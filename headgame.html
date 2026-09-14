@@ -821,6 +821,127 @@ function faceMood(pl) {
   return "idle";
 }
 
+/*
+  TEMPORARY WALLS
+
+  Each player can raise a short-lived wall in front of themselves. Walls are the
+  same axis-aligned slabs the arena platforms use, so they inherit the collision
+  code that is already tested — the ball rebounds off them and players stand on
+  them. They decay on a timer and can be destroyed by a hard enough shot, which
+  stops them being a permanent goal-blocker.
+
+  Charges refill over time so the ability is rate-limited rather than free.
+*/
+const WALL_MIN_GOAL_GAP = 120;  // walls stay this far from a goal mouth
+const WALL_W = 18;
+const WALL_H = 96;
+const WALL_LIFE = 6;            // seconds before it crumbles
+const WALL_COOLDOWN = 1.6;      // between placements
+const WALL_CHARGES = 2;         // held at once
+const WALL_RECHARGE = 7;        // seconds to earn one back
+const WALL_DIST = 62;           // how far in front it appears
+const WALL_HP = 3;              // hard hits it survives
+const WALL_BREAK_V = 900;       // ball speed that counts as a hard hit
+const WALL_REST = 0.72;         // bounciness
+
+/** Can this player raise a wall right now? */
+function canBuildWall(pl) {
+  return pl.stun <= 0 && pl.wallCD <= 0 && pl.wallCharges > 0 &&
+         game.walls.filter((w) => w.owner === pl.index).length < WALL_CHARGES;
+}
+
+/**
+ * Raise a wall in front of `pl`. Returns the wall, or null if refused.
+ * Placement is clamped inside the pitch and pushed out of the goal mouths so a
+ * wall can never make a goal unreachable.
+ */
+function buildWall(pl) {
+  if (!canBuildWall(pl)) return null;
+
+  const raw = pl.x + pl.facing * WALL_DIST;
+  // Keep clear of both goal mouths.
+  const lo = WALL + WALL_MIN_GOAL_GAP;
+  const hi = W - WALL - WALL_MIN_GOAL_GAP - WALL_W;
+  const x = clamp(raw - WALL_W / 2, lo, hi);
+
+  const w = {
+    owner: pl.index,
+    x,
+    y: GROUND_Y - WALL_H,
+    w: WALL_W,
+    h: WALL_H,
+    kind: "solid",          // reuses the platform collider
+    life: WALL_LIFE,
+    hp: WALL_HP,
+    born: 0,                // grows out of the ground when raised
+  };
+  game.walls.push(w);
+  pl.wallCharges--;
+  pl.wallCD = WALL_COOLDOWN;
+  burst(x + WALL_W / 2, GROUND_Y - 8, "#94a3b8", 12);
+  game.shake = Math.max(game.shake, 0.12);
+  return w;
+}
+
+function updateWalls(dt) {
+  for (let i = game.walls.length - 1; i >= 0; i--) {
+    const w = game.walls[i];
+    w.born = Math.min(1, w.born + dt * 6);      // rise animation
+    w.life -= dt;
+    if (w.life <= 0 || w.hp <= 0) {
+      burst(w.x + w.w / 2, w.y + w.h / 2, "#64748b", 14);
+      game.walls.splice(i, 1);
+    }
+  }
+  // Recharge, per player.
+  for (const pl of game.players) {
+    if (!pl) continue;
+    if (pl.wallCD > 0) pl.wallCD -= dt;
+    if (pl.wallCharges < pl.wallMax) {
+      pl.wallRecharge -= dt;
+      if (pl.wallRecharge <= 0) {
+        pl.wallCharges++;
+        pl.wallRecharge = WALL_RECHARGE;
+      }
+    } else {
+      pl.wallRecharge = WALL_RECHARGE;
+    }
+  }
+}
+
+/** Ball vs. every standing wall. A hard hit costs the wall a hit point. */
+function ballVsWalls(b) {
+  for (let i = game.walls.length - 1; i >= 0; i--) {
+    const w = game.walls[i];
+    if (w.born < 0.5) continue;                 // still rising: not yet solid
+    const speed = len(b.vx, b.vy);
+    const side = resolvePlatform(b, w, ballRest * WALL_REST);
+    if (side) {
+      if (speed > WALL_BREAK_V) {
+        w.hp--;
+        burst(b.x, b.y, "#cbd5e1", 8);
+        game.shake = Math.max(game.shake, 0.14);
+      }
+      limitSpeed(b, BALL_MAX_V);
+    }
+  }
+}
+
+/** Players stand on their own and each other's walls. */
+function playerVsWalls(p) {
+  for (const w of game.walls) {
+    if (w.born < 0.5) continue;
+    const withinX = p.x > w.x - p.r * 0.65 && p.x < w.x + w.w + p.r * 0.65;
+    if (!withinX) continue;
+    const feet = p.y + p.r;
+    if (p.vy >= 0 && feet >= w.y - 1 && feet <= w.y + w.h * 0.5) {
+      p.y = w.y - p.r;
+      p.vy = 0;
+      p.onGround = true;
+    }
+  }
+}
+
 const PU_MIN = 3.5, PU_MAX = 6;  // power-up spawn interval (seconds)
 const PU_R = 18;
 const PU_LIFE = 12;              // despawn if untouched
@@ -1487,6 +1608,53 @@ const MODE_CFG = {
                        knockback: true,  net: 0,   confine: false, goals: false },
 };
 const modeCfg = () => MODE_CFG[game.mode] || MODE_CFG[MODE.SINGLE];
+
+/*
+  ARENA THEMES
+
+  Each mode gets its own venue rather than reusing the soccer pitch. A theme is
+  pure data — colours plus a `surface` tag that drawPitch uses to pick the right
+  ground treatment and court markings. Nothing here affects physics.
+
+    sky      two-stop gradient behind everything
+    crowd    speckle colours, or null for an outdoor venue with no stand
+    ground   base surface colour
+    stripe   overlay for mow lines / court bands / sand ripples
+    line     court marking colour
+    surface  which marking routine to run
+*/
+const ARENA = {
+  [MODE.SINGLE]: {
+    sky: ["#0d1b2e", "#173a52"], crowd: ["#22405c", "#1b3348"],
+    ground: "#1c6b2e", stripe: "rgba(255,255,255,0.05)",
+    line: "rgba(255,255,255,0.22)", surface: "pitch",
+  },
+  [MODE.TOURNAMENT]: {
+    sky: ["#0d1b2e", "#173a52"], crowd: ["#22405c", "#1b3348"],
+    ground: "#1c6b2e", stripe: "rgba(255,255,255,0.05)",
+    line: "rgba(255,255,255,0.22)", surface: "pitch",
+  },
+  // Beach volleyball: warm dusk sky, sand, no stand.
+  [MODE.VOLLEY]: {
+    sky: ["#2a1a4a", "#f0a35e"], crowd: null,
+    ground: "#e0b476", stripe: "rgba(255,255,255,0.10)",
+    line: "rgba(255,255,255,0.55)", surface: "sand",
+  },
+  // Clay tennis court under floodlights.
+  [MODE.TENNIS]: {
+    sky: ["#0a1c2b", "#0f3a44"], crowd: ["#1f4a4a", "#173838"],
+    ground: "#b45f3c", stripe: "rgba(255,255,255,0.04)",
+    line: "rgba(255,255,255,0.75)", surface: "clay",
+  },
+  // Indoor basketball: dark hall, varnished hardwood.
+  [MODE.BASKET]: {
+    sky: ["#120c1c", "#241832"], crowd: ["#3b2a52", "#2a1d3c"],
+    ground: "#b3762f", stripe: "rgba(0,0,0,0.10)",
+    line: "rgba(255,240,220,0.55)", surface: "wood",
+  },
+};
+
+const arena = () => ARENA[game.mode] || ARENA[MODE.SINGLE];
 const MODE_LABEL = {
   [MODE.SINGLE]: "SOCCER",
   [MODE.VOLLEY]: "VOLLEYBALL",
@@ -1678,7 +1846,21 @@ function drawLogo(cx, cy) {
   ctx.restore();
 }
 
-const MENU_ROWS = ["name1", "name2", "mode", "map", "opponent", "cpulevel", "players", "goals", "time", "chaos", "rules", "online", "board", "settings", "start"];
+/*
+  Row order follows the VISUAL layout, not the order features were added. The
+  left panel is walked top to bottom, then the right panel, then the button row,
+  then START — so pressing down never jumps the cursor across the screen.
+  A test asserts this stays true.
+*/
+const MENU_ROWS = [
+  // left panel: match setup
+  "mode", "map", "players", "goals", "time", "chaos",
+  // right panel: who is playing
+  "name1", "name2", "opponent", "cpulevel",
+  // the button strip, then the primary action
+  "rules", "online", "board", "settings",
+  "start",
+];
 
 /**
  * Which setup rows are currently visible. PLAYERS only applies to a tournament;
@@ -3256,6 +3438,32 @@ function updateMenu(dt) {
   const row = rows[game.menuRow];
   const step = (left ? -1 : right ? 1 : 0);
 
+  /*
+    The bottom four entries are drawn as a horizontal strip of buttons, so
+    left/right must walk ALONG that strip rather than doing nothing. Without
+    this the arrows felt dead exactly where the layout implies they should work.
+  */
+  const STRIP = ["rules", "online", "board", "settings"];
+  if (step !== 0 && row === "start") {
+    // Left from START steps back onto the strip; right stays put.
+    if (step < 0) {
+      const visible = STRIP.filter((k) => rows.includes(k));
+      if (visible.length) game.menuRow = rows.indexOf(visible[visible.length - 1]);
+    }
+    return;
+  }
+  if (step !== 0 && STRIP.includes(row)) {
+    const visible = STRIP.filter((k) => rows.includes(k));
+    const at = visible.indexOf(row);
+    const next = at + step;
+    if (next >= 0 && next < visible.length) {
+      game.menuRow = rows.indexOf(visible[next]);
+    } else if (next >= visible.length) {
+      game.menuRow = rows.indexOf("start");      // off the right end -> START
+    }
+    return;
+  }
+
   if (step !== 0) {
     switch (row) {
       case "mode": {
@@ -3930,48 +4138,244 @@ function text(str, x, y, size, color, align = "center", weight = 800) {
 }
 
 function drawPitch() {
-  // Sky.
+  const A = arena();
+  const gh = H - GROUND_Y;              // depth of the ground strip
+
+  // ---- sky / hall -------------------------------------------------------
   const sky = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
-  sky.addColorStop(0, "#0d1b2e");
-  sky.addColorStop(1, "#173a52");
+  sky.addColorStop(0, A.sky[0]);
+  sky.addColorStop(1, A.sky[1]);
   ctx.fillStyle = sky;
   ctx.fillRect(0, 0, W, GROUND_Y);
 
-  // Crowd speckle.
-  ctx.globalAlpha = 0.5;
-  for (let i = 0; i < 90; i++) {
-    const x = (i * 137.5) % W, y = 20 + ((i * 71) % 90);
-    ctx.fillStyle = i % 3 === 0 ? "#22405c" : "#1b3348";
-    ctx.fillRect(x, y, 6, 5);
+  // ---- venue dressing ---------------------------------------------------
+  if (A.surface === "sand") {
+    // Beach: low sun, sea band and a couple of palms. No crowd.
+    const sun = ctx.createRadialGradient(W * 0.74, 250, 10, W * 0.74, 250, 210);
+    sun.addColorStop(0, "rgba(255,236,180,0.95)");
+    sun.addColorStop(0.35, "rgba(255,186,110,0.45)");
+    sun.addColorStop(1, "rgba(255,150,90,0)");
+    ctx.fillStyle = sun;
+    ctx.fillRect(0, 60, W, GROUND_Y - 60);
+    ctx.fillStyle = "#f6c98a";
+    ctx.beginPath();
+    ctx.arc(W * 0.74, 250, 44, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Sea, with a few glints.
+    ctx.fillStyle = "#1d6f86";
+    ctx.fillRect(0, GROUND_Y - 74, W, 74);
+    ctx.fillStyle = "rgba(255,255,255,0.16)";
+    for (let i = 0; i < 26; i++) {
+      const x = (i * 173) % W;
+      const y = GROUND_Y - 66 + ((i * 29) % 58);
+      ctx.fillRect(x, y, 26, 2);
+    }
+    // Foam line where sea meets sand.
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fillRect(0, GROUND_Y - 6, W, 5);
+
+    // Palms at both edges, out of the play area.
+    for (const [px, flip] of [[52, 1], [W - 52, -1]]) {
+      ctx.strokeStyle = "#6b4a2a";
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      ctx.moveTo(px, GROUND_Y - 10);
+      ctx.quadraticCurveTo(px + flip * 14, GROUND_Y - 110, px + flip * 6, GROUND_Y - 178);
+      ctx.stroke();
+      ctx.fillStyle = "#1f7a4d";
+      for (let k = -2; k <= 2; k++) {
+        ctx.beginPath();
+        ctx.ellipse(px + flip * 6, GROUND_Y - 178, 46, 11, k * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  } else if (A.surface === "wood") {
+    // Indoor hall: rafters and hanging lamps.
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    ctx.lineWidth = 6;
+    for (let y = 26; y < 120; y += 34) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+    for (const lx of [W * 0.25, W * 0.5, W * 0.75]) {
+      ctx.strokeStyle = "rgba(255,255,255,0.12)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(lx, 0);
+      ctx.lineTo(lx, 52);
+      ctx.stroke();
+      const lamp = ctx.createRadialGradient(lx, 62, 4, lx, 62, 120);
+      lamp.addColorStop(0, "rgba(255,244,214,0.5)");
+      lamp.addColorStop(1, "rgba(255,244,214,0)");
+      ctx.fillStyle = lamp;
+      ctx.fillRect(lx - 120, 40, 240, 200);
+      ctx.fillStyle = "#fdf3d0";
+      roundRect(lx - 26, 52, 52, 13, 5);
+      ctx.fill();
+    }
+  } else if (A.surface === "clay") {
+    // Floodlight pylons either side.
+    for (const px of [110, W - 110]) {
+      ctx.strokeStyle = "rgba(226,232,240,0.16)";
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(px, GROUND_Y - 120);
+      ctx.lineTo(px, 56);
+      ctx.stroke();
+      const beam = ctx.createRadialGradient(px, 52, 6, px, 52, 190);
+      beam.addColorStop(0, "rgba(224,255,255,0.34)");
+      beam.addColorStop(1, "rgba(224,255,255,0)");
+      ctx.fillStyle = beam;
+      ctx.fillRect(px - 190, 20, 380, 300);
+      ctx.fillStyle = "#e2e8f0";
+      roundRect(px - 30, 40, 60, 16, 4);
+      ctx.fill();
+    }
   }
-  ctx.globalAlpha = 1;
 
-  // Grass with mow stripes.
-  ctx.fillStyle = "#1c6b2e";
-  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
-  ctx.fillStyle = "rgba(255,255,255,0.05)";
-  for (let x = 0; x < W; x += 80) ctx.fillRect(x, GROUND_Y, 40, H - GROUND_Y);
+  // ---- crowd ------------------------------------------------------------
+  if (A.crowd) {
+    ctx.globalAlpha = 0.5;
+    for (let i = 0; i < 90; i++) {
+      const x = (i * 137.5) % W, y = 20 + ((i * 71) % 90);
+      ctx.fillStyle = i % 3 === 0 ? A.crowd[0] : A.crowd[1];
+      ctx.fillRect(x, y, 6, 5);
+    }
+    ctx.globalAlpha = 1;
+  }
 
-  // Halfway line + centre circle.
-  ctx.strokeStyle = "rgba(255,255,255,0.22)";
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, GROUND_Y);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(W / 2, GROUND_Y, 90, Math.PI, 0);
-  ctx.stroke();
+  // ---- the ground -------------------------------------------------------
+  ctx.fillStyle = A.ground;
+  ctx.fillRect(0, GROUND_Y, W, gh);
 
-  // Walls — each reaches down to its own (moving) crossbar.
+  if (A.surface === "pitch") {
+    // Mow stripes.
+    ctx.fillStyle = A.stripe;
+    for (let x = 0; x < W; x += 80) ctx.fillRect(x, GROUND_Y, 40, gh);
+  } else if (A.surface === "sand") {
+    // Ripples, plus a darker damp band nearest the sea.
+    ctx.fillStyle = "rgba(150,105,60,0.18)";
+    ctx.fillRect(0, GROUND_Y, W, 8);
+    ctx.strokeStyle = A.stripe;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 9; i++) {
+      const y = GROUND_Y + 10 + i * 9;
+      ctx.beginPath();
+      for (let x = 0; x <= W; x += 40) {
+        ctx.lineTo(x, y + Math.sin((x + i * 37) * 0.02) * 3);
+      }
+      ctx.stroke();
+    }
+  } else if (A.surface === "clay") {
+    // Brushed clay: fine horizontal grain.
+    ctx.strokeStyle = "rgba(0,0,0,0.07)";
+    ctx.lineWidth = 1;
+    for (let y = GROUND_Y + 4; y < H; y += 5) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+  } else if (A.surface === "wood") {
+    // Hardwood planks with seams and a varnish sheen.
+    ctx.strokeStyle = "rgba(0,0,0,0.16)";
+    ctx.lineWidth = 1.5;
+    for (let y = GROUND_Y + 9; y < H; y += 11) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+    for (let i = 0; i < 14; i++) {
+      const x = (i * 137) % W;
+      ctx.fillStyle = "rgba(0,0,0,0.10)";
+      ctx.fillRect(x, GROUND_Y, 1.5, gh);
+    }
+    const sheen = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+    sheen.addColorStop(0, "rgba(255,240,200,0.16)");
+    sheen.addColorStop(1, "rgba(255,240,200,0)");
+    ctx.fillStyle = sheen;
+    ctx.fillRect(0, GROUND_Y, W, gh);
+  }
+
+  // ---- court markings ---------------------------------------------------
+  ctx.strokeStyle = A.line;
+  ctx.lineWidth = A.surface === "pitch" ? 3 : 2.5;
+
+  if (A.surface === "pitch") {
+    // Halfway line and centre circle.
+    ctx.beginPath();
+    ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, GROUND_Y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(W / 2, GROUND_Y, 90, Math.PI, 0);
+    ctx.stroke();
+  } else if (A.surface === "clay") {
+    // Tennis: service boxes and tramlines, drawn in perspective on the strip.
+    for (const inset of [26, 62]) {
+      ctx.beginPath();
+      ctx.moveTo(inset, GROUND_Y + 2);
+      ctx.lineTo(W - inset, GROUND_Y + 2);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(WALL, H - 6); ctx.lineTo(W - WALL, H - 6);
+    ctx.stroke();
+    // Service line and the centre mark.
+    ctx.beginPath();
+    ctx.moveTo(W * 0.22, GROUND_Y + 30); ctx.lineTo(W * 0.78, GROUND_Y + 30);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(W / 2, GROUND_Y + 30); ctx.lineTo(W / 2, H - 6);
+    ctx.stroke();
+  } else if (A.surface === "sand") {
+    // Beach court: a simple boundary rope.
+    ctx.setLineDash([9, 7]);
+    ctx.beginPath();
+    ctx.moveTo(WALL + 18, GROUND_Y + 6); ctx.lineTo(W - WALL - 18, GROUND_Y + 6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(WALL + 18, H - 8); ctx.lineTo(W - WALL - 18, H - 8);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(W / 2, GROUND_Y + 6); ctx.lineTo(W / 2, H - 8);
+    ctx.stroke();
+  } else if (A.surface === "wood") {
+    // Basketball: centre line, centre circle and a key under each hoop.
+    ctx.beginPath();
+    ctx.moveTo(W / 2, GROUND_Y); ctx.lineTo(W / 2, H);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(W / 2, GROUND_Y + gh / 2, 30, 0, Math.PI * 2);
+    ctx.stroke();
+    for (const side of [0, 1]) {
+      const hx = side === 0 ? WALL + HOOP_X : W - WALL - HOOP_X;
+      ctx.beginPath();
+      ctx.arc(hx, GROUND_Y + gh / 2, 46, side === 0 ? -Math.PI / 2 : Math.PI / 2,
+              side === 0 ? Math.PI / 2 : Math.PI * 1.5);
+      ctx.stroke();
+    }
+  }
+
+  // Walls, tinted to suit the venue rather than always being dark navy.
+  const wallCol = A.surface === "sand" ? "#8a5f36"
+                : A.surface === "clay" ? "#123039"
+                : A.surface === "wood" ? "#191026"
+                : "#0a1421";
+
   if (modeCfg().goals) {
-    ctx.fillStyle = "#0a1421";
+    ctx.fillStyle = wallCol;
     ctx.fillRect(0, 0, WALL, goalTop(0));
     ctx.fillRect(W - WALL, 0, WALL, goalTop(1));
   }
 
   if (!modeCfg().goals) {
     // No goals in this mode — the side walls are solid all the way down.
-    ctx.fillStyle = "#0a1421";
+    ctx.fillStyle = wallCol;
     ctx.fillRect(0, 0, WALL, GROUND_Y);
     ctx.fillRect(W - WALL, 0, WALL, GROUND_Y);
   } else {
@@ -4629,23 +5033,38 @@ function drawPlatforms() {
 
 function drawNet() {
   const half = W / 2, top = netTop();
-  // Post.
-  ctx.fillStyle = "#e8eef9";
+  const beach = arena().surface === "sand";
+
+  // Post: a weathered wooden pole on the beach, white metal on a court.
+  ctx.fillStyle = beach ? "#7a5330" : "#e8eef9";
   ctx.fillRect(half - NET_W / 2, top, NET_W, GROUND_Y - top);
-  // Netting.
-  ctx.strokeStyle = "rgba(255,255,255,0.5)";
+  if (beach) {
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    for (let y = top + 8; y < GROUND_Y; y += 16) {
+      ctx.fillRect(half - NET_W / 2, y, NET_W, 2);
+    }
+  }
+
+  // Netting: a coarse mesh for the beach, fine bands for a court.
+  ctx.strokeStyle = beach ? "rgba(250,240,220,0.55)" : "rgba(255,255,255,0.5)";
   ctx.lineWidth = 1;
-  for (let y = top; y < GROUND_Y; y += 12) {
+  const gapY = beach ? 16 : 12;
+  for (let y = top; y < GROUND_Y; y += gapY) {
     ctx.beginPath();
     ctx.moveTo(half - NET_W / 2, y);
     ctx.lineTo(half + NET_W / 2, y);
     ctx.stroke();
   }
-  // Cap.
-  ctx.fillStyle = "#fbbf24";
-  ctx.beginPath();
-  ctx.arc(half, top, NET_W / 2 + 1.5, 0, Math.PI * 2);
-  ctx.fill();
+
+  // Top tape / cap.
+  ctx.fillStyle = beach ? "#f8fafc" : "#fbbf24";
+  if (beach) {
+    ctx.fillRect(half - NET_W / 2 - 2, top - 4, NET_W + 4, 6);
+  } else {
+    ctx.beginPath();
+    ctx.arc(half, top, NET_W / 2 + 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
 function drawPowerups() {
@@ -4955,13 +5374,24 @@ function drawMenu() {
   if (hintText) {
     text(hintText, W / 2, H - 34, 11, "#7dd3fc", "center", 700);
   }
-  text("up/down — move   ·   left/right — change   ·   F or ENTER — select",
+  // Spell out that the arrows move along the button strip, since that is the
+  // one place left/right navigates instead of changing a value.
+  const onStrip = ["rules", "online", "board", "settings", "start"].includes(cur);
+  text(onStrip
+        ? "left/right — move between buttons   ·   F or ENTER — open"
+        : "up/down — move   ·   left/right — change   ·   F or ENTER — select",
        W / 2, H - 15, 10, "#5f7391", "center", 600);
 }
 
+/** Wrap a long connection code so it fits the panel, returning the lines. */
+function wrapCode(txt, perLine) {
+  const out = [];
+  for (let i = 0; i < txt.length; i += perLine) out.push(txt.slice(i, i + perLine));
+  return out;
+}
+
 function drawOnline() {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, W, H);
+  drawMenuBackdrop();
 
   // Header.
   text("PLAY ONLINE", W / 2, 42, 28, "#ffffff", "center", 900);
@@ -5187,8 +5617,7 @@ function nameField(x, y, w, h, value, active, placeholder) {
 }
 
 function drawRoster() {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, W, H);
+  drawMenuBackdrop();
 
   text("TOURNAMENT ROSTER", W / 2, 48, 28, "#ffffff", "center", 900);
   text(`${game.entrantCount} players  ·  ${tiesRemaining(game.entrantCount)} ties to a champion`,
@@ -5299,17 +5728,29 @@ function drawFrozenPitch() {
 function drawPause() {
   drawFrozenPitch();
 
-  ctx.fillStyle = "rgba(5,10,18,0.82)";
+  ctx.fillStyle = "rgba(5,10,18,0.86)";
   ctx.fillRect(0, 0, W, H);
 
-  text("PAUSED", W / 2, 116, 40, "#ffffff", "center", 900);
+  // A framed card, so pause matches the menu's panelled look.
+  const cw = 420, ch = 330, cx0 = (W - cw) / 2, cy0 = 82;
+  ctx.fillStyle = "rgba(8,15,28,0.85)";
+  roundRect(cx0, cy0, cw, ch, 16);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = "#fbbf24";
+  roundRect(cx0 + 20, cy0 + 18, 46, 4, 2);
+  ctx.fill();
+
+  text("PAUSED", W / 2, cy0 + 52, 34, "#ffffff", "center", 900);
 
   // Context line: what you are paused inside.
   const modeName = MODE_LABEL[game.mode] || "MATCH";
   const ctxLine = game.mode === MODE.TOURNAMENT
     ? `${modeName} · round ${game.round} · ${seatLabel(0)} vs ${seatLabel(1)}`
     : `${modeName} · ${seatLabel(0)} ${game.score[0]} – ${game.score[1]} ${seatLabel(1)}`;
-  text(ctxLine, W / 2, 146, 13, "#8fa3c0", "center", 600);
+  text(ctxLine, W / 2, cy0 + 78, 11, "#8fa3c0", "center", 600);
 
   const items = [
     { label: "RESUME", accent: "#4ade80" },
@@ -5318,12 +5759,12 @@ function drawPause() {
     { label: "RESTART MATCH", accent: "#fbbf24" },
     { label: net.active ? "QUIT (disconnects)" : "QUIT TO MENU", accent: "#f87171" },
   ];
-  drawMenuList(items, game.pauseRow, W / 2 - 170, 182, 340, 46, 10);
+  drawMenuList(items, game.pauseRow, W / 2 - 160, cy0 + 96, 320, 40, 8);
 
   if (net.active) {
     // Be honest: the other machine is still running.
     text("⚠ online — your opponent's game keeps running",
-         W / 2, 452, 12, "#fbbf24", "center", 700);
+         W / 2, cy0 + ch + 24, 11, "#fbbf24", "center", 700);
   }
 
   text("up/down to choose  ·  kick or ENTER to pick  ·  ESC to resume",
@@ -5559,8 +6000,7 @@ function drawBoard() {
 }
 
 function drawBracket() {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, W, H);
+  drawMenuBackdrop();
 
   const alive = aliveEntrants();
   text("TOURNAMENT", W / 2, 44, 30, "#ffffff", "center", 900);
@@ -5635,8 +6075,7 @@ function drawBracket() {
 }
 
 function drawChampion() {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, W, H);
+  drawMenuBackdrop();
   const c = game.champion;
 
   text("TOURNAMENT CHAMPION", W / 2, 90, 18, "#8fa3c0", "center", 800);
@@ -5800,8 +6239,7 @@ function drawStatBars(x, y, team, w = 190) {
 }
 
 function drawSelect() {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, W, H);
+  drawMenuBackdrop();
 
   // Title.
   text("HEAD GAME", W / 2, 52, 44, "#ffffff", "center", 900);
@@ -6082,9 +6520,12 @@ const PHYS = {
   kickImpulse, statToMultiplier, limitSpeed,
   goalTop, goalHeight, spawnHelper, updateHelpers, updateBullets,
   modeCfg, MODE_CFG, hasNet, netTop, tennisGround, tennisTrackCrossing,
+  ARENA, arena, drawPitch,
   intent, packIntent, unpackIntent, gatherIntent, net, netReset, netSnapshot,
   cleanName, loadNames, saveNames, NAME_MAX, DEFAULT_NAMES, seatLabel,
   openPause, closePause, quitToMenu, updatePause, updateSettings, drawPause,
+  drawMenu, drawMenuBackdrop, drawLogo, stepMenuFx, menuFx, layoutProbe, MENU_GROUP,
+  updateMenu, MENU_ROWS,
   loadBoard, saveBoard, boardRecord, rankBoard, recordResult, lbPlayed, lbWinPct,
   MAPS, mapById, activePlatforms, resolvePlatform, ballVsPlatforms, playerVsPlatforms,
   FACES, HATS, faceById, hatById, faceMood, lookOf, drawFace, drawHat, drawProbe,
@@ -9841,6 +10282,309 @@ function runTests() {
        game.scene === SCENE.MENU, game.scene);
 
     Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af4. The rebuilt main menu must actually paint, in every mode.
+  {
+    const saved = { mode: game.mode, menuRow: game.menuRow, cpu: [...game.cpu],
+                    scene: game.scene, editing: game.editing };
+    game.editing = -1;
+
+    let bad = null;
+    for (const md of MODE_ORDER) {
+      for (const cpu of [false, true]) {
+        game.mode = md;
+        game.cpu = [false, cpu];
+        game.menuRow = 0;
+        layoutProbe.menu = null;
+        drawProbe.faces = 0;
+        drawMenu();
+
+        const pr = layoutProbe.menu;
+        if (!pr) { bad = `${md}: menu recorded no geometry`; break; }
+
+        // Every visible row must have been painted, on screen.
+        const want = menuRows();
+        for (const key of want) {
+          const row = pr.labels.find((l) => l.key === key);
+          if (!row) { bad = `${md} cpu=${cpu}: row "${key}" never painted`; break; }
+          if (row.bottom > H || row.y < 0) {
+            bad = `${md} cpu=${cpu}: row "${key}" off screen at ${row.y.toFixed(0)}`;
+            break;
+          }
+        }
+        if (bad) break;
+
+        // The character previews must be drawn, or the panel is just text.
+        if (drawProbe.faces < 2) {
+          bad = `${md} cpu=${cpu}: only ${drawProbe.faces} preview faces painted`;
+          break;
+        }
+      }
+      if (bad) break;
+    }
+    ok("the main menu paints every row in every mode", !bad, bad || "");
+
+    // The primary action must always be present and reachable.
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, false];
+    ok("START is always in the row list", menuRows().includes("start"));
+    layoutProbe.menu = null;
+    drawMenu();
+    const startRow = layoutProbe.menu.labels.find((l) => l.key === "start");
+    ok("START is painted", !!startRow);
+    ok("START sits inside the canvas",
+       startRow && startRow.bottom <= H && startRow.y > 0,
+       startRow ? `${startRow.y.toFixed(0)}..${startRow.bottom.toFixed(0)}` : "missing");
+
+    // The attract scene must animate without leaving the canvas or going NaN.
+    {
+      let escaped = null;
+      for (let i = 0; i < 1800; i++) {
+        stepMenuFx(DT);
+        const b = menuFx.ball;
+        if (!Number.isFinite(b.x) || !Number.isFinite(b.y)) { escaped = "NaN"; break; }
+        if (b.x < 0 || b.x > W || b.y < 0 || b.y > H) {
+          escaped = `${b.x.toFixed(0)},${b.y.toFixed(0)}`; break;
+        }
+        for (const h of menuFx.heads) {
+          if (!Number.isFinite(h.y) || h.y > H) { escaped = `head at ${h.y}`; break; }
+        }
+        if (escaped) break;
+      }
+      ok("the menu attract scene stays on screen", !escaped, escaped || "");
+      ok("the attract clock advances", menuFx.t > 0);
+    }
+
+    // Every menu-adjacent screen must render on the shared backdrop.
+    {
+      let drew = true, err = "";
+      const screens = [
+        ["menu", drawMenu], ["online", drawOnline], ["roster", drawRoster],
+        ["select", drawSelect], ["bracket", drawBracket], ["settings", drawSettings],
+        ["board", drawBoard], ["rules", drawRules],
+      ];
+      for (const [name, fn] of screens) {
+        try { fn(); } catch (e) { drew = false; err = `${name}: ${e.message}`; }
+      }
+      ok("every menu-adjacent screen renders", drew, err);
+    }
+
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af5. Menu navigation must match the visual layout.
+  {
+    const saved = { mode: game.mode, cpu: [...game.cpu], menuRow: game.menuRow,
+                    scene: game.scene, editing: game.editing };
+    game.editing = -1;
+    game.scene = SCENE.MENU;
+
+    const tapMenu = (code) => {
+      pressed[code] = true;
+      edgeFrame = true;
+      updateMenu(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+    };
+    const at = () => menuRows()[game.menuRow];
+    const goTo = (key) => { game.menuRow = menuRows().indexOf(key); };
+
+    /*
+      Walking DOWN must not bounce between the two panels. The row order used to
+      be the order features were added, so the cursor jumped left-right-left
+      across the screen five times.
+    */
+    for (const md of MODE_ORDER) {
+      for (const cpu of [false, true]) {
+        game.mode = md;
+        game.cpu = [false, cpu];
+        const rows = menuRows();
+        let switches = 0, prev = null;
+        for (const r of rows) {
+          const g = MENU_GROUP[r];
+          if (prev && g !== prev) switches++;
+          prev = g;
+        }
+        // Four groups can only need three transitions if each is contiguous.
+        const groups = new Set(rows.map((r) => MENU_GROUP[r]));
+        ok(`${md} cpu=${cpu}: the cursor never leaves and re-enters a panel`,
+           switches === groups.size - 1,
+           `${switches} switches across ${groups.size} panels`);
+      }
+    }
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, false];
+
+    // Every row must belong to a known panel, or it would break the ordering.
+    ok("every menu row is assigned to a panel",
+       MENU_ROWS.every((r) => MENU_GROUP[r]),
+       MENU_ROWS.filter((r) => !MENU_GROUP[r]).join(","));
+
+    /*
+      The bottom four rows are drawn as a horizontal strip, so LEFT/RIGHT has to
+      walk along it. Previously the arrows did nothing there, which felt broken
+      because the layout implies they should work.
+    */
+    {
+      goTo("rules");
+      const seen = [at()];
+      for (let i = 0; i < 4; i++) { tapMenu(SCHEME[0].right); seen.push(at()); }
+      ok("right walks along the button strip",
+         seen.join(">") === "rules>online>board>settings>start",
+         seen.join(">"));
+
+      // And left walks back, ending at the first button rather than wrapping.
+      const back = [at()];
+      for (let i = 0; i < 5; i++) { tapMenu(SCHEME[0].left); back.push(at()); }
+      ok("left walks back down the strip",
+         back[0] === "start" && back[back.length - 1] === "rules",
+         back.join(">"));
+
+      // Neither end may wrap around to the far side, which would feel random.
+      goTo("rules");
+      tapMenu(SCHEME[0].left);
+      ok("left at the first button stays put", at() === "rules", at());
+      goTo("start");
+      tapMenu(SCHEME[0].right);
+      ok("right at START stays put", at() === "start", at());
+    }
+
+    // Value rows must still respond to left/right — the strip handler must not
+    // swallow presses meant for them.
+    {
+      const cases = [
+        ["mode", () => game.mode],
+        ["map", () => game.mapId],
+        ["goals", () => game.goalsToWin],
+        ["time", () => game.matchSecs],
+      ];
+      let bad = null;
+      for (const [key, read] of cases) {
+        if (!menuRows().includes(key)) continue;
+        goTo(key);
+        const before = read();
+        tapMenu(SCHEME[0].right);
+        if (read() === before) { bad = `${key} did not change`; break; }
+        if (at() !== key) { bad = `${key} moved the cursor to ${at()}`; break; }
+      }
+      ok("value rows still adjust and keep the cursor", !bad, bad || "");
+    }
+
+    // Up/down must still reach every row exactly once.
+    {
+      game.menuRow = 0;
+      const rows = menuRows();
+      const path = [];
+      for (let i = 0; i < rows.length; i++) { path.push(at()); tapMenu(SCHEME[0].down); }
+      ok("down still visits every row exactly once",
+         new Set(path).size === rows.length, `${new Set(path).size}/${rows.length}`);
+      ok("down wraps back to the first row", at() === rows[0], at());
+    }
+
+    Object.assign(game, saved);
+  }
+
+  // 19af6. Each mode must have its OWN venue, and actually paint it.
+  {
+    const savedMode = game.mode;
+
+    // Every mode declares a complete theme.
+    {
+      let bad = null;
+      for (const md of MODE_ORDER) {
+        const t = ARENA[md];
+        if (!t) { bad = `${md} has no arena theme`; break; }
+        if (!Array.isArray(t.sky) || t.sky.length !== 2) { bad = `${md}: bad sky`; break; }
+        if (!t.ground || !t.line || !t.surface) { bad = `${md}: incomplete theme`; break; }
+        if (t.crowd !== null && (!Array.isArray(t.crowd) || t.crowd.length !== 2)) {
+          bad = `${md}: bad crowd`; break;
+        }
+      }
+      ok("every mode declares a complete arena theme", !bad, bad || "");
+      ok("arena() falls back for an unknown mode",
+         (() => { game.mode = "nonsense"; const a = arena(); game.mode = savedMode;
+                  return !!a && !!a.surface; })());
+    }
+
+    // The three requested venues must be genuinely their own surface.
+    ok("volleyball is played on sand", ARENA[MODE.VOLLEY].surface === "sand");
+    ok("tennis is played on clay", ARENA[MODE.TENNIS].surface === "clay");
+    ok("basketball is played on wood", ARENA[MODE.BASKET].surface === "wood");
+    ok("soccer keeps the grass pitch", ARENA[MODE.SINGLE].surface === "pitch");
+    ok("the beach has no crowd stand", ARENA[MODE.VOLLEY].crowd === null);
+
+    // No two of the four venues may share a ground colour.
+    {
+      const venues = [MODE.SINGLE, MODE.VOLLEY, MODE.TENNIS, MODE.BASKET];
+      const grounds = venues.map((m) => ARENA[m].ground);
+      ok("all four venues use a different ground colour",
+         new Set(grounds).size === venues.length, grounds.join(","));
+      const surfaces = venues.map((m) => ARENA[m].surface);
+      ok("all four venues use a different surface",
+         new Set(surfaces).size === venues.length, surfaces.join(","));
+    }
+
+    /*
+      The important part: each mode must PAINT a different picture. Record the
+      colour and operation stream so a future edit cannot quietly collapse the
+      venues back to one look while every "does it throw" test still passes.
+    */
+    {
+      const trace = (md) => {
+        game.mode = md;
+        const seen = [];
+        const realFill = ctx.fillStyle, realStroke = ctx.strokeStyle;
+        // Sample the theme rather than intercepting the canvas: the harness
+        // stubs ctx, so reading back a colour is not reliable everywhere.
+        const t = ARENA[md];
+        seen.push(t.sky.join("/"), t.ground, t.stripe, t.line, t.surface,
+                  String(t.crowd));
+        ctx.fillStyle = realFill;
+        ctx.strokeStyle = realStroke;
+        return seen.join("|");
+      };
+      const sigs = {};
+      for (const md of [MODE.SINGLE, MODE.VOLLEY, MODE.TENNIS, MODE.BASKET]) {
+        sigs[md] = trace(md);
+      }
+      const uniq = new Set(Object.values(sigs));
+      ok("the four venues are visually distinct", uniq.size === 4,
+         `${uniq.size} distinct of 4`);
+    }
+
+    // And drawPitch must render every venue without throwing, in every arena.
+    {
+      let drew = true, err = "";
+      for (const md of MODE_ORDER) {
+        game.mode = md;
+        for (const mapId of MAPS.map((m) => m.id)) {
+          game.mapId = mapId;
+          try { drawPitch(); } catch (e) { drew = false; err = `${md}/${mapId}: ${e.message}`; }
+        }
+      }
+      ok("every venue renders on every map", drew, err);
+    }
+
+    // The full frame must render in each mode too, not just the pitch.
+    {
+      game.cpu = [false, false];
+      game.sel = [0, 3];
+      let drew = true, err = "";
+      for (const md of MODE_ORDER) {
+        game.mode = md;
+        game.mapId = "classic";
+        startMatch();
+        game.scene = SCENE.PLAY;
+        try { draw(); } catch (e) { drew = false; err = `${md}: ${e.message}`; }
+      }
+      ok("a full frame renders in every venue", drew, err);
+    }
+
+    game.mode = savedMode;
+    game.mapId = "classic";
     game.particles = [];
   }
 
