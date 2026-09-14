@@ -69,6 +69,17 @@
 
 /* ---------------------------------------------------------------- 1. CONSTS */
 
+/*
+  THE VERSION. Single source of truth: the title bar, the menu badge, the credits
+  screen and the netcode handshake all read this one constant, so they can never
+  drift apart. Bump it here and nowhere else.
+
+  Guests are told the host's version when they connect: the two machines run the
+  same simulation lockstep, so a mismatch is worth a visible warning rather than
+  a desync nobody can explain.
+*/
+const VERSION = "1.5";
+
 const W = 1000;               // logical width  (canvas is letterboxed to fit)
 const H = 600;                // logical height
 const GROUND_Y = 520;         // top of the grass
@@ -3882,6 +3893,8 @@ const net = {
   pingMs: 0,
   copied: false,
   spectating: false,     // guest watching a tie it is not playing
+  peerVersion: "",       // the other machine's build, from its hello
+  versionMismatch: false,// true once a differing peer version is seen
 };
 
 const netIsHost = () => net.active && net.role === "host";
@@ -3893,6 +3906,8 @@ function netReset() {
   try { if (net.pc) net.pc.close(); } catch (e) { /* already gone */ }
   net.active = false;
   net.role = null;
+  net.peerVersion = "";
+  net.versionMismatch = false;
   net.pc = null;
   net.chan = null;
   net.state = "idle";
@@ -4149,6 +4164,18 @@ function netHandle(msg) {
   if (msg.t === "hi") {
     // Never trust a name off the wire: strip it to printable characters.
     game.remoteName = cleanName(msg.n, "OPPONENT");
+    /*
+      Version check. Both machines must run the same simulation for host
+      authority to make sense, so a mismatch is surfaced plainly instead of
+      showing up later as a desync nobody can account for. It is a WARNING, not
+      a refusal: close builds usually interoperate, and blocking play outright
+      would be worse than letting people decide. An older peer may send no
+      version at all, which is itself a mismatch worth showing.
+    */
+    net.peerVersion = typeof msg.v === "string"
+      ? msg.v.replace(/[^0-9A-Za-z.\-]/g, "").slice(0, 12)
+      : "";
+    net.versionMismatch = net.peerVersion !== VERSION;
     return;
   }
   if (msg.t === "bye") { net.state = "closed"; return; }
@@ -4182,10 +4209,11 @@ function netPump() {
   }
 }
 
-/** Tell the peer our name (and re-send whenever it changes). */
+/** Tell the peer our name and version (re-sent whenever the name changes). */
 function netSendHello() {
   if (!net.active) return;
-  netSend({ t: "hi", n: cleanName(game.names[net.localSeat], DEFAULT_NAMES[net.localSeat]) });
+  netSend({ t: "hi", n: cleanName(game.names[net.localSeat], DEFAULT_NAMES[net.localSeat]),
+            v: VERSION });
 }
 
 /** Host: push the whole bracket so the guest's screen follows along. */
@@ -6577,6 +6605,9 @@ function drawMenu() {
 
   drawLogo(W / 2, 48);
   text("LOCAL & ONLINE MULTIPLAYER SOCCER", W / 2, 82, 10, "#7dd3fc", "center", 800);
+  // Version badge, top-left: the corners are the only space the menu leaves free,
+  // and the menu has overflowed its canvas before, so nothing is added below.
+  text(`v${VERSION}`, 16, 20, 10, "#5f7391", "left", 800);
 
   // ---- panel geometry --------------------------------------------------
   const colW = 400, gapX = 24;
@@ -7030,6 +7061,18 @@ function drawOnline() {
     text(netIsHost() ? "PLAYER 2 · right" : "PLAYER 1 · left",
          bx + half * 1.5, 236, 10, "#8fa3c0", "center", 600);
 
+    /*
+      Version agreement. Host authority assumes both machines simulate the same
+      rules, so a differing build is called out here — as a warning, since close
+      versions normally play fine and refusing to connect would be worse.
+    */
+    if (net.versionMismatch) {
+      text(`⚠ their build is ${net.peerVersion || "unknown"} · yours is v${VERSION}`,
+           W / 2, 262, 10, "#fbbf24", "center", 800);
+    } else {
+      text(`both on v${VERSION}`, W / 2, 262, 9, "#5f7391", "center", 700);
+    }
+
     if (netIsHost()) {
       ctx.fillStyle = "#4ade80";
       roundRect(W / 2 - 150, 286, 300, 44, 9);
@@ -7257,7 +7300,8 @@ function drawSettings() {
   }
 
   text("SETTINGS", W / 2, 88, 32, "#ffffff", "center", 900);
-  text("saved on this computer", W / 2, 114, 12, "#8fa3c0", "center", 600);
+  text(`saved on this computer  ·  v${VERSION}`, W / 2, 114, 12, "#8fa3c0",
+       "center", 600);
 
   const items = [
     { label: "MUSIC", value: game.opt.music,
@@ -7615,6 +7659,9 @@ function drawCredits() {
     ["BUILT WITH", null],
     ["Claude Code", "pair programming"],
     ["Vanilla JavaScript · HTML5 Canvas", "no dependencies, one file"],
+    ["", null],
+    ["VERSION", null],
+    [`v${VERSION}`, "thanks for playing"],
   ];
 
   /*
@@ -15468,6 +15515,118 @@ function runTests() {
     game.particles = [];
   }
 
+  // 19al. Versioning: one constant, shown consistently, checked on connect.
+  {
+    const saved = { scene: game.scene, mode: game.mode, remoteName: game.remoteName };
+    const savedNet = { ...net };
+
+    ok("the version is a plain dotted number", /^\d+(\.\d+)+$/.test(VERSION), VERSION);
+
+    /*
+      The tab title is derived from VERSION at boot, so it cannot drift. Asserted
+      on the real document where there is one; the earlier form of this check was
+      wrapped in a `typeof document` guard and so never ran in the harness at all,
+      which let a hard-coded v1.4 title pass unnoticed.
+    */
+    if (typeof document !== "undefined" && "title" in document) {
+      ok("the page title carries the current version",
+         String(document.title).includes(`v${VERSION}`), String(document.title));
+    }
+
+    // The menu paints the badge, on screen.
+    game.scene = SCENE.MENU;
+    game.mode = MODE.SINGLE;
+    game.editing = -1;
+    {
+      const shot = capturePaint(drawMenu);
+      const badge = shot.lines.filter((l) => l.s === `v${VERSION}`);
+      ok("the menu shows the version", badge.length === 1,
+         `${badge.length} badges`);
+      const b = badge[0];
+      ok("the version badge is inside the canvas",
+         b && b.x >= 0 && b.x <= W && b.y >= 0 && b.y <= H,
+         b ? `(${b.x},${b.y})` : "none");
+      // It must not have pushed anything off the bottom: this menu has overflowed
+      // its canvas before.
+      const off = shot.lines.filter((l) => l.y < 0 || l.y > H);
+      ok("adding the badge kept the menu on screen", off.length === 0,
+         off.map((o) => o.s).join("|"));
+    }
+
+    // The credits screen agrees, and still fits.
+    {
+      const shot = capturePaint(drawCredits);
+      ok("the credits show the version", shot.strings.includes(`v${VERSION}`),
+         shot.strings.slice(-4).join("|"));
+      const over = shot.lines.filter((l) => l.y > H);
+      ok("the credits still fit on screen", over.length === 0,
+         over.map((o) => o.s).join("|"));
+    }
+
+    // ---- the handshake ---------------------------------------------------
+    net.active = true; net.role = "host"; net.state = "live";
+    net.localSeat = 0; net.remoteSeat = 1;
+
+    netHandle({ t: "hi", n: "ZOE", v: VERSION });
+    ok("a matching peer version raises no warning", net.versionMismatch === false);
+    ok("the peer version is recorded", net.peerVersion === VERSION, net.peerVersion);
+
+    netHandle({ t: "hi", n: "ZOE", v: "1.2" });
+    ok("a differing peer version is flagged", net.versionMismatch === true);
+    {
+      const shot = capturePaint(drawOnline);
+      ok("the mismatch is shown on the connection screen",
+         shot.strings.some((t) => /their build is 1\.2/.test(t)),
+         shot.strings.filter((t) => /build/.test(t)).join("|"));
+    }
+
+    // A peer too old to send a version at all is still a mismatch, and must not
+    // print "undefined" at the player.
+    netHandle({ t: "hi", n: "ZOE" });
+    ok("a peer with no version is treated as a mismatch", net.versionMismatch === true);
+    ok("and its version is empty, not undefined", net.peerVersion === "", net.peerVersion);
+    {
+      const shot = capturePaint(drawOnline);
+      ok("an unknown build is described, not left blank",
+         shot.strings.some((t) => /unknown/.test(t)));
+      ok("no 'undefined' ever reaches the screen",
+         !shot.strings.some((t) => /undefined/.test(t)),
+         shot.strings.filter((t) => /undefined/.test(t)).join("|"));
+    }
+
+    // A version string off the wire is untrusted input like any other.
+    netHandle({ t: "hi", n: "ZOE", v: "<b>1.9</b>" });
+    ok("a hostile version string is stripped",
+       !/[<>]/.test(net.peerVersion), net.peerVersion);
+    netHandle({ t: "hi", n: "ZOE", v: "9".repeat(500) });
+    ok("an over-long version is truncated", net.peerVersion.length <= 12,
+       `${net.peerVersion.length} chars`);
+    netHandle({ t: "hi", n: "ZOE", v: 42 });
+    ok("a non-string version does not throw or stick", net.peerVersion === "");
+
+    // Our own hello carries the version, so the peer can run the same check.
+    {
+      const sent = [];
+      const realChan = net.chan;
+      net.chan = { readyState: "open", send: (d) => sent.push(d) };
+      netSendHello();
+      net.chan = realChan;
+      const parsed = sent.map((d) => { try { return JSON.parse(d); } catch (e) { return {}; } });
+      ok("our hello announces our version",
+         parsed.some((m) => m.t === "hi" && m.v === VERSION),
+         JSON.stringify(parsed));
+    }
+
+    // Disconnecting must clear the warning, or it follows the player into the
+    // next connection.
+    netReset();
+    ok("netReset clears the version warning", net.versionMismatch === false);
+    ok("netReset clears the peer version", net.peerVersion === "", net.peerVersion);
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+  }
+
   // 23. Determinism: identical initial conditions give identical results.
   {
     const run = () => {
@@ -15487,6 +15646,14 @@ function runTests() {
 /* ------------------------------------------------------------------ BOOT */
 
 const isTest = typeof location !== "undefined" && /[?&]test=1\b/.test(location.search);
+
+/*
+  The tab title is written from VERSION rather than hard-coded in the <title>
+  tag, so it can never drift from the constant on a release. The tag above holds
+  the name only.
+*/
+try { document.title = `Head Game v${VERSION} — 1v1 Soccer`; }
+catch (e) { /* no document (test harness): nothing to title */ }
 
 game.names = loadNames();
 loadOpts(game.opt);
