@@ -2560,6 +2560,9 @@ const layoutProbe = { menu: null };
 */
 const drawProbe = { platforms: 0, faces: 0, walls: 0 };
 
+/** Captures the strings a draw pass paints; see capturePaint(). Off by default. */
+const textProbe = { on: false, lines: [] };
+
 /** What the credits screen last rendered, so the test suite can check names. */
 const creditProbe = { lines: [] };
 
@@ -5439,11 +5442,26 @@ function roundRect(x, y, w, h, r) {
 }
 
 function text(str, x, y, size, color, align = "center", weight = 800) {
+  if (textProbe.on) textProbe.lines.push({ s: String(str), x, y, size, color });
   ctx.font = `${weight} ${size}px ui-sans-serif, system-ui, sans-serif`;
   ctx.textAlign = align;
   ctx.textBaseline = "middle";
   ctx.fillStyle = color;
   ctx.fillText(str, x, y);
+}
+
+/**
+ * Run a draw function and return every string it actually painted, with where.
+ * Screens have shipped with a row that silently never painted, so a test that
+ * only checks "it did not throw" is not enough — this reads the real output.
+ */
+function capturePaint(fn) {
+  textProbe.on = true;
+  textProbe.lines = [];
+  try { fn(); } finally { textProbe.on = false; }
+  const lines = textProbe.lines;
+  textProbe.lines = [];
+  return { lines, strings: lines.map((l) => l.s) };
 }
 
 function drawPitch() {
@@ -8455,6 +8473,7 @@ const PHYS = {
   loadBoard, saveBoard, boardRecord, rankBoard, recordResult, lbPlayed, lbWinPct,
   MAPS, mapById, activePlatforms, MODE_PLATFORMS, resolvePlatform, ballVsPlatforms, playerVsPlatforms,
   FACES, HATS, faceById, hatById, faceMood, lookOf, drawFace, drawHat, drawProbe,
+  textProbe, capturePaint, lookForSeat, seatFixed, rerollDraw,
   WALL_W, WALL_H, WALL_LIFE, WALL_HP, WALL_CHARGES, WALL_RECHARGE, WALL_BREAK_V,
   WALL_MIN_GOAL_GAP, canBuildWall, buildWall, updateWalls, ballVsWalls,
   playerVsWalls, kickVsWalls, drawWalls, WALL_KICK_LIFE, WALL_HIT_CD, WALL_BALL_MIN_V,
@@ -14214,8 +14233,10 @@ function runTests() {
             if (aliveEntrants().length <= 1) beginRound(); else nextTie();
             continue;
           }
-          if (game.scene === SCENE.SELECT) {
-            startMatch();
+          // SELECT only appears while a team is still unchosen; later ties go
+          // straight to COUNTDOWN with the entrant's locked-in team.
+          if (game.scene === SCENE.SELECT) { startMatch(); continue; }
+          if (game.scene === SCENE.COUNTDOWN || game.scene === SCENE.PLAY) {
             const w = game.seats[0] < game.seats[1] ? 0 : 1;
             game.score = w === 0 ? [3, 0] : [0, 3];
             finishMatch(w, false);
@@ -15058,6 +15079,393 @@ function runTests() {
     const p = new Player(0, TEAMS[0]);
     ok("kick starts", p.tryStartKick() === true);
     ok("kick cannot restart mid-swing", p.tryStartKick() === false);
+  }
+
+  // 19aj. A kick RESETS THE JUMP, so the ball can be juggled across the pitch.
+  {
+    const saved = { players: game.players, ball: game.ball, mode: game.mode,
+                    scene: game.scene, cpu: [...game.cpu] };
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, false];
+    game.sel = [0, 3];
+    startMatch();
+
+    /** Put a player in mid-air, then swing — with the ball in reach or not. */
+    const airSwing = (connects) => {
+      const p = new Player(0, TEAMS[0]);
+      p.reset();
+      p.facing = 1;
+      intent[0].up = true;
+      p.update(DT, null);
+      intent[0].up = false;
+      for (let i = 0; i < 8; i++) p.update(DT, null);
+      const airborne = !p.onGround;
+      p.kickT = KICK_TIME * 0.5;
+      p.kickConsumed = false;
+      const tip = p.legTip;
+      // In reach, or far across the pitch where the swing hits nothing.
+      game.ball = connects
+        ? { x: tip.x + 4, y: tip.y, vx: 0, vy: 0, r: BALL_R, mass: BALL_MASS }
+        : { x: tip.x + 400, y: tip.y, vx: 0, vy: 0, r: BALL_R, mass: BALL_MASS };
+      const yBefore = p.y;
+      ballVsPlayer(p);
+      return { p, airborne, moved: Math.abs(p.y - yBefore) };
+    };
+
+    const hitIt = airSwing(true);
+    ok("the test player really was airborne", hitIt.airborne);
+    ok("a connecting mid-air kick restores the jump", hitIt.p.onGround === true);
+    ok("the reset is flagged for the visual cue", hitIt.p.airKickReset === true);
+    ok("the kick does not teleport the player to the ground", hitIt.moved < 2,
+       `${hitIt.moved.toFixed(1)} px`);
+
+    // The restored jump must be a REAL jump, not just a flag.
+    {
+      const p = hitIt.p;
+      intent[0].up = true;
+      p.update(DT, null);
+      intent[0].up = false;
+      ok("the restored jump actually launches", p.vy < -100, `vy ${p.vy.toFixed(0)}`);
+      // ...and it is spent: no third jump without another touch.
+      for (let i = 0; i < 6; i++) p.update(DT, null);
+      ok("the restored jump is consumed, not permanent", p.onGround === false);
+      const vyAir = p.vy;
+      intent[0].up = true;
+      p.update(DT, null);
+      intent[0].up = false;
+      ok("no free third jump", p.vy >= vyAir - 1, `vy ${p.vy.toFixed(0)}`);
+      // And the player still falls back to the floor normally.
+      for (let i = 0; i < 700; i++) p.update(DT, null);
+      ok("the player still lands on the ground",
+         near(p.y + p.r, GROUND_Y, 1.5), `${(p.y + p.r).toFixed(1)} vs ${GROUND_Y}`);
+    }
+
+    // Swinging at nothing must NOT hand back the jump — otherwise the kick key
+    // would simply be a double jump.
+    {
+      const miss = airSwing(false);
+      ok("a swing that connects with nothing gives no jump back",
+         miss.p.onGround === false);
+      ok("and sets no reset flag", !miss.p.airKickReset);
+    }
+
+    Object.assign(game, saved);
+  }
+
+  // 19ak. A tournament team is for the WHOLE tournament, and the draw can be
+  // re-rolled until the first tie is played.
+  {
+    const saved = { mode: game.mode, scene: game.scene, entrants: game.entrants,
+                    entrantCount: game.entrantCount, round: game.round,
+                    roundPairs: game.roundPairs, tieIndex: game.tieIndex,
+                    seats: [...game.seats], sel: [...game.sel],
+                    locked: [...game.locked], cpu: [...game.cpu],
+                    champion: game.champion, lastResult: game.lastResult,
+                    bracket: game.bracket, drawOrder: [...(game.drawOrder || [])],
+                    looks: game.looks.map((l) => ({ ...l })),
+                    selFixed: [...game.selFixed], players: game.players,
+                    goalsToWin: game.goalsToWin, timeIdx: game.timeIdx };
+    const savedNet = { ...net };
+    net.active = false; net.role = null;
+
+    const setup = (n) => {
+      game.mode = MODE.TOURNAMENT;
+      game.entrantCount = n;
+      game.rosterNames = Array.from({ length: n }, (_, i) => `E${i + 1}`);
+      game.rosterCpu = Array.from({ length: n }, () => false);
+      game.goalsToWin = 3;
+      game.timeIdx = 0;
+      startTournament();
+    };
+
+    /*
+      Play a whole bracket, recording the team and character each ENTRANT used in
+      every match they played. Each entrant picks something distinctive the first
+      time they appear; if a choice were tied to the seat instead of the entrant,
+      the record would show it change.
+    */
+    const playAll = (n, winSeat) => {
+      setup(n);
+      const chose = {}, used = {}, seatsUsed = {};
+      const selectRounds = [];
+      let pick = 0, guard = 0, ties = 0;
+      while (game.scene !== SCENE.CHAMPION && guard++ < 300) {
+        if (game.scene === SCENE.BRACKET) {
+          if (aliveEntrants().length <= 1) beginRound(); else nextTie();
+          continue;
+        }
+        if (game.scene === SCENE.SELECT) {
+          selectRounds.push(game.round);
+          for (let sSeat = 0; sSeat < 2; sSeat++) {
+            if (game.selFixed[sSeat]) continue;   // already locked in: leave it
+            const id = game.seats[sSeat];
+            const face = FACES[pick % FACES.length].id;
+            const hat = HATS[pick % HATS.length].id;
+            const tIdx = (pick * 3 + 2) % TEAMS.length;
+            pick++;
+            chose[id] = { face, hat, team: TEAMS[tIdx].name };
+            game.looks[sSeat] = { face, hat };
+            game.lookOverride[sSeat] = null;
+            game.sel[sSeat] = tIdx;
+          }
+          startMatch();
+          continue;
+        }
+        if (game.scene === SCENE.COUNTDOWN || game.scene === SCENE.PLAY) {
+          for (let sSeat = 0; sSeat < 2; sSeat++) {
+            const id = game.seats[sSeat];
+            const l = lookOf(game.players[sSeat]);
+            (used[id] = used[id] || []).push({
+              team: game.players[sSeat].team.name, face: l.face, hat: l.hat,
+            });
+            (seatsUsed[id] = seatsUsed[id] || []).push(sSeat);
+          }
+          const w = winSeat === "low" ? (game.seats[0] < game.seats[1] ? 0 : 1)
+                                      : winSeat;
+          game.score = w === 0 ? [3, 0] : [0, 3];
+          finishMatch(w, false);
+          ties++;
+          game.scene = SCENE.BRACKET;
+          continue;
+        }
+        break;
+      }
+      return { chose, used, seatsUsed, selectRounds, ties };
+    };
+
+    {
+      const r = playAll(8, "low");
+      ok("an 8-entrant bracket still resolves", game.scene === SCENE.CHAMPION,
+         game.scene);
+      ok("it still plays every tie", r.ties === tiesRemaining(8), `${r.ties}`);
+
+      // Team select happens in round one ONLY. Later rounds reuse the choice.
+      const later = r.selectRounds.filter((rd) => rd !== 1);
+      ok("team select only ever appears in round one", later.length === 0,
+         `also rounds ${later.join(",")}`);
+
+      // Nobody's team or character changed between their matches.
+      let mismatches = 0, multiMatch = 0;
+      for (const id of Object.keys(r.used)) {
+        const c = r.chose[id], list = r.used[id];
+        if (list.length > 1) multiMatch++;
+        for (const u of list) {
+          if (u.team !== c.team || u.face !== c.face || u.hat !== c.hat) mismatches++;
+        }
+      }
+      ok("some entrants played more than one tie", multiMatch >= 2, `${multiMatch}`);
+      ok("every entrant kept one team and character all tournament",
+         mismatches === 0, `${mismatches} mismatches`);
+    }
+
+    /*
+      The real test of per-ENTRANT storage: always let seat 1 win, so a winner
+      from seat 1 is reseated at seat 0 next round. A look stored per seat would
+      follow the chair and break here.
+    */
+    {
+      const r = playAll(8, 1);
+      let movers = 0, mismatches = 0;
+      for (const id of Object.keys(r.used)) {
+        if (new Set(r.seatsUsed[id]).size > 1) movers++;
+        const c = r.chose[id];
+        for (const u of r.used[id]) {
+          if (u.team !== c.team || u.face !== c.face || u.hat !== c.hat) mismatches++;
+        }
+      }
+      ok("at least one entrant changed seats between rounds", movers >= 1,
+         `${movers}`);
+      ok("identity follows the entrant, not the seat", mismatches === 0,
+         `${mismatches} mismatches`);
+    }
+
+    // A seat locked for the tournament ignores the select screen entirely.
+    {
+      setup(4);
+      nextTie();
+      game.scene = SCENE.SELECT;
+      game.selFixed = [true, false];
+      game.locked = [true, false];
+      game.lookRow = [0, 0];
+      game.sel = [2, 5];
+      const before = game.sel[0];
+      pressed[SCHEME[0].right] = true;
+      edgeFrame = true;
+      updateSelect(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("a locked seat cannot change team", game.sel[0] === before,
+         `${before} -> ${game.sel[0]}`);
+      ok("a locked seat stays ready", game.locked[0] === true);
+
+      // Kick must not un-ready it either.
+      pressed[SCHEME[0].kick] = true;
+      edgeFrame = true;
+      updateSelect(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("kick cannot un-ready a locked seat", game.locked[0] === true);
+
+      // The other seat is still free to choose.
+      const free = game.sel[1];
+      pressed[SCHEME[1].right] = true;
+      edgeFrame = true;
+      updateSelect(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("the unlocked seat can still pick", game.sel[1] !== free,
+         `${free} -> ${game.sel[1]}`);
+    }
+
+    // Both new states must actually PAINT — a green suite has hidden an unpainted
+    // row before, so this asserts on real drawn text.
+    {
+      game.mode = MODE.TOURNAMENT;
+      game.scene = SCENE.SELECT;
+      game.selFixed = [true, false];
+      game.locked = [true, false];
+      game.cpu = [false, false];
+      game.sel = [2, 5];
+      game.seats = [0, 1];
+      const shown = capturePaint(drawSelect).strings;
+      ok("a locked seat is labelled LOCKED IN on screen", shown.includes("LOCKED IN"),
+         shown.slice(0, 8).join("|"));
+      ok("and it says why the seat cannot be changed",
+         shown.some((t) => /locked for the tournament/i.test(t)));
+      ok("the free seat still shows its own controls",
+         shown.some((t) => /ENTER to lock/i.test(t)));
+
+      // The bracket advertises the re-roll, and withdraws the offer once used up.
+      game.scene = SCENE.BRACKET;
+      game.round = 1; game.tieIndex = 0; game.lastResult = null;
+      const fresh = capturePaint(drawBracket).strings;
+      ok("the bracket offers the re-draw", fresh.some((t) => /re-draw/i.test(t)),
+         fresh.slice(-4).join("|"));
+      game.lastResult = { winnerId: 0, loserId: 1, score: [3, 0], byTime: false };
+      const later = capturePaint(drawBracket).strings;
+      ok("and withdraws it once the tournament is under way",
+         !later.some((t) => /re-draw/i.test(t)));
+      game.rerollDenied = 1;
+      const denied = capturePaint(drawBracket).strings;
+      ok("a refused re-draw says so on screen",
+         denied.some((t) => /too late/i.test(t)));
+      game.rerollDenied = 0;
+      game.lastResult = null;
+    }
+
+    // A stale lock must never leak into a non-tournament match.
+    {
+      game.mode = MODE.SINGLE;
+      game.selFixed = [true, true];
+      game.lookOverride = [{ face: FACES[3].id, hat: HATS[3].id }, null];
+      game.locked = [false, false];
+      game.lookRow = [0, 0];
+      game.sel = [1, 4];
+      const before = game.sel[0];
+      pressed[SCHEME[0].right] = true;
+      edgeFrame = true;
+      updateSelect(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("a leftover tournament lock never freezes a normal match",
+         game.sel[0] !== before, `${before} -> ${game.sel[0]}`);
+      game.looks[0] = { face: FACES[0].id, hat: HATS[0].id };
+      ok("nor a leftover character override",
+         lookForSeat(0).face === FACES[0].id, lookForSeat(0).face);
+      game.selFixed = [false, false];
+      game.lookOverride = [null, null];
+    }
+
+    // ---- the draw re-roll ------------------------------------------------
+    {
+      setup(8);
+      const sig = () => JSON.stringify(game.roundPairs);
+      let changed = 0, accepted = 0;
+      for (let i = 0; i < 30; i++) {
+        const b = sig();
+        if (rerollDraw() === true) accepted++;
+        if (sig() !== b) changed++;
+      }
+      ok("every re-roll before the first tie is allowed", accepted === 30,
+         `${accepted}/30`);
+      // A shuffle may land on the same pairing, so this is a floor, not equality.
+      ok("re-rolling actually changes the draw", changed >= 20, `${changed}/30`);
+      ok("the re-roll counter tracks the rolls", game.drawRolls === 30,
+         `${game.drawRolls}`);
+      ok("a re-roll does not advance the round", game.round === 1, `${game.round}`);
+      ok("a re-roll eliminates nobody", aliveEntrants().length === 8,
+         `${aliveEntrants().length}`);
+      ok("the drawn tree matches the new pairings",
+         JSON.stringify(game.bracket[0].map((t) => [t.a, t.b])) === sig());
+
+      // Every entrant still appears exactly once in the new draw.
+      const seen = game.roundPairs.flat().filter((x) => x !== null).sort((a, b) => a - b);
+      ok("the re-rolled draw still includes every entrant once",
+         JSON.stringify(seen) === JSON.stringify([0, 1, 2, 3, 4, 5, 6, 7]),
+         JSON.stringify(seen));
+
+      /*
+        R on the bracket screen performs the roll. Asserted on the roll COUNTER,
+        not on the pairings: a shuffle can legitimately land on the same order,
+        so comparing pairings would be flaky — and an "or" escape hatch here let
+        this pass once with the key unwired at all.
+      */
+      const rollsBefore = game.drawRolls;
+      pressed.KeyR = true;
+      edgeFrame = true;
+      step(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("R re-draws from the bracket screen", game.drawRolls === rollsBefore + 1,
+         `${rollsBefore} -> ${game.drawRolls}`);
+      ok("R does not start a tie", game.scene === SCENE.BRACKET, game.scene);
+
+      // Once a tie is played the draw is history and must not be reshuffled.
+      nextTie();
+      startMatch();
+      game.score = [3, 0];
+      finishMatch(0, false);
+      game.scene = SCENE.BRACKET;
+      const locked = sig();
+      ok("a re-roll is refused once a tie has been played", rerollDraw() === false);
+      ok("and the draw is untouched", sig() === locked);
+
+      // The refusal is visible, not silent.
+      game.rerollDenied = 0;
+      pressed.KeyR = true;
+      edgeFrame = true;
+      step(DT);
+      for (const k in pressed) delete pressed[k];
+      edgeFrame = true;
+      ok("the refusal shows an on-screen notice", game.rerollDenied > 0,
+         `${game.rerollDenied}`);
+
+      // Later rounds are never re-rollable either.
+      game.round = 2; game.tieIndex = 0; game.lastResult = null;
+      ok("a later round cannot be re-drawn", rerollDraw() === false);
+
+      // Nor is it a general-purpose key outside a tournament.
+      game.mode = MODE.SINGLE; game.round = 1; game.tieIndex = 0;
+      ok("re-roll does nothing outside a tournament", rerollDraw() === false);
+      game.mode = MODE.TOURNAMENT;
+
+      // A guest never re-rolls: the host owns the bracket.
+      net.active = true; net.role = "guest";
+      game.round = 1; game.tieIndex = 0; game.lastResult = null;
+      ok("a guest cannot re-roll the host's draw", rerollDraw() === false);
+      net.active = false; net.role = null;
+
+      // And the bracket still paints after a re-roll.
+      setup(6);
+      rerollDraw();
+      let threw = null;
+      try { drawBracket(); } catch (e) { threw = e.message; }
+      ok("the bracket still renders after a re-roll", !threw, threw || "");
+    }
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+    game.particles = [];
   }
 
   // 23. Determinism: identical initial conditions give identical results.
