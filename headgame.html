@@ -42,7 +42,7 @@
 </style>
 
 <div id="wrap"><canvas id="cv" width="1000" height="600"></canvas></div>
-<div id="hint">P1 = W A S D + F &nbsp;·&nbsp; P2 = Arrows + Enter &nbsp;·&nbsp; <b>ESC = pause, settings &amp; quit</b> &nbsp;·&nbsp; pick a face &amp; hat on the team screen</div>
+<div id="hint">P1 = W A S D + F, G = build &nbsp;·&nbsp; P2 = Arrows + Enter, R-Shift = build &nbsp;·&nbsp; rebindable on CONTROLS &nbsp;·&nbsp; gamepads &amp; music supported &nbsp;·&nbsp; ESC = pause</div>
 
 <script>
 "use strict";
@@ -655,8 +655,38 @@ const MAPS = [
 const mapById = (id) => MAPS.find((m) => m.id === id) || MAPS[0];
 
 /** Platforms in play right now. Net modes stay clear so rallies aren't blocked. */
+/*
+  Platforms for the net and hoop modes. The arena maps are authored for a soccer
+  pitch, so dropping them into volleyball would wall off the rally. These are
+  purpose-built per mode: symmetric, clear of the net column and the hoops, and
+  low enough to jump from rather than hide behind.
+*/
+// Keyed by the MODE string values directly: `MODE` itself is declared further
+// down the file, so referencing it here would hit its temporal dead zone.
+const MODE_PLATFORMS = {
+  volley: [
+    // Two low pads either side, to spike from. Well clear of the net at x=500.
+    { x: 150, y: 430, w: 120, h: PLAT_H, kind: "bounce" },
+    { x: 730, y: 430, w: 120, h: PLAT_H, kind: "bounce" },
+  ],
+  tennis: [
+    // Ledges deep in each court, for a smash on the return.
+    { x: 120, y: 400, w: 130, h: PLAT_H, kind: "solid" },
+    { x: 750, y: 400, w: 130, h: PLAT_H, kind: "solid" },
+  ],
+  basket: [
+    // Springboards under each hoop, plus a centre ledge to shoot from.
+    { x: 150, y: 400, w: 130, h: PLAT_H, kind: "bounce" },
+    { x: 720, y: 400, w: 130, h: PLAT_H, kind: "bounce" },
+    { x: 430, y: 330, w: 140, h: PLAT_H, kind: "solid" },
+  ],
+};
+
 function activePlatforms() {
-  if (modeCfg().net > 0) return [];
+  // Net and hoop modes use their own purpose-built layout; the soccer modes use
+  // whichever arena the player picked.
+  const own = MODE_PLATFORMS[game.mode];
+  if (own) return own;
   return mapById(game.mapId).platforms;
 }
 
@@ -842,6 +872,13 @@ const WALL_RECHARGE = 7;        // seconds to earn one back
 const WALL_DIST = 62;           // how far in front it appears
 const WALL_HP = 3;              // hard hits it survives
 const WALL_BREAK_V = 900;       // ball speed that counts as a hard hit
+const WALL_KICK_LIFE = 1.6;     // seconds a direct kick takes off a wall
+const WALL_KICK_REACH = 26;     // how close the leg must be to connect
+// A ball impact also costs the wall time, scaled by how hard it lands.
+const WALL_BALL_MIN_V = 260;    // below this the ball just bounces off harmlessly
+const WALL_BALL_LIFE_MIN = 0.35; // cost of a soft-but-real hit
+const WALL_BALL_LIFE_MAX = 1.8;  // cost at full pace
+const WALL_HIT_CD = 0.2;        // per-wall gap between ball hits
 const WALL_REST = 0.72;         // bounciness
 
 /** Can this player raise a wall right now? */
@@ -855,30 +892,66 @@ function canBuildWall(pl) {
  * Placement is clamped inside the pitch and pushed out of the goal mouths so a
  * wall can never make a goal unreachable.
  */
+/*
+  In the net and hoop modes a tall vertical wall would simply block the rally, so
+  the same ability instead lays a horizontal PLATFORM in front of the player —
+  something to jump onto and spike or shoot from. It is the same entity with
+  different dimensions, so every collider, timer and damage rule already applies.
+*/
+const buildsPlatform = () => modeCfg().net > 0 || game.mode === MODE.BASKET;
+
+const PLATFORM_W = 118;         // built platform: wide and shallow
+const PLATFORM_H = 16;
+const PLATFORM_Y = GROUND_Y - 108;   // high enough to be worth jumping to
+
 function buildWall(pl) {
   if (!canBuildWall(pl)) return null;
 
+  const asPlatform = buildsPlatform();
+  const bw = asPlatform ? PLATFORM_W : WALL_W;
+  const bh = asPlatform ? PLATFORM_H : WALL_H;
+  const by = asPlatform ? PLATFORM_Y : GROUND_Y - WALL_H;
+
   const raw = pl.x + pl.facing * WALL_DIST;
-  // Keep clear of both goal mouths.
-  const lo = WALL + WALL_MIN_GOAL_GAP;
-  const hi = W - WALL - WALL_MIN_GOAL_GAP - WALL_W;
-  const x = clamp(raw - WALL_W / 2, lo, hi);
+  let lo, hi;
+  if (asPlatform) {
+    /*
+      Keep a built platform out of the net column and clear of the hoops, so the
+      ability can never wall off a rally or block a shot at the basket.
+    */
+    lo = WALL + 8;
+    hi = W - WALL - 8 - bw;
+  } else {
+    lo = WALL + WALL_MIN_GOAL_GAP;
+    hi = W - WALL - WALL_MIN_GOAL_GAP - bw;
+  }
+  let x = clamp(raw - bw / 2, lo, hi);
+
+  if (asPlatform && modeCfg().net > 0) {
+    // Push it fully onto the builder's own side of the net.
+    const half = W / 2;
+    if (pl.index === 0) x = Math.min(x, half - NET_W / 2 - bw - 6);
+    else x = Math.max(x, half + NET_W / 2 + 6);
+    x = clamp(x, lo, hi);
+  }
 
   const w = {
     owner: pl.index,
     x,
-    y: GROUND_Y - WALL_H,
-    w: WALL_W,
-    h: WALL_H,
+    y: by,
+    w: bw,
+    h: bh,
     kind: "solid",          // reuses the platform collider
-    life: WALL_LIFE,
+    platform: asPlatform,   // drives the rendering and the label
+    life: WALL_LIFE * (inRun() && pl.index === 0 ? game.run.mods.wallLife : 1),
     hp: WALL_HP,
+    hitCD: 0,               // gap between ball impacts
     born: 0,                // grows out of the ground when raised
   };
   game.walls.push(w);
   pl.wallCharges--;
   pl.wallCD = WALL_COOLDOWN;
-  burst(x + WALL_W / 2, GROUND_Y - 8, "#94a3b8", 12);
+  burst(x + bw / 2, by + bh, asPlatform ? "#7dd3fc" : "#94a3b8", 12);
   game.shake = Math.max(game.shake, 0.12);
   return w;
 }
@@ -887,6 +960,8 @@ function updateWalls(dt) {
   for (let i = game.walls.length - 1; i >= 0; i--) {
     const w = game.walls[i];
     w.born = Math.min(1, w.born + dt * 6);      // rise animation
+    if (w.kickFlash > 0) w.kickFlash = Math.max(0, w.kickFlash - dt);
+    if (w.hitCD > 0) w.hitCD = Math.max(0, w.hitCD - dt);
     w.life -= dt;
     if (w.life <= 0 || w.hp <= 0) {
       burst(w.x + w.w / 2, w.y + w.h / 2, "#64748b", 14);
@@ -901,7 +976,8 @@ function updateWalls(dt) {
       pl.wallRecharge -= dt;
       if (pl.wallRecharge <= 0) {
         pl.wallCharges++;
-        pl.wallRecharge = WALL_RECHARGE;
+        pl.wallRecharge = WALL_RECHARGE *
+          (inRun() && pl.index === 0 ? game.run.mods.wallRecharge : 1);
       }
     } else {
       pl.wallRecharge = WALL_RECHARGE;
@@ -916,15 +992,82 @@ function ballVsWalls(b) {
     if (w.born < 0.5) continue;                 // still rising: not yet solid
     const speed = len(b.vx, b.vy);
     const side = resolvePlatform(b, w, ballRest * WALL_REST);
-    if (side) {
-      if (speed > WALL_BREAK_V) {
-        w.hp--;
-        burst(b.x, b.y, "#cbd5e1", 8);
-        game.shake = Math.max(game.shake, 0.14);
-      }
-      limitSpeed(b, BALL_MAX_V);
+    if (!side) continue;
+
+    limitSpeed(b, BALL_MAX_V);
+
+    /*
+      A ball striking a wall shortens its life, like a kick does — scaled by how
+      hard it hit, so a firm shot costs the wall much more than a gentle roll.
+
+      Two guards matter here. This runs every substep while the ball is touching,
+      so without a hit COOLDOWN a ball resting against a wall would drain 120
+      hits a second; and without a speed FLOOR a ball trickling along the top
+      would erode it for free.
+    */
+    /*
+      Your own wall is your defence, so you cannot break it yourself. Attributed
+      by whoever last touched the ball: if that was the wall's owner, the ball
+      bounces off harmlessly. An untouched ball (a mine blast, a stray rebound)
+      damages nobody's wall either, which is the safe default.
+    */
+    if (w.owner === game.ballLastTouch) continue;
+    if (game.ballLastTouch < 0) continue;
+
+    if (w.hitCD > 0) continue;
+    if (speed < WALL_BALL_MIN_V) continue;
+
+    const over = (speed - WALL_BALL_MIN_V) / (WALL_BREAK_V - WALL_BALL_MIN_V);
+    const cost = WALL_BALL_LIFE_MIN +
+                 clamp(over, 0, 1.5) * (WALL_BALL_LIFE_MAX - WALL_BALL_LIFE_MIN);
+    w.life -= cost;
+    w.hitCD = WALL_HIT_CD;
+    w.kickFlash = Math.max(w.kickFlash || 0, 0.2);
+
+    // A really hard shot still costs a hit point on top, as before.
+    if (speed > WALL_BREAK_V) {
+      w.hp--;
+      game.shake = Math.max(game.shake, 0.14);
+    }
+    burst(b.x, b.y, "#cbd5e1", 8);
+
+    if (w.life <= 0 || w.hp <= 0) {
+      burst(w.x + w.w / 2, w.y + w.h / 2, "#94a3b8", 16);
+      game.walls.splice(i, 1);
     }
   }
+}
+
+/**
+ * A kick that lands on a wall knocks time off it. Called during the kick swing,
+ * so it costs the attacker a swing rather than being free — and it gives a
+ * player without a fast shot a way to clear a wall in their path.
+ * Returns the wall that was hit, or null.
+ */
+function kickVsWalls(pl) {
+  if (pl.kickT <= 0 || pl.wallKicked) return null;
+  const tip = pl.legTip;
+  for (let i = game.walls.length - 1; i >= 0; i--) {
+    const w = game.walls[i];
+    if (w.born < 0.5) continue;
+    if (w.owner === pl.index) continue;      // you cannot kick down your own wall
+    // Nearest point on the slab to the leg tip.
+    const cx = clamp(tip.x, w.x, w.x + w.w);
+    const cy = clamp(tip.y, w.y, w.y + w.h);
+    if (len(tip.x - cx, tip.y - cy) > tip.r + WALL_KICK_REACH) continue;
+
+    w.life -= WALL_KICK_LIFE;
+    w.kickFlash = 0.25;
+    pl.wallKicked = true;              // one wall per swing
+    burst(cx, cy, "#cbd5e1", 10);
+    game.shake = Math.max(game.shake, 0.16);
+    if (w.life <= 0) {
+      burst(w.x + w.w / 2, w.y + w.h / 2, "#94a3b8", 16);
+      game.walls.splice(i, 1);
+    }
+    return w;
+  }
+  return null;
 }
 
 /** Players stand on their own and each other's walls. */
@@ -934,11 +1077,472 @@ function playerVsWalls(p) {
     const withinX = p.x > w.x - p.r * 0.65 && p.x < w.x + w.w + p.r * 0.65;
     if (!withinX) continue;
     const feet = p.y + p.r;
-    if (p.vy >= 0 && feet >= w.y - 1 && feet <= w.y + w.h * 0.5) {
+    // A built platform is only 16px deep, so give it a usable landing band
+    // rather than a fraction of its height.
+    const band = w.platform ? w.h + 10 : w.h * 0.5;
+    if (p.vy >= 0 && feet >= w.y - 1 && feet <= w.y + band) {
       p.y = w.y - p.r;
       p.vy = 0;
       p.onGround = true;
     }
+  }
+}
+
+/*
+  ROGUELIKE RUN (single player)
+
+  A ladder of matches against escalating CPU opponents. Win one and you choose
+  an upgrade that persists for the rest of the run; lose and the run ends.
+
+  Design notes:
+    - Upgrades are MULTIPLIERS applied on top of the team's own stats, held in
+      `game.run.mods`. They are re-applied in Player.applyChaos, which already
+      recomputes derived stats, so a mid-run power-up or chaos roll composes
+      correctly instead of overwriting them.
+    - Every stage is beatable by design: the CPU tier rises but the target score
+      stays low, and the player keeps compounding advantages.
+    - Losing forfeits the run's upgrades, not the leaderboard record.
+*/
+const RUN_STAGES = [
+  { name: "WARM-UP",    cpu: 0, goals: 2, mode: "single", label: "friendly kickabout" },
+  { name: "THE LOCALS", cpu: 0, goals: 3, mode: "single", label: "they mean it now" },
+  { name: "BEACH DUEL", cpu: 1, goals: 3, mode: "volley", label: "sand and a high net" },
+  { name: "COURT CLASH",cpu: 1, goals: 3, mode: "tennis", label: "one bounce per side" },
+  { name: "THE ARENA",  cpu: 1, goals: 4, mode: "single", label: "platforms in play" },
+  { name: "HARDWOOD",   cpu: 2, goals: 3, mode: "basket", label: "through the hoop" },
+  { name: "CHAOS PIT",  cpu: 2, goals: 4, mode: "single", label: "every stat re-rolls" },
+  { name: "THE FINAL",  cpu: 2, goals: 5, mode: "single", label: "beat the champion" },
+];
+
+/*
+  Upgrade pool. `apply` mutates the run's modifier bag; nothing here touches a
+  Player directly, so the same upgrade works for a player created later.
+*/
+const UPGRADES = [
+  { id: "speed",   name: "FLEET FOOTED", desc: "+18% movement speed",
+    apply: (m) => { m.speed *= 1.18; } },
+  { id: "power",   name: "CANNON LEG",   desc: "+22% shot power",
+    apply: (m) => { m.shot *= 1.22; } },
+  { id: "jump",    name: "SPRING HEELS", desc: "+16% jump height",
+    apply: (m) => { m.jump *= 1.16; } },
+  { id: "size",    name: "BROAD SHOULDERS", desc: "+12% size and mass",
+    apply: (m) => { m.size *= 1.12; } },
+  { id: "small",   name: "NIMBLE",       desc: "-12% size, harder to hit",
+    apply: (m) => { m.size *= 0.88; } },
+  { id: "walls",   name: "MASON",        desc: "+1 wall charge",
+    apply: (m) => { m.wallCharges += 1; } },
+  { id: "wallLife",name: "REINFORCED",   desc: "walls last 50% longer",
+    apply: (m) => { m.wallLife *= 1.5; } },
+  { id: "recharge",name: "QUARRY",       desc: "walls recharge twice as fast",
+    apply: (m) => { m.wallRecharge *= 0.5; } },
+  { id: "ammo",    name: "GUNSLINGER",   desc: "start each match with a pistol",
+    apply: (m) => { m.startAmmo += PISTOL_AMMO; } },
+  { id: "keeper",  name: "LOYAL KEEPER", desc: "a goalkeeper joins every match",
+    apply: (m) => { m.freeKeeper = true; } },
+  { id: "striker", name: "STRIKE PARTNER", desc: "a striker joins every match",
+    apply: (m) => { m.freeStriker = true; } },
+  { id: "cooldown",name: "QUICK FEET",   desc: "kick cooldown cut by a third",
+    apply: (m) => { m.kickCD *= 0.66; } },
+];
+
+const upgradeById = (id) => UPGRADES.find((u) => u.id === id) || null;
+
+/** A fresh, neutral modifier bag. */
+function freshMods() {
+  return {
+    speed: 1, shot: 1, jump: 1, size: 1,
+    wallCharges: 0, wallLife: 1, wallRecharge: 1,
+    startAmmo: 0, freeKeeper: false, freeStriker: false, kickCD: 1,
+  };
+}
+
+/** Begin a new run at stage 0. */
+function startRun() {
+  game.run = {
+    active: true,
+    stage: 0,
+    mods: freshMods(),
+    taken: [],            // upgrade ids, in the order chosen
+    offer: [],            // the three currently on offer
+    offerRow: 0,
+    lives: 1,
+    bestStage: game.run ? game.run.bestStage : 0,
+    teamIdx: null,          // set when the first match starts
+    cpuTeamIdx: null,
+  };
+  loadRunBest();
+  beginRunStage(true);      // only the opening stage shows team select
+}
+
+/**
+ * Configure and launch the current stage.
+ *
+ * `firstStage` is true only for the opening match, which is the ONLY point a run
+ * shows team select. Later stages drop straight into the countdown: returning to
+ * select between every stage let the player re-pick a team, which silently
+ * changed their speed and shot power and made the carried-over upgrades look
+ * like they had been lost.
+ */
+function beginRunStage(firstStage) {
+  const st = RUN_STAGES[game.run.stage];
+  game.mode = st.mode;
+  game.cpu = [false, true];
+  game.cpuLevel = st.cpu;
+  game.goalsToWin = st.goals;
+  game.timeIdx = 0;                       // no clock: a run is decided on goals
+  game.chaos = st.name === "CHAOS PIT";
+  game.mapId = st.name === "THE ARENA" ? "terraces" : "classic";
+  game.seats = [null, null];
+  game.locked = [false, false];
+
+  if (firstStage) {
+    game.scene = SCENE.SELECT;            // pick your team once, at the start
+    return;
+  }
+
+  /*
+    Keep the team the player locked in at the start of the run, then go straight
+    into the next match. `startMatch` rebuilds both Players, and the constructor
+    calls applyChaos, so the run modifiers are re-applied to the fresh object.
+  */
+  game.sel = [game.run.teamIdx, game.run.cpuTeamIdx];
+  startMatch();
+}
+
+/**
+ * Pick three distinct upgrades to offer, never repeating one already taken
+ * unless the pool is exhausted.
+ */
+function rollOffer() {
+  const pool = UPGRADES.filter((u) => !game.run.taken.includes(u.id));
+  const from = pool.length >= 3 ? pool : UPGRADES.slice();
+  const picked = [];
+  while (picked.length < 3 && picked.length < from.length) {
+    const c = from[(Math.random() * from.length) | 0];
+    if (!picked.includes(c)) picked.push(c);
+  }
+  game.run.offer = picked;
+  game.run.offerRow = 0;
+}
+
+/** Take an upgrade and advance to the next stage. */
+function takeUpgrade(u) {
+  if (!u) return;
+  u.apply(game.run.mods);
+  game.run.taken.push(u.id);
+  game.run.stage++;
+  if (game.run.stage >= RUN_STAGES.length) {
+    game.run.bestStage = RUN_STAGES.length;
+    saveRunBest();
+    game.scene = SCENE.RUNWIN;
+    return;
+  }
+  game.run.bestStage = Math.max(game.run.bestStage, game.run.stage);
+  saveRunBest();
+  beginRunStage(false);     // straight into the next match
+}
+
+/** The run ends here. */
+function endRun() {
+  game.run.active = false;
+  saveRunBest();
+  game.scene = SCENE.RUNOVER;
+}
+
+function loadRunBest() {
+  try {
+    const v = parseInt(localStorage.getItem("headgame.runbest") || "0", 10);
+    game.run.bestStage = Number.isFinite(v) ? clamp(v, 0, RUN_STAGES.length) : 0;
+  } catch (e) { game.run.bestStage = 0; }
+}
+
+function saveRunBest() {
+  try { localStorage.setItem("headgame.runbest", String(game.run.bestStage)); }
+  catch (e) { /* not fatal */ }
+}
+
+const inRun = () => !!(game.run && game.run.active);
+
+/*
+  SPONSORS
+
+  Logos are loaded from `img/sponsors/`, listed in `sponsors.json`. They appear
+  on the pitch hoardings during play, along the bottom of the menu, and on the
+  credits screen.
+
+  Failure is always silent: a missing manifest, an unreadable image or a
+  `file://` URL (where fetch is blocked) leaves `sponsors.list` empty and the
+  game draws plain placeholder boards instead. Nothing here can stop the game
+  from starting, which matters because these are optional third-party assets.
+*/
+const SPONSOR_DIR = "img/sponsors/";
+const SPONSOR_TIERS = { gold: 1.0, silver: 0.78, bronze: 0.6 };
+
+const sponsors = {
+  list: [],            // { name, img, url, tier, ready }
+  loaded: false,       // the manifest has been fetched (successfully or not)
+  error: "",
+  scroll: 0,           // hoarding marquee offset
+};
+
+/** Sanitise a manifest entry; returns null if unusable. */
+function cleanSponsor(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const name = cleanName(raw.name, "");
+  if (!name) return null;
+  const file = String(raw.file || "").trim();
+  // Refuse anything that tries to escape the sponsor folder.
+  if (file.includes("..") || file.startsWith("/") || /^[a-z]+:/i.test(file)) return null;
+  const tier = SPONSOR_TIERS[raw.tier] ? raw.tier : "silver";
+  return { name, file, tier, url: typeof raw.url === "string" ? raw.url : "", img: null, ready: false };
+}
+
+/** Load the manifest and kick off the image loads. Never throws. */
+function loadSponsors() {
+  if (typeof fetch !== "function") { sponsors.loaded = true; return; }
+  fetch(SPONSOR_DIR + "sponsors.json")
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("no manifest"))))
+    .then((data) => {
+      const raw = Array.isArray(data) ? data : (data && data.sponsors) || [];
+      sponsors.list = raw.map(cleanSponsor).filter(Boolean).slice(0, 12);
+      for (const sp of sponsors.list) {
+        if (!sp.file || typeof Image !== "function") continue;
+        const im = new Image();
+        im.onload = () => { sp.img = im; sp.ready = true; };
+        im.onerror = () => { sp.ready = false; };   // skipped, not fatal
+        im.src = SPONSOR_DIR + sp.file;
+      }
+      sponsors.loaded = true;
+    })
+    .catch((e) => {
+      // file:// or a missing manifest: fall back to placeholder boards.
+      sponsors.error = String(e && e.message || e);
+      sponsors.loaded = true;
+    });
+}
+
+/** Sponsors with a usable image, for drawing. */
+const readySponsors = () => sponsors.list.filter((s) => s.ready && s.img);
+
+/**
+ * Draw a strip of sponsor boards. Falls back to lettered placeholder boards so
+ * the hoardings never look broken when no images are present.
+ */
+function drawSponsorStrip(x, y, w, h, opts = {}) {
+  const ready = readySponsors();
+  const boards = ready.length ? ready : null;
+  const count = boards ? boards.length : (opts.placeholders || 3);
+  const gap = opts.gap === undefined ? 10 : opts.gap;
+  const bw = (w - gap * (count - 1)) / count;
+  if (bw <= 8) return;
+
+  for (let i = 0; i < count; i++) {
+    const bx = x + i * (bw + gap);
+    const tier = boards ? SPONSOR_TIERS[boards[i].tier] : 0.8;
+    const bh = h * tier;
+    const by = y + (h - bh);
+
+    // Board backing.
+    ctx.fillStyle = opts.dark ? "rgba(8,15,28,0.85)" : "rgba(255,255,255,0.10)";
+    roundRect(bx, by, bw, bh, 4);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    if (boards) {
+      const sp = boards[i];
+      // Fit the image inside the board, preserving its aspect ratio.
+      const pad = 4;
+      const availW = bw - pad * 2, availH = bh - pad * 2;
+      const iw = sp.img.width || 1, ih = sp.img.height || 1;
+      const scale = Math.min(availW / iw, availH / ih);
+      const dw = iw * scale, dh = ih * scale;
+      try {
+        ctx.drawImage(sp.img, bx + (bw - dw) / 2, by + (bh - dh) / 2, dw, dh);
+      } catch (e) {
+        // A tainted or broken image: fall back to the name.
+        text(sp.name, bx + bw / 2, by + bh / 2, Math.min(12, bh * 0.5),
+             "#8fa3c0", "center", 800);
+      }
+    } else {
+      text(opts.label || "YOUR LOGO HERE", bx + bw / 2, by + bh / 2,
+           Math.min(11, bh * 0.45), "#5f7391", "center", 800);
+    }
+  }
+}
+
+/*
+  MUSIC
+
+  Synthesised with the Web Audio API rather than loaded from a file, because this
+  game ships as one self-contained HTML document with no assets. A short chord
+  progression with a bass line and an arpeggio, scheduled a bar ahead so it stays
+  steady regardless of frame rate.
+
+  Every entry point is wrapped: audio is unavailable in some environments, and
+  browsers refuse to start a context until the user has interacted with the page.
+  Failure is always silent — the game must never break because sound cannot play.
+*/
+const MUSIC_BPM = 104;
+const MUSIC_LOOKAHEAD = 0.35;   // seconds of notes scheduled in advance
+
+// Two moods: a driving menu loop and a lighter in-match loop.
+const MUSIC_TRACKS = {
+  menu: {
+    // i - VI - III - VII in A minor, the standard "heroic menu" turn.
+    chords: [[57, 60, 64], [53, 57, 60], [60, 64, 67], [55, 59, 62]],
+    bass: [33, 29, 36, 31],
+    arp: [0, 2, 1, 2],
+    gain: 0.16,
+  },
+  play: {
+    // Same key, brighter voicing, less busy so it sits under the action.
+    chords: [[57, 61, 64], [59, 62, 66], [55, 59, 62], [52, 57, 60]],
+    bass: [33, 35, 31, 28],
+    arp: [0, 1, 2, 1],
+    gain: 0.1,
+  },
+};
+
+const music = {
+  ctx: null,
+  master: null,
+  started: false,
+  track: null,        // key into MUSIC_TRACKS
+  step: 0,            // eighth-note counter
+  nextTime: 0,
+  failed: false,      // audio unavailable; stop trying
+};
+
+const midiToHz = (n) => 440 * Math.pow(2, (n - 69) / 12);
+
+/** Create the audio context on first use. Returns false if audio is unusable. */
+function musicInit() {
+  if (music.failed) return false;
+  if (music.ctx) return true;
+  try {
+    const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+    if (!AC) { music.failed = true; return false; }
+    music.ctx = new AC();
+    music.master = music.ctx.createGain();
+    music.master.gain.value = 0;
+    music.master.connect(music.ctx.destination);
+    return true;
+  } catch (e) {
+    music.failed = true;         // blocked or unsupported
+    return false;
+  }
+}
+
+/** One plucked note. `type` shapes the envelope for bass, chord or lead. */
+function musicNote(midi, when, dur, level, type) {
+  const c = music.ctx;
+  if (!c) return;
+  try {
+    const osc = c.createOscillator();
+    const g = c.createGain();
+    osc.type = type === "bass" ? "triangle" : type === "lead" ? "square" : "sine";
+    osc.frequency.value = midiToHz(midi);
+
+    // Short attack, exponential decay: a pluck rather than a drone.
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(level, when + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+
+    osc.connect(g);
+    g.connect(music.master);
+    osc.start(when);
+    osc.stop(when + dur + 0.02);
+  } catch (e) {
+    // A scheduling failure must not take the game with it.
+  }
+}
+
+/** Schedule any notes falling inside the lookahead window. */
+function musicPump() {
+  if (!music.started || !music.ctx || music.failed) return;
+  const t = MUSIC_TRACKS[music.track];
+  if (!t) return;
+
+  const spb = 60 / MUSIC_BPM;
+  const eighth = spb / 2;
+  try {
+    while (music.nextTime < music.ctx.currentTime + MUSIC_LOOKAHEAD) {
+      const step = music.step;
+      const bar = Math.floor(step / 8) % t.chords.length;
+      const chord = t.chords[bar];
+      const beat = step % 8;
+
+      // Bass on the downbeat and the half-bar.
+      if (beat === 0 || beat === 4) {
+        musicNote(t.bass[bar], music.nextTime, spb * 0.9, 0.5, "bass");
+      }
+      // Chord pad on the downbeat.
+      if (beat === 0) {
+        for (const n of chord) {
+          musicNote(n, music.nextTime, spb * 1.7, 0.16, "pad");
+        }
+      }
+      // Arpeggio on the off-beats.
+      if (beat % 2 === 1) {
+        const idx = t.arp[(step / 2 | 0) % t.arp.length];
+        musicNote(chord[idx % chord.length] + 12, music.nextTime, eighth * 0.8, 0.1, "lead");
+      }
+
+      music.nextTime += eighth;
+      music.step++;
+    }
+  } catch (e) {
+    music.failed = true;
+  }
+}
+
+/** Start or switch the track. Safe to call every frame. */
+function musicPlay(trackName) {
+  if (!game.opt.music) { musicStop(); return; }
+  if (!musicInit()) return;
+  try {
+    if (music.ctx.state === "suspended") music.ctx.resume();
+  } catch (e) { /* the browser will allow it after a real interaction */ }
+
+  if (music.track !== trackName) {
+    music.track = trackName;
+    music.step = 0;
+    music.nextTime = music.ctx.currentTime + 0.05;
+  }
+  if (!music.started) {
+    music.started = true;
+    music.nextTime = music.ctx.currentTime + 0.05;
+  }
+  // Fade to the track's level.
+  const target = (MUSIC_TRACKS[trackName] || {}).gain || 0.12;
+  try {
+    music.master.gain.cancelScheduledValues(music.ctx.currentTime);
+    music.master.gain.linearRampToValueAtTime(target, music.ctx.currentTime + 0.6);
+  } catch (e) { /* ignore */ }
+}
+
+/** Fade out and stop scheduling. */
+function musicStop() {
+  if (!music.ctx || !music.started) return;
+  try {
+    music.master.gain.cancelScheduledValues(music.ctx.currentTime);
+    music.master.gain.linearRampToValueAtTime(0, music.ctx.currentTime + 0.4);
+  } catch (e) { /* ignore */ }
+  music.started = false;
+  music.track = null;
+}
+
+/** Which track suits the current scene? */
+function musicTrackForScene() {
+  switch (game.scene) {
+    case SCENE.PLAY:
+    case SCENE.COUNTDOWN:
+    case SCENE.CELEBRATE:
+      return "play";
+    default:
+      return "menu";
   }
 }
 
@@ -1099,6 +1703,16 @@ const TEAMS = [
   { name: "Orange Acrobats", color: "#e2822f", accent: "#ffc38a", speed: 3, shot: 3, jump: 5, size: 2 },
   { name: "Cyan Sprinters",  color: "#2fb9c4", accent: "#9df0f7", speed: 5, shot: 3, jump: 3, size: 1 },
   { name: "Black Bulldozers",color: "#3a3f4b", accent: "#9aa3b5", speed: 1, shot: 5, jump: 1, size: 5 },
+  // Second wave. Same shared budget of 12-13 pips, so nothing here is simply
+  // better than the originals — each trades something away.
+  { name: "Pink Panthers",   color: "#ec4899", accent: "#fbcfe8", speed: 4, shot: 4, jump: 3, size: 2 },
+  { name: "Teal Titans",     color: "#0d9488", accent: "#7fe6db", speed: 2, shot: 3, jump: 3, size: 5 },
+  { name: "Amber Arrows",    color: "#f59e0b", accent: "#fde68a", speed: 5, shot: 4, jump: 2, size: 1 },
+  { name: "Indigo Owls",     color: "#4f46e5", accent: "#c7d2fe", speed: 2, shot: 2, jump: 5, size: 4 },
+  { name: "Lime Livewires",  color: "#84cc16", accent: "#e3f7a8", speed: 4, shot: 1, jump: 4, size: 3 },
+  { name: "Crimson Bulls",   color: "#b91c1c", accent: "#fca5a5", speed: 1, shot: 5, jump: 2, size: 5 },
+  { name: "Slate Sentinels", color: "#64748b", accent: "#cbd5e1", speed: 3, shot: 2, jump: 2, size: 5 },
+  { name: "Violet Vipers",   color: "#a855f7", accent: "#e9d5ff", speed: 5, shot: 5, jump: 1, size: 2 },
 ];
 
 const STAT_KEYS = [
@@ -1153,11 +1767,24 @@ const HELP_KEEP_X = 92;       // keeper distance from its own goal line
 const keys = Object.create(null);
 const pressed = Object.create(null);   // edge-triggered, cleared each frame
 
-const WATCHED = new Set([
-  "KeyW","KeyA","KeyS","KeyD","KeyF",
-  "ArrowUp","ArrowLeft","ArrowDown","ArrowRight","Enter","Numpad0",
-  "Space","KeyH","KeyJ","Escape",
-]);
+/*
+  Keys the game consumes, so the browser does not also act on them (scrolling on
+  arrows, for instance). Rebuilt whenever the bindings change, since a remapped
+  key must be swallowed too.
+*/
+const WATCHED = new Set();
+const UI_KEYS = ["Enter", "Space", "Escape", "KeyH", "KeyJ", "Numpad0",
+                 "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"];
+
+function rebuildWatched() {
+  WATCHED.clear();
+  for (const k of UI_KEYS) WATCHED.add(k);
+  for (const seat of SCHEME) {
+    for (const a of ACTIONS) if (seat[a.key]) WATCHED.add(seat[a.key]);
+  }
+}
+// Called at boot, once SCHEME and ACTIONS exist — not here, where they are
+// still in their temporal dead zone.
 
 addEventListener("keydown", (e) => {
   /*
@@ -1165,6 +1792,30 @@ addEventListener("keydown", (e) => {
     it rather than steering the menu. Without this, typing "SAM" would be read
     as movement keys.
   */
+  /*
+    Rebinding swallows the very next key press. Handled first, and before
+    preventDefault on WATCHED, so any key can be captured — including one that
+    is not currently bound to anything.
+  */
+  if (game.ctrlBinding) {
+    const { seat, action } = game.ctrlBinding;
+    if (e.key === "Escape") {
+      game.ctrlBinding = null;                 // cancelled
+    } else if (!RESERVED_KEYS.has(e.code)) {
+      // Clear this code from any other action on the SAME seat, so a key is
+      // never bound twice for one player.
+      for (const a of ACTIONS) {
+        if (a.key !== action && SCHEME[seat][a.key] === e.code) SCHEME[seat][a.key] = "";
+      }
+      SCHEME[seat][action] = e.code;
+      saveScheme();
+      rebuildWatched();
+      game.ctrlBinding = null;
+    }
+    e.preventDefault();
+    return;
+  }
+
   // Roster entry (tournament) uses the same swallow-the-keyboard rule.
   if (game.rosterEdit >= 0) {
     const i = game.rosterEdit;
@@ -1211,6 +1862,16 @@ addEventListener("keyup", (e) => {
 addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
 
 /*
+  Browsers refuse to start an AudioContext until the user has interacted with the
+  page, so the first key press or click is what actually gets the music going.
+*/
+const kickAudio = () => {
+  if (game.opt.music) musicPlay(musicTrackForScene());
+};
+addEventListener("keydown", kickAudio);
+addEventListener("pointerdown", kickAudio);
+
+/*
   The connection codes are far too long to type, so the online screen leans on
   the real clipboard: Cmd/Ctrl-V pastes the peer's code, Cmd/Ctrl-C copies your
   own. Both are ignored outside that screen.
@@ -1232,10 +1893,156 @@ addEventListener("copy", (e) => {
   }
 });
 
-const SCHEME = [
-  { left: "KeyA",      right: "KeyD",       up: "KeyW",     down: "KeyS",     kick: "KeyF"  },
-  { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp",  down: "ArrowDown",kick: "Enter" },
+/*
+  CONTROLS
+
+  SCHEME is mutable so the bindings can be remapped, and the defaults are kept
+  separately so RESET always works. Every action the game reads goes through
+  `intent`, so a rebind or a gamepad needs no changes anywhere in the physics.
+*/
+const SCHEME_DEFAULTS = [
+  { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", kick: "KeyF", wall: "KeyG" },
+  { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown",
+    kick: "Enter", wall: "ShiftRight" },
 ];
+const SCHEME = SCHEME_DEFAULTS.map((s) => ({ ...s }));
+
+// The actions a player can rebind, in the order they are listed on screen.
+const ACTIONS = [
+  { key: "left",  label: "MOVE LEFT" },
+  { key: "right", label: "MOVE RIGHT" },
+  { key: "up",    label: "JUMP" },
+  { key: "down",  label: "FAST FALL" },
+  { key: "kick",  label: "KICK / FIRE" },
+  { key: "wall",  label: "BUILD WALL" },
+];
+
+/** A readable name for a KeyboardEvent.code. */
+function keyLabel(code) {
+  if (!code) return "—";
+  if (code.startsWith("Key")) return code.slice(3);
+  if (code.startsWith("Digit")) return code.slice(5);
+  if (code.startsWith("Numpad")) return "NUM " + code.slice(6);
+  if (code.startsWith("Arrow")) return code.slice(5).toUpperCase();
+  const named = {
+    Space: "SPACE", Enter: "ENTER", ShiftLeft: "L-SHIFT", ShiftRight: "R-SHIFT",
+    ControlLeft: "L-CTRL", ControlRight: "R-CTRL", AltLeft: "L-ALT", AltRight: "R-ALT",
+    Tab: "TAB", Backslash: "\\", Slash: "/", Comma: ",", Period: ".",
+    Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]",
+    Minus: "-", Equal: "=", Backquote: "`",
+  };
+  return named[code] || code.toUpperCase();
+}
+
+/** Keys the game must never let a player bind, to avoid trapping them. */
+const RESERVED_KEYS = new Set(["Escape", "F5", "F11", "F12", "Tab"]);
+
+function loadScheme() {
+  try {
+    const raw = localStorage.getItem("headgame.controls");
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    for (let i = 0; i < 2; i++) {
+      if (!arr || !arr[i]) continue;
+      for (const a of ACTIONS) {
+        const code = arr[i][a.key];
+        if (typeof code === "string" && code && !RESERVED_KEYS.has(code)) {
+          SCHEME[i][a.key] = code;
+        }
+      }
+    }
+    rebuildWatched();
+  } catch (e) {
+    // Corrupt or blocked storage: the defaults stand.
+  }
+}
+
+function saveScheme() {
+  try { localStorage.setItem("headgame.controls", JSON.stringify(SCHEME)); }
+  catch (e) { /* not fatal */ }
+}
+
+function resetScheme() {
+  for (let i = 0; i < 2; i++) Object.assign(SCHEME[i], SCHEME_DEFAULTS[i]);
+  saveScheme();
+  rebuildWatched();
+}
+
+/*
+  GAMEPAD SUPPORT
+
+  Polled once per frame and folded into the same `intent` a keyboard fills, so a
+  controller is indistinguishable to the rest of the game. Pad 0 drives seat 0,
+  pad 1 drives seat 1. A seat with a live pad ignores its keyboard bindings so
+  the two cannot fight each other.
+*/
+const PAD_DEADZONE = 0.35;
+const PAD_BTN = {
+  kick: [0, 2],        // A / X on most pads
+  wall: [1, 3],        // B / Y
+  jump: [0, 12],       // A, or d-pad up
+};
+const pads = { active: [false, false], names: ["", ""], prev: [{}, {}] };
+
+/** Is the Gamepad API usable here? */
+/*
+  Pads are read through this indirection rather than touching `navigator`
+  directly: in some environments `navigator` is a read-only accessor, so a test
+  cannot substitute a fake one. Overriding this single hook keeps the production
+  path identical while remaining testable.
+*/
+let padSource = () => {
+  if (typeof navigator === "undefined" || typeof navigator.getGamepads !== "function") {
+    return null;
+  }
+  try { return navigator.getGamepads() || []; } catch (e) { return null; }
+};
+
+/** Replace the pad source. Used by the test suite to inject a fake gamepad. */
+function setPadSource(fn) { padSource = fn; }
+
+const padsAvailable = () => padSource() !== null;
+
+/** Read connected pads into `intent`. Returns the number of live pads. */
+function pollPads(edge) {
+  pads.active[0] = pads.active[1] = false;
+  if (!game.opt.gamepad) return 0;
+  const list = padSource();
+  if (!list) return 0;
+
+  let live = 0;
+  for (let seat = 0; seat < 2; seat++) {
+    const gp = list[seat];
+    if (!gp || !gp.connected) { pads.names[seat] = ""; continue; }
+    live++;
+    pads.active[seat] = true;
+    pads.names[seat] = gp.id || "gamepad";
+
+    // A remote seat is driven by the network, not by a local pad.
+    if (net.active && net.remoteSeat === seat) continue;
+    if (game.cpu[seat]) continue;
+
+    const a = intent[seat];
+    const ax = gp.axes && gp.axes.length > 0 ? gp.axes[0] : 0;
+    const ay = gp.axes && gp.axes.length > 1 ? gp.axes[1] : 0;
+    const btn = (i) => !!(gp.buttons && gp.buttons[i] && gp.buttons[i].pressed);
+    const anyOf = (ids) => ids.some(btn);
+
+    a.left = ax < -PAD_DEADZONE || btn(14);
+    a.right = ax > PAD_DEADZONE || btn(15);
+    a.up = ay < -PAD_DEADZONE || anyOf(PAD_BTN.jump);
+    a.down = ay > PAD_DEADZONE || btn(13);
+
+    const kick = anyOf(PAD_BTN.kick);
+    const wall = anyOf(PAD_BTN.wall);
+    a.kick = kick;
+    // Edge-detect the buttons ourselves, since a pad has no keydown event.
+    a.kickEdge = edge && kick && !pads.prev[seat].kick;
+    a.wallEdge = edge && wall && !pads.prev[seat].wall;
+    if (edge) { pads.prev[seat].kick = kick; pads.prev[seat].wall = wall; }
+  }
+  return live;
+}
 
 /*
   INTENT is the single input channel the simulation reads. Nothing inside the
@@ -1247,14 +2054,17 @@ const SCHEME = [
   `kickEdge` is a one-shot flag so a held button fires a single kick.
 */
 const intent = [
-  { left: false, right: false, up: false, down: false, kick: false, kickEdge: false },
-  { left: false, right: false, up: false, down: false, kick: false, kickEdge: false },
+  { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
+    wallEdge: false },
+  { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
+    wallEdge: false },
 ];
 
 /** Pack a seat's intent into one byte, for the network. */
 function packIntent(a) {
   return (a.left ? 1 : 0) | (a.right ? 2 : 0) | (a.up ? 4 : 0) |
-         (a.down ? 8 : 0) | (a.kick ? 16 : 0) | (a.kickEdge ? 32 : 0);
+         (a.down ? 8 : 0) | (a.kick ? 16 : 0) | (a.kickEdge ? 32 : 0) |
+         (a.wallEdge ? 64 : 0);
 }
 
 /** Unpack a byte into a seat's intent object (mutates and returns `out`). */
@@ -1265,6 +2075,7 @@ function unpackIntent(byte, out) {
   out.down  = !!(byte & 8);
   out.kick  = !!(byte & 16);
   out.kickEdge = !!(byte & 32);
+  out.wallEdge = !!(byte & 64);
   return out;
 }
 
@@ -1274,10 +2085,15 @@ function unpackIntent(byte, out) {
  * produces exactly one kick regardless of how many substeps run.
  */
 function gatherIntent(edge) {
+  // A connected gamepad fills its own seat, so poll first and let the keyboard
+  // pass over any seat a pad already owns.
+  pollPads(edge);
+
   for (let i = 0; i < 2; i++) {
     const a = intent[i];
     if (net.active && net.remoteSeat === i && i >= 0) continue;  // filled by the network
     if (game.cpu[i]) continue;                          // filled by updateCPU
+    if (pads.active[i]) continue;                       // filled by pollPads
     const S = SCHEME[i];
     a.left  = !!keys[S.left];
     a.right = !!keys[S.right];
@@ -1285,6 +2101,7 @@ function gatherIntent(edge) {
     a.down  = !!keys[S.down];
     a.kick  = kickDown(i);
     a.kickEdge = edge && kickHit(i);
+    a.wallEdge = edge && hit(S.wall);
   }
 }
 
@@ -1328,6 +2145,7 @@ class Player {
     this.jumpV = PLAYER_JUMP * statToMultiplier(team.jump, 0.14);
     this.shotP = KICK_BASE * statToMultiplier(team.shot, 0.17);
     this.effects = Object.create(null); // type -> remaining seconds
+    this.wallMax = WALL_CHARGES;        // raised by roguelike upgrades
     this.reset();
     this.applyChaos();                  // pick up any live chaos multipliers
   }
@@ -1346,6 +2164,11 @@ class Player {
     this.stun = 0;                      // >0 while disabled by a mine
     this.ammo = 0;                      // pistol rounds remaining
     this.fireCD = 0;
+    this.wallKicked = false;
+    this.airKickReset = false;
+    this.wallCharges = this.wallMax === undefined ? WALL_CHARGES : this.wallMax;
+    this.wallCD = 0;
+    this.wallRecharge = WALL_RECHARGE;
     this.facing = this.index === 0 ? 1 : -1;
     this.effects = Object.create(null);
     this.applySize();
@@ -1353,10 +2176,28 @@ class Player {
 
   applySize() {
     let s = playerSizeMul;                 // chaos mode scales everyone
+    if (inRun() && this.index === 0) s *= game.run.mods.size;
     if (this.effects.bigger)  s *= 1.55;
     if (this.effects.smaller) s *= 0.62;
     this.r = this.baseR * s;
     this.massNow = this.mass * s * s;
+
+    /*
+      Growing while grounded would leave the feet BELOW the floor by the size
+      increase — measured at 12.2px after a BIGGER pickup, briefly showing the
+      player buried in the pitch. Lift them back onto the surface here, at the
+      moment the radius changes, rather than waiting for the next update.
+    */
+    if (this.y !== undefined) {
+      const floor = GROUND_Y - this.r;
+      if (this.y > floor) {
+        this.y = floor;
+        if (this.vy > 0) this.vy = 0;
+        this.onGround = true;
+      }
+      // A ceiling case too, for a grow that would clip the top of the screen.
+      if (this.y - this.r < 0) this.y = this.r;
+    }
   }
 
   /**
@@ -1366,9 +2207,20 @@ class Player {
    */
   applyChaos() {
     const t = this.team;
-    this.accel = PLAYER_ACCEL * statToMultiplier(t.speed, 0.16) * playerSpeedMul;
-    this.maxv  = PLAYER_MAXV  * statToMultiplier(t.speed, 0.16) * playerSpeedMul;
-    this.jumpV = PLAYER_JUMP  * statToMultiplier(t.jump, 0.14)  * playerJumpMul;
+    /*
+      Run upgrades apply only to the human seat, on top of the team stats and any
+      chaos multipliers. Done here because this is the single place derived stats
+      are recomputed, so upgrades survive a chaos roll or a power-up.
+    */
+    const m = (inRun() && this.index === 0) ? game.run.mods : null;
+    const sMul = m ? m.speed : 1;
+    const jMul = m ? m.jump : 1;
+
+    this.accel = PLAYER_ACCEL * statToMultiplier(t.speed, 0.16) * playerSpeedMul * sMul;
+    this.maxv  = PLAYER_MAXV  * statToMultiplier(t.speed, 0.16) * playerSpeedMul * sMul;
+    this.jumpV = PLAYER_JUMP  * statToMultiplier(t.jump, 0.14)  * playerJumpMul * jMul;
+    this.shotP = KICK_BASE * statToMultiplier(t.shot, 0.17) * (m ? m.shot : 1);
+    this.wallMax = WALL_CHARGES + (m ? m.wallCharges : 0);
     this.applySize();
   }
 
@@ -1480,7 +2332,7 @@ class Player {
     if (this.kickCD > 0) this.kickCD -= dt;
     if (this.kickT > 0) {
       this.kickT -= dt;
-      if (this.kickT <= 0) { this.kickT = 0; this.kickConsumed = false; }
+      if (this.kickT <= 0) { this.kickT = 0; this.kickConsumed = false; this.wallKicked = false; }
     }
 
     // Effect timers.
@@ -1530,7 +2382,9 @@ class Player {
     if (this.stun > 0) return false;
     if (this.kickT === 0 && this.kickCD <= 0) {
       this.kickT = KICK_TIME;
-      this.kickCD = KICK_TIME + KICK_COOLDOWN;
+      this.wallKicked = false;        // one wall per swing
+      this.kickCD = KICK_TIME + KICK_COOLDOWN *
+        (inRun() && this.index === 0 ? game.run.mods.kickCD : 1);
       this.kickConsumed = false;
       return true;
     }
@@ -1554,6 +2408,11 @@ const SCENE = {
   PAUSE: "pause",           // in-game overlay: resume / settings / quit
   SETTINGS: "settings",     // adjustable options, reachable from menu or pause
   BOARD: "board",           // win/loss leaderboard
+  CONTROLS: "controls",     // rebind keys, gamepad status
+  CREDITS: "credits",       // credits and sponsors
+  UPGRADE: "upgrade",       // roguelike: choose a reward
+  RUNOVER: "runover",       // roguelike: the run ended
+  RUNWIN: "runwin",         // roguelike: the ladder was cleared
   RULES: "rules",           // spawn rates and world toggles
 };
 
@@ -1562,7 +2421,7 @@ const SCENE = {
   match back exactly where it was, including mid-countdown or mid-celebration.
 */
 const PAUSE_ITEMS = ["resume", "settings", "board", "restart", "quit"];
-const SETTINGS_ITEMS = ["shake", "particles", "flash", "sfxhint", "back"];
+const SETTINGS_ITEMS = ["music", "shake", "particles", "flash", "sfxhint", "gamepad", "back"];
 
 const MODE = {
   SINGLE: "single",
@@ -1589,25 +2448,36 @@ const MODE_ORDER = [MODE.SINGLE, MODE.VOLLEY, MODE.TENNIS, MODE.BASKET, MODE.TOU
 */
 const MODE_CFG = {
   [MODE.SINGLE]:     { ballR: 14, ballMass: 1,    grav: 1,    drag: 1,   rest: 1,
-                       knockback: true,  net: 0,   confine: false, goals: true },
+                       knockback: true,  net: 0,   confine: false, goals: true,
+                       kickMul: 1, reachMul: 1 },
   [MODE.TOURNAMENT]: { ballR: 14, ballMass: 1,    grav: 1,    drag: 1,   rest: 1,
                        knockback: true,  net: 0,   confine: false, goals: true },
-  // Volleyball: a big, light, floaty ball that never shoves anyone.
   // Volleyball: big, light and springy — the ball should keep a rally alive.
   [MODE.VOLLEY]:     { ballR: 22, ballMass: 0.45, grav: 0.52, drag: 1.35, rest: 1.16,
-                       knockback: false, net: 210, confine: true,  goals: false },
-  // Tennis: small, quick, very bouncy ball over a low net.
-  [MODE.TENNIS]:     { ballR: 10, ballMass: 0.6,  grav: 1.45, drag: 0.45, rest: 1.02,
-                       knockback: false, net: 110, confine: true,  goals: false },
+                       knockback: false, net: 210, confine: true,  goals: false,
+                       kickMul: 1, reachMul: 1 },
+  /*
+    Tennis: the ball was small AND light, which made the contact window only
+    21px against soccer's 25px — you whiffed constantly. It is now a little
+    bigger and much lighter, with a kick bonus, so a swing connects and sends it.
+  */
+  [MODE.TENNIS]:     { ballR: 13, ballMass: 0.35, grav: 1.3, drag: 0.4, rest: 1.04,
+                       knockback: false, net: 110, confine: true,  goals: false,
+                       kickMul: 1.45, reachMul: 1.35 },
   /*
     Basketball: a genuinely bouncy ball. It was the second-least bouncy mode in
     the game (0.78) while also needing the tightest aim, which made scoring
     rare. Smaller and springier, with lower gravity for a floatier arc.
   */
-  [MODE.BASKET]:     { ballR: 15, ballMass: 1.0,  grav: 0.78, drag: 0.95, rest: 1.06,
-                       knockback: true,  net: 0,   confine: false, goals: false },
+  [MODE.BASKET]:     { ballR: 14, ballMass: 0.72, grav: 0.62, drag: 0.8,  rest: 1.18,
+                       knockback: true,  net: 0,   confine: false, goals: false,
+                       kickMul: 1.15, reachMul: 1.15 },
 };
 const modeCfg = () => MODE_CFG[game.mode] || MODE_CFG[MODE.SINGLE];
+
+// Per-mode kick tuning, defaulting to neutral if a mode omits them.
+const modeKickMul = () => modeCfg().kickMul || 1;
+const modeReachMul = () => modeCfg().reachMul || 1;
 
 /*
   ARENA THEMES
@@ -1682,7 +2552,10 @@ const layoutProbe = { menu: null };
   this instead of merely calling a draw function and checking it did not throw —
   which is how an unpainted arena shipped once already.
 */
-const drawProbe = { platforms: 0, faces: 0 };
+const drawProbe = { platforms: 0, faces: 0, walls: 0 };
+
+/** What the credits screen last rendered, so the test suite can check names. */
+const creditProbe = { lines: [] };
 
 /*
   MENU ATTRACT SCENE
@@ -1858,8 +2731,8 @@ const MENU_ROWS = [
   // right panel: who is playing
   "name1", "name2", "opponent", "cpulevel",
   // the button strip, then the primary action
-  "rules", "online", "board", "settings",
-  "start",
+  "rules", "online", "board", "controls", "credits", "settings",
+  "roguelike", "start",
 ];
 
 /**
@@ -1875,6 +2748,9 @@ function menuRows() {
     if (r === "online") return true;
     if (r === "settings") return true;
     if (r === "board") return true;
+    if (r === "roguelike") return true;
+    if (r === "controls") return true;
+    if (r === "credits") return true;
     if (r === "rules") return true;
     // Platforms would block a volleyball or tennis rally, so no map choice there.
     if (r === "map") return modeCfg().net === 0;
@@ -1919,6 +2795,14 @@ const game = {
   mineTimer: 14,
   helpers: [],          // AI goalkeepers / strikers
   bullets: [],          // pistol rounds in flight
+  walls: [],            // temporary player-built walls
+  run: null,            // roguelike run state, or null
+  ctrlSeat: 0,          // which player the controls screen is editing
+  ctrlRow: 0,
+  ctrlBinding: null,    // { seat, action } while waiting for a key press
+  ctrlFrom: null,
+  creditsFrom: null,
+  creditsScroll: 0,
   jetpack: 0,           // >0 while the ball is weightless
   jetpackOwner: -1,
   goalFx: null,         // "bigGoals" | "tinyGoals" | null
@@ -1930,6 +2814,7 @@ const game = {
   volleyT: 0,           // grace period after a volleyball point
   ballPowered: false,   // ball is a live power shot (can knock players back)
   ballPoweredBy: -1,
+  ballLastTouch: -1,    // seat that last touched the ball, for wall attribution
   lastBounceSide: -1,   // tennis: which side the ball last bounced on
   ballSide: -1,         // tennis: which side the ball is currently over
   cpu: [false, false],  // is this seat played by the AI?
@@ -1938,6 +2823,9 @@ const game = {
   editing: -1,          // which name field is being typed into, or -1
   remoteName: "",       // the peer's name, once they tell us
   rosterNames: [],      // tournament entrant names, editable on the roster screen
+  rosterCpu: [],        // per-entrant: is this seat played by the computer?
+  drawOrder: [],        // randomised seeding, fixed once per tournament
+  bracket: [],          // per round: [{ a, b, winner }] — the whole history
   rosterEdit: -1,       // which roster entry is being typed into, or -1
   rosterCursor: 0,      // roster screen selection
   pauseFrom: null,      // scene the pause overlay interrupted
@@ -1959,6 +2847,8 @@ const game = {
     particles: true,    // burst effects
     flash: true,        // white flash on a goal
     hints: true,        // on-screen control reminders during play
+    music: true,        // background music
+    gamepad: true,      // read connected controllers
   },
   particles: [],
   lastScorer: 0,
@@ -1984,6 +2874,38 @@ function buildPairs(aliveIds) {
   return pairs;
 }
 
+/**
+ * Fisher-Yates shuffle, returning a new array. Pure apart from Math.random, so
+ * the draw can be asserted for fairness rather than just "it changed".
+ */
+function shuffled(list) {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = (Math.random() * (i + 1)) | 0;
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+
+/**
+ * The DRAW: a randomised seeding order fixed once at the start of a tournament.
+ * Without this, entrant 1 always met entrant 2 and the bracket was identical
+ * every time. Held in `game.drawOrder` so later rounds keep the same side of the
+ * bracket rather than re-shuffling as players are eliminated.
+ */
+function makeDraw(ids) {
+  return shuffled(ids);
+}
+
+/** Alive entrants, ordered by the tournament draw rather than by id. */
+function aliveInDrawOrder() {
+  const alive = new Set(aliveEntrants().map((e) => e.id));
+  const ordered = (game.drawOrder || []).filter((id) => alive.has(id));
+  // Anything missing from the draw (shouldn't happen) still gets a place.
+  for (const e of aliveEntrants()) if (!ordered.includes(e.id)) ordered.push(e.id);
+  return ordered;
+}
+
 const aliveEntrants = () => game.entrants.filter((e) => e.alive);
 const entrantById = (id) => game.entrants.find((e) => e.id === id) || null;
 
@@ -2005,10 +2927,15 @@ function startTournament() {
     */
     let owner = "host";
     if (net.active) owner = i === 1 ? "guest" : "host";
-    if (!net.active && i > 0 && game.cpu[1] && game.entrantCount === 2) owner = "cpu";
+    // A seat marked CPU on the roster is played by the computer. Never seat 0 —
+    // somebody has to be playing — and never a remote seat in an online bracket.
+    const isCpu = !!(game.rosterCpu && game.rosterCpu[i]) && i > 0 &&
+                  !(net.active && i === 1);
+    if (isCpu) owner = "cpu";
     game.entrants.push({
       id: i,
-      name: cleanName(preset || (i < 2 ? game.names[i] : ""), `PLAYER ${i + 1}`),
+      name: isCpu ? `CPU ${i}`
+                  : cleanName(preset || (i < 2 ? game.names[i] : ""), `PLAYER ${i + 1}`),
       teamIdx: null,
       alive: true,
       owner,
@@ -2017,11 +2944,14 @@ function startTournament() {
   game.round = 0;
   game.champion = null;
   game.lastResult = null;
+  // Randomise the draw once, so who meets whom is different every tournament.
+  game.drawOrder = makeDraw(game.entrants.map((e) => e.id));
+  game.bracket = [];
   beginRound();
 }
 
 function beginRound() {
-  const alive = aliveEntrants().map((e) => e.id);
+  const alive = aliveInDrawOrder();
   if (alive.length <= 1) {
     game.champion = alive.length === 1 ? entrantById(alive[0]) : null;
     game.scene = SCENE.CHAMPION;
@@ -2031,6 +2961,14 @@ function beginRound() {
   game.round++;
   game.roundPairs = buildPairs(alive);
   game.tieIndex = 0;
+  /*
+    Record this round in the bracket history, so the screen can draw the whole
+    tree rather than only the round in progress. `winner` is filled in as ties
+    are decided.
+  */
+  game.bracket[game.round - 1] = game.roundPairs.map(([a, b]) => ({
+    a, b, winner: b === null ? a : null,
+  }));
   game.scene = SCENE.BRACKET;
   netSendBracket();
 }
@@ -2080,6 +3018,12 @@ function resolveTie(winnerSeat, byTime) {
     score: [...game.score],
     byTime,
   };
+  // Stamp the result into the bracket history for the tree view.
+  const roundRec = game.bracket[game.round - 1];
+  if (roundRec && roundRec[game.tieIndex]) {
+    roundRec[game.tieIndex].winner = winId;
+    roundRec[game.tieIndex].score = [...game.score];
+  }
   game.tieIndex++;
   netSendBracket();
 }
@@ -2094,6 +3038,7 @@ function startMatch() {
   game.mines = [];
   game.helpers = [];
   game.bullets = [];
+  game.walls = [];
   game.jetpack = 0;
   game.jetpackOwner = -1;
   game.goalFx = null;
@@ -2106,13 +3051,47 @@ function startMatch() {
   game.mineTimer = mineInterval();
   game.matchSecs = TIME_OPTIONS[game.timeIdx];
   game.clock = game.matchSecs;
+
+  // Remember the run's teams on the first match, so later stages can reuse them
+  // without sending the player back to the select screen.
+  if (inRun() && game.run.teamIdx === null) {
+    game.run.teamIdx = game.sel[0];
+    game.run.cpuTeamIdx = game.sel[1];
+  }
   game.ballPowered = false;
   game.ballPoweredBy = -1;
+  game.ballLastTouch = -1;
   game.lastBounceSide = -1;
   game.ballSide = -1;
   for (const pl of game.players) if (pl) pl.ai = null;   // fresh AI memory
   game.suddenDeath = false;
+  // kickoff() ends by calling applyRunPerks(), so the run's pistol and helpers
+  // are granted there — after the reset that would otherwise wipe them.
   kickoff(0, false);          // opening kickoff: normal gravity
+}
+
+/*
+  Grant the run's per-match perks.
+
+  MUST run after `kickoff`, not before: kickoff calls player.reset(), which
+  zeroes `ammo` and clears `effects`, and it empties `game.helpers`. Granting
+  first meant the GUNSLINGER pistol and the free keeper/striker were handed out
+  and then immediately wiped — the player started every stage empty-handed.
+
+  Called from kickoff itself as well, so the perks survive each goal reset too.
+*/
+function applyRunPerks() {
+  if (!inRun()) return;
+  const m = game.run.mods;
+  const pl = game.players[0];
+  if (!pl) return;
+
+  if (m.startAmmo > 0) {
+    pl.ammo = m.startAmmo;
+    pl.effects.pistol = POWERUPS.pistol.dur;
+  }
+  if (m.freeKeeper) spawnHelper(0, "keeper");
+  if (m.freeStriker) spawnHelper(0, "striker");
 }
 
 /**
@@ -2146,6 +3125,20 @@ function finishMatch(winner, byTime) {
   // the same match is not counted twice on one machine.
   if (!netIsGuest()) recordResult(winner, game.score);
   if (game.mode === MODE.TOURNAMENT && winner >= 0) resolveTie(winner, byTime);
+
+  /*
+    A run stage is decided here. Winning offers an upgrade; anything else — a
+    loss or a draw — ends the run. The WIN scene set above is replaced, so the
+    player goes straight to the consequence.
+  */
+  if (inRun()) {
+    if (winner === 0) {
+      rollOffer();
+      game.scene = SCENE.UPGRADE;
+    } else {
+      endRun();
+    }
+  }
 }
 
 /**
@@ -2180,6 +3173,7 @@ function kickoff(towards, reroll = true) {
   game.mineTimer = mineInterval();
   game.helpers = [];
   game.bullets = [];
+  game.walls = [];
   game.jetpack = 0;
   game.jetpackOwner = -1;
   game.goalFx = null;
@@ -2188,10 +3182,18 @@ function kickoff(towards, reroll = true) {
   game.volleyT = 0;
   game.ballPowered = false;
   game.ballPoweredBy = -1;
+  game.ballLastTouch = -1;
   game.lastBounceSide = -1;
   game.ballSide = -1;
   game.timer = COUNTDOWN_T;
   game.scene = SCENE.COUNTDOWN;
+
+  /*
+    Re-grant the run's perks: this function just reset both players and emptied
+    the helper list, so without this a GUNSLINGER pistol or a free keeper would
+    disappear the first time anyone scored.
+  */
+  applyRunPerks();
 }
 
 function burst(x, y, color, n = 34) {
@@ -2584,9 +3586,29 @@ function ballVsHoops(b) {
   let hit = false;
   for (const side of [0, 1]) {
     const h = hoopPos(side);
-    // Backboard side and open side rims.
-    if (resolveStaticCircle(b, h.x - HOOP_R, h.y, RIM_R, 0.6)) hit = true;
-    if (resolveStaticCircle(b, h.x + HOOP_R, h.y, RIM_R, 0.6)) hit = true;
+    /*
+      Rim colliders sit slightly OUTSIDE the ring, and are skipped entirely for
+      a ball already falling through the aperture.
+
+      They used to sit exactly at ±HOOP_R, which is the scoring aperture edge —
+      so a ball on target had to clip a rim, and 272 of 400 measured shots
+      rattled out instead of dropping. That was the real reason scoring felt
+      impossible, not the ball's weight or bounce.
+    */
+    /*
+      The skip window is generous on purpose: the rim used to deflect an
+      on-target ball BEFORE it reached the aperture, so a tight window changed
+      nothing. A ball descending anywhere near the ring is treated as going in.
+    */
+    const dropping = b.vy > 0 &&
+                     Math.abs(b.x - h.x) < HOOP_R + b.r &&
+                     b.y > h.y - HOOP_R * 2.5 &&
+                     b.y < h.y + HOOP_R;
+    if (!dropping) {
+      const rimX = HOOP_R + RIM_R;
+      if (resolveStaticCircle(b, h.x - rimX, h.y, RIM_R, 0.6)) hit = true;
+      if (resolveStaticCircle(b, h.x + rimX, h.y, RIM_R, 0.6)) hit = true;
+    }
     // Backboard itself.
     const bx = side === 0 ? WALL + 4 : W - WALL - 4;
     const boardTop = h.y - BOARD_H * 0.65, boardBot = h.y + BOARD_H * 0.35;
@@ -2722,7 +3744,7 @@ function releaseCPUKeys() {
   for (let i = 0; i < 2; i++) {
     if (!game.cpu[i]) continue;
     const a = intent[i];
-    a.left = a.right = a.up = a.down = a.kick = a.kickEdge = false;
+    a.left = a.right = a.up = a.down = a.kick = a.kickEdge = a.wallEdge = false;
   }
 }
 
@@ -3127,14 +4149,27 @@ function tieIsOnline() {
  * remote, who is a CPU. Called from nextTie once seats are known.
  */
 function applyTieControl() {
-  if (!net.active || game.mode !== MODE.TOURNAMENT) return;
-  const me = netIsHost() ? "host" : "guest";
-  const online = tieIsOnline();
+  if (game.mode !== MODE.TOURNAMENT) return;
 
+  /*
+    Seat control first, and it applies OFFLINE too. This used to return early
+    unless a network match was running, so an offline bracket never handed a tie
+    to the computer — entrants marked CPU were still played by hand.
+  */
   for (let s = 0; s < 2; s++) {
     const e = entrantById(game.seats[s]);
     game.cpu[s] = !!(e && e.owner === "cpu");
   }
+
+  if (!net.active) {
+    net.localSeat = 0;
+    net.remoteSeat = -1;
+    net.spectating = false;
+    return;
+  }
+
+  const me = netIsHost() ? "host" : "guest";
+  const online = tieIsOnline();
 
   if (online) {
     // Each machine drives its own entrant.
@@ -3299,6 +4334,7 @@ function ballVsPlayer(pl) {
   const ballVx0 = b.vx, ballVy0 = b.vy, bx0 = b.x, by0 = b.y;
 
   if (resolveCircles(pb, bb, 0.62)) {
+    game.ballLastTouch = pl.index;      // for wall-damage attribution
     b.x = bb.x; b.y = bb.y; b.vx = bb.vx; b.vy = bb.vy;
 
     // Every body touch launches the ball upward. Striking the top of the head
@@ -3363,7 +4399,9 @@ function ballVsPlayer(pl) {
     const tip = pl.legTip;
     const dx = b.x - tip.x, dy = b.y - tip.y;
     const d = len(dx, dy);
-    const reach = (pl.r + b.r) * KICK_REACH;
+    // Some modes widen the contact window: a small, fast ball is otherwise
+    // almost impossible to connect with.
+    const reach = (pl.r + b.r) * KICK_REACH * modeReachMul();
 
     // A kick connects if the ball is near the leg (normal shot) OR if it has
     // slipped behind the player, in which case it becomes a defensive
@@ -3373,7 +4411,9 @@ function ballVsPlayer(pl) {
     const behind = (b.x - pl.x) * ownGoalDir > 0;        // ball on own-goal side
     const bodyD = len(b.x - pl.x, b.y - pl.y);
 
-    const normalHit = d < tip.r + b.r + 6 && forward > -pl.r * 0.4;
+    const hitPad = 6 * modeReachMul();
+    const normalHit = d < (tip.r + b.r) * modeReachMul() + hitPad &&
+                      forward > -pl.r * 0.4;
     const clearHit = behind && bodyD < pl.r + b.r + LEG_LEN * 0.9;
 
     if (normalHit || clearHit) {
@@ -3385,12 +4425,26 @@ function ballVsPlayer(pl) {
       const hasPower = !!pl.effects.powershot;
       // The swing-timing window is wider now (0.72..1.3 rather than 0.8..1.15),
       // so catching the ball late in the swing is a visible reward.
-      let power = pl.shotP * (hasPower ? POWERSHOT_MUL : 1) * lerp(0.72, 1.3, tip.t);
+      let power = pl.shotP * (hasPower ? POWERSHOT_MUL : 1) *
+                  lerp(0.72, 1.3, tip.t) * modeKickMul();
 
       // Clearance: drive the ball AWAY from the defender's own goal, regardless
       // of which way they happen to be facing.
       const dir = isClear ? -ownGoalDir : pl.facing;
       if (isClear) power *= CLEAR_MUL;
+
+      game.ballLastTouch = pl.index;    // for wall-damage attribution
+
+      /*
+        A connecting kick RESETS THE JUMP. Landing a touch in mid-air lets you
+        jump again, so a skilled player can juggle the ball across the pitch.
+        Only a real connection counts, so it cannot be used as a free double
+        jump by swinging at nothing.
+      */
+      if (!pl.onGround) {
+        pl.onGround = true;             // consumed by the next jump press
+        pl.airKickReset = true;         // for the visual cue
+      }
 
       // Mark the ball as charged so it can knock the opponent back.
       if (hasPower) { game.ballPowered = true; game.ballPoweredBy = pl.index; }
@@ -3518,6 +4572,27 @@ function updateMenu(dt) {
     return;
   }
 
+  if (go && row === "controls") {
+    game.ctrlFrom = SCENE.MENU;
+    game.ctrlSeat = 0;
+    game.ctrlRow = 0;
+    game.ctrlBinding = null;
+    game.scene = SCENE.CONTROLS;
+    return;
+  }
+
+  if (go && row === "credits") {
+    game.creditsFrom = SCENE.MENU;
+    game.creditsScroll = 0;
+    game.scene = SCENE.CREDITS;
+    return;
+  }
+
+  if (go && row === "roguelike") {
+    startRun();
+    return;
+  }
+
   if (go && row === "board") {
     game.boardFrom = SCENE.MENU;
     game.boardScroll = 0;
@@ -3546,11 +4621,16 @@ function updateMenu(dt) {
     if (game.mode === MODE.TOURNAMENT) {
       // Name everyone first, so the bracket is readable.
       game.rosterNames = [];
+      game.rosterCpu = [];
       for (let i = 0; i < game.entrantCount; i++) {
         game.rosterNames.push(i < 2 ? cleanName(game.names[i], `PLAYER ${i + 1}`)
                                     : `PLAYER ${i + 1}`);
+        // Default: seats beyond the first two are CPUs, so a big bracket is
+        // playable straight away without naming eight people.
+        game.rosterCpu.push(i >= 2);
       }
       game.rosterEdit = -1;
+      game.rosterCursor = 0;
       game.scene = SCENE.ROSTER;
       return;
     }
@@ -3591,10 +4671,13 @@ function updateOnline(dt) {
     if (game.mode === MODE.TOURNAMENT) {
       // Name the field first; the bracket then syncs to the guest.
       game.rosterNames = [];
+      game.rosterCpu = [];
       for (let i = 0; i < game.entrantCount; i++) {
         game.rosterNames.push(i === 0 ? cleanName(game.names[0], "PLAYER 1")
                             : i === 1 ? (game.remoteName || "PLAYER 2")
                             : `PLAYER ${i + 1}`);
+        // Seats 0 and 1 are the two humans online; the rest default to CPUs.
+        game.rosterCpu.push(i >= 2);
       }
       game.rosterEdit = -1;
       game.rosterCursor = 0;
@@ -3618,9 +4701,23 @@ function updateRoster(dt) {
   if (hit(SCHEME[0].down) || hit(SCHEME[1].down)) game.rosterCursor = (game.rosterCursor + 1) % (n + 1);
   if (hit(SCHEME[0].up) || hit(SCHEME[1].up)) game.rosterCursor = (game.rosterCursor + n) % (n + 1);
 
+  /*
+    Left/right marks the highlighted entrant as a human or the computer, so a
+    bracket can be filled out without needing a person for every seat.
+    Seat 1 is pinned human: somebody has to be playing.
+  */
+  const i = game.rosterCursor;
+  if (i < n && i > 0 && (hit(SCHEME[0].left) || hit(SCHEME[0].right) ||
+                         hit(SCHEME[1].left) || hit(SCHEME[1].right))) {
+    game.rosterCpu[i] = !game.rosterCpu[i];
+  }
+
   if (kickHit(0) || kickHit(1) || hit("Space") || hit("Enter")) {
     if (game.rosterCursor === n) {              // the START row
       startTournament();
+    } else if (game.rosterCpu[game.rosterCursor]) {
+      // A CPU entrant has no name to type; toggle it back to human instead.
+      game.rosterCpu[game.rosterCursor] = false;
     } else {
       game.rosterEdit = game.rosterCursor;
     }
@@ -3719,6 +4816,12 @@ function updateSettings(dt) {
   if (!toggled) return;
 
   switch (row) {
+    case "music":
+      game.opt.music = !game.opt.music;
+      saveOpts(game.opt);
+      if (!game.opt.music) musicStop();
+      break;
+    case "gamepad":   game.opt.gamepad = !game.opt.gamepad; saveOpts(game.opt); break;
     case "shake":     game.opt.shake = !game.opt.shake; saveOpts(game.opt); break;
     case "particles": game.opt.particles = !game.opt.particles; saveOpts(game.opt); break;
     case "flash":     game.opt.flash = !game.opt.flash; saveOpts(game.opt); break;
@@ -3796,6 +4899,68 @@ function updateRules(dt) {
   if (step) {
     game.rules[d.key] = clampRule(d.key, game.rules[d.key] + step);
     saveRules(game.rules);
+  }
+}
+
+/** Upgrade choice between run stages. */
+function updateUpgrade(dt) {
+  const n = game.run.offer.length;
+  if (!n) { beginRunStage(false); return; }
+  if (hit(SCHEME[0].left) || hit(SCHEME[0].up)) {
+    game.run.offerRow = (game.run.offerRow + n - 1) % n;
+  }
+  if (hit(SCHEME[0].right) || hit(SCHEME[0].down)) {
+    game.run.offerRow = (game.run.offerRow + 1) % n;
+  }
+  if (kickHit(0) || hit("Enter") || hit("Space")) {
+    takeUpgrade(game.run.offer[game.run.offerRow]);
+  }
+}
+
+/** Run over, or run cleared. Either way, back to the menu. */
+function updateRunEnd(dt) {
+  if (kickHit(0) || hit("Enter") || hit("Space") || hit("Escape")) {
+    escUsed = true;
+    game.run = null;
+    game.cpu = [false, false];
+    game.scene = SCENE.MENU;
+  }
+}
+
+/** Controls screen: choose a seat, rebind an action, or reset. */
+function updateControls(dt) {
+  if (game.ctrlBinding) return;                // the keydown handler owns input
+
+  const rowsN = ACTIONS.length + 2;            // + RESET + BACK
+  const leave = () => {
+    saveScheme();
+    game.scene = game.ctrlFrom === SCENE.PAUSE ? SCENE.PAUSE : SCENE.MENU;
+    game.ctrlFrom = null;
+  };
+
+  if (hit("Escape")) { escUsed = true; leave(); return; }
+  if (hit("ArrowDown") || hit("KeyS")) game.ctrlRow = (game.ctrlRow + 1) % rowsN;
+  if (hit("ArrowUp") || hit("KeyW")) game.ctrlRow = (game.ctrlRow + rowsN - 1) % rowsN;
+  // Left/right switches which player is being edited.
+  if (hit("ArrowLeft") || hit("ArrowRight") || hit("KeyA") || hit("KeyD")) {
+    game.ctrlSeat = 1 - game.ctrlSeat;
+  }
+
+  const go = hit("Enter") || hit("Space");
+  if (!go) return;
+
+  if (game.ctrlRow === ACTIONS.length) { resetScheme(); return; }      // RESET
+  if (game.ctrlRow === ACTIONS.length + 1) { leave(); return; }        // BACK
+  game.ctrlBinding = { seat: game.ctrlSeat, action: ACTIONS[game.ctrlRow].key };
+}
+
+/** Credits screen. */
+function updateCredits(dt) {
+  game.creditsScroll += dt;
+  if (hit("Escape") || hit("Enter") || hit("Space") || kickHit(0) || kickHit(1)) {
+    escUsed = true;
+    game.scene = game.creditsFrom === SCENE.PAUSE ? SCENE.PAUSE : SCENE.MENU;
+    game.creditsFrom = null;
   }
 }
 
@@ -3912,6 +5077,23 @@ function step(dt) {
       updateBoard(dt);
       break;
 
+    case SCENE.CONTROLS:
+      updateControls(dt);
+      break;
+
+    case SCENE.CREDITS:
+      updateCredits(dt);
+      break;
+
+    case SCENE.UPGRADE:
+      updateUpgrade(dt);
+      break;
+
+    case SCENE.RUNOVER:
+    case SCENE.RUNWIN:
+      updateRunEnd(dt);
+      break;
+
     case SCENE.RULES:
       updateRules(dt);
       break;
@@ -3945,6 +5127,11 @@ function step(dt) {
         if (game.cpu[i]) updateCPU(game.players[i], dt);
       }
 
+      // Wall building, for any seat that asked for it this substep.
+      for (let i = 0; i < 2; i++) {
+        if (intent[i].wallEdge) buildWall(game.players[i]);
+      }
+
       for (let i = 0; i < 2; i++) {
         if (game.cpu[i]) continue;          // the AI calls these itself
         const a = intent[i];
@@ -3961,9 +5148,17 @@ function step(dt) {
       stepBall(dt);
       if (netMode) ballVsNet(game.ball);
       if (basket) ballVsHoops(game.ball);
+      // A swinging leg damages a wall it connects with.
+      kickVsWalls(game.players[0]);
+      kickVsWalls(game.players[1]);
+
       ballVsPlatforms(game.ball);
+      ballVsWalls(game.ball);
       playerVsPlatforms(game.players[0]);
       playerVsPlatforms(game.players[1]);
+      playerVsWalls(game.players[0]);
+      playerVsWalls(game.players[1]);
+      updateWalls(dt);
       ballVsPlayer(game.players[0]);
       ballVsPlayer(game.players[1]);
       updatePowerups(dt);
@@ -4098,6 +5293,11 @@ function frame(now) {
 
   for (const k in pressed) delete pressed[k];
   edgeFrame = true;
+
+  // Music: pick the track for the current scene and keep the scheduler fed.
+  if (game.opt.music) musicPlay(musicTrackForScene()); else musicStop();
+  musicPump();
+
   draw();
   requestAnimationFrame(frame);
 }
@@ -4299,6 +5499,19 @@ function drawPitch() {
     sheen.addColorStop(1, "rgba(255,240,200,0)");
     ctx.fillStyle = sheen;
     ctx.fillRect(0, GROUND_Y, W, gh);
+  }
+
+  // ---- sponsor hoardings ------------------------------------------------
+  /*
+    A band of advertising boards along the back of the pitch. Drawn before the
+    markings so players, ball and lines all sit in front of them.
+  */
+  {
+    const hh = 26, hy = GROUND_Y - hh - 2;
+    ctx.fillStyle = "rgba(0,0,0,0.28)";
+    ctx.fillRect(WALL, hy, W - WALL * 2, hh);
+    drawSponsorStrip(WALL + 4, hy + 2, W - WALL * 2 - 8, hh - 4,
+                     { dark: false, gap: 6, placeholders: 4 });
   }
 
   // ---- court markings ---------------------------------------------------
@@ -4972,6 +6185,74 @@ function drawHat(x, y, r, facing, hatId, team) {
   }
 }
 
+function drawWalls() {
+  drawProbe.walls = 0;
+  for (const w of game.walls) {
+    drawProbe.walls++;
+    const team = game.players[w.owner] ? game.players[w.owner].team : TEAMS[0];
+    /*
+      A wall grows up out of the ground; a built platform fades in at full size
+      instead, since sliding a horizontal slab upward reads as it falling.
+    */
+    const h = w.platform ? w.h : w.h * w.born;
+    const y = w.platform ? w.y : w.y + (w.h - h);
+    if (w.platform) ctx.globalAlpha = 0.35 + 0.65 * w.born;
+    const dying = w.life < 1.5 && Math.floor(w.life * 8) % 2 === 0;
+    ctx.globalAlpha = dying ? 0.45 : 1;
+
+    // Body, tinted toward the owner's colour so you can tell whose it is.
+    const g = ctx.createLinearGradient(w.x, y, w.x + w.w, y);
+    g.addColorStop(0, "#475569");
+    g.addColorStop(0.5, team.color);
+    g.addColorStop(1, "#334155");
+    ctx.fillStyle = g;
+    roundRect(w.x, y, w.w, h, 4);
+    ctx.fill();
+    ctx.strokeStyle = team.accent;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Brick courses, so damage reads as structural.
+    ctx.strokeStyle = "rgba(0,0,0,0.28)";
+    ctx.lineWidth = 1;
+    for (let by = y + 12; by < y + h - 4; by += 14) {
+      ctx.beginPath();
+      ctx.moveTo(w.x + 2, by);
+      ctx.lineTo(w.x + w.w - 2, by);
+      ctx.stroke();
+    }
+
+    // Damage: cracks appear as hit points are lost.
+    const lost = WALL_HP - w.hp;
+    if (lost > 0) {
+      ctx.strokeStyle = "rgba(15,23,42,0.75)";
+      ctx.lineWidth = 2;
+      for (let k = 0; k < lost; k++) {
+        const cy = y + h * (0.25 + k * 0.25);
+        ctx.beginPath();
+        ctx.moveTo(w.x + 1, cy);
+        ctx.lineTo(w.x + w.w * 0.6, cy + 6);
+        ctx.lineTo(w.x + w.w - 1, cy - 3);
+        ctx.stroke();
+      }
+    }
+
+    // A kick flashes the wall white, so the hit reads even without a hp change.
+    if (w.kickFlash > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${w.kickFlash * 1.6})`;
+      roundRect(w.x, y, w.w, h, 4);
+      ctx.fill();
+    }
+
+    // Remaining-life bar along the top.
+    const frac = clamp(w.life / WALL_LIFE, 0, 1);
+    ctx.fillStyle = frac > 0.35 ? team.accent : "#f87171";
+    ctx.fillRect(w.x, y - 4, w.w * frac, 2.5);
+
+    ctx.globalAlpha = 1;
+  }
+}
+
 function drawPlatforms() {
   // Tally for the test suite: proves platforms reached the canvas on this
   // frame. A previous bug had this called only from the pause backdrop, so the
@@ -5145,6 +6426,8 @@ const MENU_GROUP = {
   mode: "setup", map: "setup", goals: "setup", time: "setup",
   chaos: "setup", players: "setup",
   rules: "nav", online: "nav", board: "nav", settings: "nav",
+  controls: "nav", credits: "nav",
+  roguelike: "action",
   start: "action",
 };
 
@@ -5154,15 +6437,15 @@ function drawMenu() {
   const rows = menuRows();
   const cur = rows[game.menuRow];
 
-  drawLogo(W / 2, 52);
-  text("LOCAL & ONLINE MULTIPLAYER SOCCER", W / 2, 88, 10, "#7dd3fc", "center", 800);
+  drawLogo(W / 2, 48);
+  text("LOCAL & ONLINE MULTIPLAYER SOCCER", W / 2, 82, 10, "#7dd3fc", "center", 800);
 
   // ---- panel geometry --------------------------------------------------
   const colW = 400, gapX = 24;
   const leftX = (W - (colW * 2 + gapX)) / 2;
   const rightX = leftX + colW + gapX;
-  const panelTop = 108;
-  const panelH = 300;
+  const panelTop = 104;
+  const panelH = 268;
 
   const panel = (x, title, accent) => {
     ctx.fillStyle = "rgba(8,15,28,0.78)";
@@ -5313,38 +6596,75 @@ function drawMenu() {
   }
 
   // ---- destination buttons --------------------------------------------
-  const navKeys = ["rules", "online", "board", "settings"];
+  const navKeys = ["rules", "online", "board", "controls", "credits", "settings"];
   const navLabels = {
     rules: ["SPAWN RATES", "#fbbf24"],
     online: ["PLAY ONLINE", "#38bdf8"],
     board: ["LEADERBOARD", "#a78bfa"],
+    controls: ["CONTROLS", "#34d399"],
+    credits: ["CREDITS", "#fb7185"],
     settings: ["SETTINGS", "#94a3b8"],
   };
   const visibleNav = navKeys.filter((k) => rows.includes(k));
-  const navW = 190, navGap = 12;
-  const navTotal = visibleNav.length * navW + (visibleNav.length - 1) * navGap;
-  let nx = (W - navTotal) / 2;
-  const navY = panelTop + panelH + 16;
+  const navGap = 10, navH = 32;
+  const perRow = 3;
+  const navW = 190;
+  const navY = panelTop + panelH + 10;
 
-  for (const k of visibleNav) {
+  visibleNav.forEach((k, i) => {
     const [label, accent] = navLabels[k];
     const on = cur === k;
-    layoutProbe.menu.labels.push({ key: k, y: navY, bottom: navY + 38 });
+    const row = Math.floor(i / perRow);
+    const inRowCount = Math.min(perRow, visibleNav.length - row * perRow);
+    const rowTotal = inRowCount * navW + (inRowCount - 1) * navGap;
+    const col = i % perRow;
+    const nx = (W - rowTotal) / 2 + col * (navW + navGap);
+    const ny = navY + row * (navH + navGap);
+
+    layoutProbe.menu.labels.push({ key: k, y: ny, bottom: ny + navH });
     ctx.fillStyle = on ? "rgba(255,255,255,0.14)" : "rgba(8,15,28,0.78)";
-    roundRect(nx, navY, navW, 38, 9);
+    roundRect(nx, ny, navW, navH, 8);
     ctx.fill();
     ctx.strokeStyle = on ? accent : "rgba(255,255,255,0.12)";
     ctx.lineWidth = on ? 2.5 : 1.5;
     ctx.stroke();
-    text(label, nx + navW / 2, navY + 20, 12, on ? accent : "#cddcf2", "center", 900);
-    nx += navW + navGap;
+    text(label, nx + navW / 2, ny + navH / 2, 11, on ? accent : "#cddcf2", "center", 900);
+  });
+  const navRows = Math.ceil(visibleNav.length / perRow);
+  const navBottom = navY + navRows * (navH + navGap);
+
+  // ---- roguelike entry -------------------------------------------------
+  {
+    const on = cur === "roguelike";
+    const bw3 = 320, bh3 = 38;
+    const bx3 = (W - bw3) / 2, by3 = navBottom + 2;
+    layoutProbe.menu.labels.push({ key: "roguelike", y: by3, bottom: by3 + bh3 });
+
+    const g3 = ctx.createLinearGradient(bx3, by3, bx3 + bw3, by3);
+    g3.addColorStop(0, on ? "#7c3aed" : "#1b1430");
+    g3.addColorStop(1, on ? "#c026d3" : "#221838");
+    ctx.fillStyle = g3;
+    roundRect(bx3, by3, bw3, bh3, 9);
+    ctx.fill();
+    ctx.strokeStyle = on ? "#e879f9" : "rgba(192,132,252,0.35)";
+    ctx.lineWidth = on ? 2.5 : 1.5;
+    ctx.stroke();
+    text("⚔  ROGUELIKE RUN", W / 2, by3 + bh3 / 2 - 1, 14,
+         on ? "#ffffff" : "#c4b5fd", "center", 900);
+    const best = (() => {
+      try { return parseInt(localStorage.getItem("headgame.runbest") || "0", 10) || 0; }
+      catch (e) { return 0; }
+    })();
+    text(best ? `solo ladder · best ${best}/${RUN_STAGES.length}`
+              : `solo ladder · ${RUN_STAGES.length} stages`,
+         W / 2, by3 + bh3 - 6, 8, on ? "rgba(255,255,255,0.75)" : "#6b819e", "center", 600);
   }
 
   // ---- the primary action ---------------------------------------------
   {
     const on = cur === "start";
-    const bw2 = 320, bh2 = 54;
-    const bx2 = (W - bw2) / 2, by2 = navY + 50;
+    const bw2 = 320, bh2 = 46;
+    const bx2 = (W - bw2) / 2, by2 = navBottom + 44;
     layoutProbe.menu.labels.push({ key: "start", y: by2, bottom: by2 + bh2 });
 
     if (on) {
@@ -5645,11 +6965,27 @@ function drawRoster() {
     ctx.fill();
     text(String(i + 1), x + 17, y + fh / 2, 15, sel ? "#0b1220" : "#8fa3c0", "center", 900);
 
-    nameField(x + 42, y, fw - 42, fh, game.rosterNames[i], active,
-              `player ${i + 1} name`);
+    const isCpu = !!game.rosterCpu[i];
+    if (isCpu) {
+      // A CPU seat shows a badge instead of an editable name field.
+      ctx.fillStyle = sel ? "rgba(251,191,36,0.18)" : "rgba(255,255,255,0.05)";
+      roundRect(x + 42, y, fw - 42, fh, 6);
+      ctx.fill();
+      ctx.strokeStyle = sel ? "#fbbf24" : "rgba(255,255,255,0.14)";
+      ctx.lineWidth = sel ? 2.5 : 1.5;
+      ctx.stroke();
+      text(`COMPUTER · ${cpuCfg().name}`, x + 56, y + fh / 2, 13,
+           sel ? "#fde68a" : "#8fa3c0", "left", 800);
+    } else {
+      nameField(x + 42, y, fw - 42, fh, game.rosterNames[i], active,
+                `player ${i + 1} name`);
+    }
 
     if (sel && !active) {
-      text("press kick to rename", x + fw + 10, y + fh / 2, 9, "#6b819e", "left", 600);
+      const tip = i === 0 ? "kick to rename"
+                : isCpu ? "◄ ► for a human"
+                : "◄ ► for a CPU  ·  kick to rename";
+      text(tip, x + fw + 10, y + fh / 2, 9, "#6b819e", "left", 600);
     }
   }
 
@@ -5663,7 +6999,7 @@ function drawRoster() {
 
   text(game.rosterEdit >= 0
         ? "type a name  ·  ENTER to confirm"
-        : "up/down to choose  ·  kick to rename or begin  ·  ESC to go back",
+        : "up/down to choose  ·  left/right for HUMAN or CPU  ·  kick to rename or begin",
        W / 2, H - 30, 12, "#6b819e", "center", 600);
 }
 
@@ -5709,6 +7045,7 @@ function drawFrozenPitch() {
   try {
     drawPitch();
     drawPlatforms();
+    drawWalls();
     if (hasNet()) drawNet();
     if (game.mode === MODE.BASKET) drawHoops();
     drawMines();
@@ -5785,6 +7122,9 @@ function drawSettings() {
   text("saved on this computer", W / 2, 114, 12, "#8fa3c0", "center", 600);
 
   const items = [
+    { label: "MUSIC", value: game.opt.music,
+      hint: music.failed ? "audio unavailable in this browser"
+                         : "synthesised soundtrack" },
     { label: "SCREEN SHAKE", value: game.opt.shake,
       hint: "camera kick on goals, mines and hard hits" },
     { label: "PARTICLES", value: game.opt.particles,
@@ -5793,6 +7133,8 @@ function drawSettings() {
       hint: "white flash the moment someone scores" },
     { label: "CONTROL HINTS", value: game.opt.hints,
       hint: "show the key reminder during play" },
+    { label: "GAMEPAD", value: game.opt.gamepad,
+      hint: "read connected controllers" },
     { label: "BACK", accent: "#4ade80" },
   ];
   drawMenuList(items, game.settingsRow, W / 2 - 260, 154, 520, 54, 10);
@@ -5891,6 +7233,284 @@ function drawRules() {
 
   text("left/right to adjust  ·  the white notch marks the default  ·  ESC to go back",
        W / 2, H - 26, 11, "#6b819e", "center", 600);
+}
+
+/** Upgrade picker, shown after each won stage. */
+function drawUpgrade() {
+  drawMenuBackdrop();
+  ctx.fillStyle = "rgba(5,10,18,0.72)";
+  ctx.fillRect(0, 0, W, H);
+
+  const r = game.run;
+  const cleared = r.stage;                    // stages beaten so far
+  text("STAGE CLEARED", W / 2, 54, 30, "#4ade80", "center", 900);
+  text(`${RUN_STAGES[cleared].name}  ·  ${cleared + 1} of ${RUN_STAGES.length}`,
+       W / 2, 80, 12, "#8fa3c0", "center", 600);
+  text("CHOOSE A REWARD", W / 2, 116, 15, "#fbbf24", "center", 900);
+
+  // Three cards.
+  const cw = 260, ch = 190, gap = 22;
+  const total = r.offer.length * cw + (r.offer.length - 1) * gap;
+  let cx = (W - total) / 2;
+  r.offer.forEach((u, i) => {
+    const on = i === r.offerRow;
+    ctx.fillStyle = on ? "rgba(74,222,128,0.14)" : "rgba(8,15,28,0.85)";
+    roundRect(cx, 140, cw, ch, 14);
+    ctx.fill();
+    ctx.strokeStyle = on ? "#4ade80" : "rgba(255,255,255,0.12)";
+    ctx.lineWidth = on ? 3 : 1.5;
+    ctx.stroke();
+
+    // A simple emblem so the cards are not just words.
+    ctx.fillStyle = on ? "#4ade80" : "#334155";
+    ctx.beginPath();
+    ctx.arc(cx + cw / 2, 190, 26, 0, Math.PI * 2);
+    ctx.fill();
+    text(u.name.slice(0, 1), cx + cw / 2, 191, 24, on ? "#04240f" : "#8fa3c0", "center", 900);
+
+    text(u.name, cx + cw / 2, 244, 16, on ? "#ffffff" : "#cddcf2", "center", 900);
+    // Wrap the description over two short lines.
+    const words = u.desc.split(" ");
+    const half = Math.ceil(words.length / 2);
+    text(words.slice(0, half).join(" "), cx + cw / 2, 272, 11, "#8fa3c0", "center", 600);
+    text(words.slice(half).join(" "), cx + cw / 2, 288, 11, "#8fa3c0", "center", 600);
+
+    if (on) text("PRESS F", cx + cw / 2, 314, 11, "#4ade80", "center", 900);
+    cx += cw + gap;
+  });
+
+  // What is already held, and what is next.
+  if (r.taken.length) {
+    const names = r.taken.map((id) => (upgradeById(id) || {}).name || id);
+    text("HELD:  " + names.join("   ·   "), W / 2, 366, 10, "#7dd3fc", "center", 700);
+  }
+  const next = RUN_STAGES[r.stage + 1];
+  if (next) {
+    text(`NEXT — ${next.name}:  ${next.label}   ·   CPU ${CPU_LEVELS[next.cpu].name}`,
+         W / 2, 400, 12, "#fbbf24", "center", 700);
+  } else {
+    text("NEXT — the final match", W / 2, 400, 12, "#fbbf24", "center", 700);
+  }
+
+  drawRunLadder(W / 2, 440);
+  text("left/right to choose  ·  F or ENTER to take it",
+       W / 2, H - 24, 11, "#6b819e", "center", 600);
+}
+
+/** A compact pip ladder showing progress through the run. */
+function drawRunLadder(cx, y) {
+  const r = game.run;
+  if (!r) return;
+  const n = RUN_STAGES.length;
+  const gap = 42;
+  let x = cx - (gap * (n - 1)) / 2;
+  for (let i = 0; i < n; i++) {
+    const done = i < r.stage;
+    const now = i === r.stage;
+    ctx.fillStyle = done ? "#4ade80" : now ? "#fbbf24" : "rgba(255,255,255,0.14)";
+    ctx.beginPath();
+    ctx.arc(x, y, now ? 9 : 6, 0, Math.PI * 2);
+    ctx.fill();
+    if (i < n - 1) {
+      ctx.strokeStyle = done ? "rgba(74,222,128,0.5)" : "rgba(255,255,255,0.12)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x + 10, y);
+      ctx.lineTo(x + gap - 10, y);
+      ctx.stroke();
+    }
+    x += gap;
+  }
+}
+
+/** End of a run: either defeat or a cleared ladder. */
+function drawRunEnd(won) {
+  drawMenuBackdrop();
+  ctx.fillStyle = won ? "rgba(4,26,14,0.82)" : "rgba(26,6,10,0.82)";
+  ctx.fillRect(0, 0, W, H);
+
+  const r = game.run || { stage: 0, taken: [], bestStage: 0 };
+  text(won ? "RUN COMPLETE" : "RUN OVER", W / 2, 130,
+       44, won ? "#4ade80" : "#f87171", "center", 900);
+  text(won ? "you beat every challenger"
+           : `fell at ${RUN_STAGES[Math.min(r.stage, RUN_STAGES.length - 1)].name}`,
+       W / 2, 168, 15, "#cddcf2", "center", 600);
+
+  text(`STAGES CLEARED   ${r.stage} / ${RUN_STAGES.length}`,
+       W / 2, 216, 17, "#ffffff", "center", 900);
+  if (r.bestStage) {
+    text(`best run so far: ${r.bestStage} / ${RUN_STAGES.length}`,
+         W / 2, 240, 11, "#8fa3c0", "center", 600);
+  }
+
+  if (r.taken.length) {
+    text("UPGRADES COLLECTED", W / 2, 282, 11, "#7dd3fc", "center", 800);
+    const names = r.taken.map((id) => (upgradeById(id) || {}).name || id);
+    // Two rows so a long list stays readable.
+    const half = Math.ceil(names.length / 2);
+    text(names.slice(0, half).join("   ·   "), W / 2, 304, 12, "#cddcf2", "center", 700);
+    if (names.length > half) {
+      text(names.slice(half).join("   ·   "), W / 2, 324, 12, "#cddcf2", "center", 700);
+    }
+  }
+
+  drawRunLadder(W / 2, 372);
+
+  const bw = 300, bh = 48, bx = W / 2 - bw / 2, by = 410;
+  ctx.fillStyle = won ? "#4ade80" : "#94a3b8";
+  roundRect(bx, by, bw, bh, 10);
+  ctx.fill();
+  text("BACK TO MENU", W / 2, by + bh / 2, 17, "#0b1220", "center", 900);
+  text("press F, ENTER or ESC", W / 2, by + bh + 22, 11, "#8fa3c0", "center", 600);
+}
+
+function drawControls() {
+  if (game.ctrlFrom === SCENE.PAUSE) {
+    drawFrozenPitch();
+    ctx.fillStyle = "rgba(5,10,18,0.88)";
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    drawMenuBackdrop();
+  }
+
+  text("CONTROLS", W / 2, 44, 28, "#ffffff", "center", 900);
+  text("saved on this computer  ·  left/right switches player",
+       W / 2, 68, 11, "#8fa3c0", "center", 600);
+
+  // Seat tabs.
+  for (let i = 0; i < 2; i++) {
+    const on = game.ctrlSeat === i;
+    const tw = 170, tx = W / 2 - tw - 8 + i * (tw + 16);
+    ctx.fillStyle = on ? "rgba(125,211,252,0.18)" : "rgba(8,15,28,0.8)";
+    roundRect(tx, 84, tw, 30, 8);
+    ctx.fill();
+    ctx.strokeStyle = on ? "#7dd3fc" : "rgba(255,255,255,0.12)";
+    ctx.lineWidth = on ? 2.5 : 1.5;
+    ctx.stroke();
+    const padTag = pads.active[i] ? "  🎮" : "";
+    text(`PLAYER ${i + 1}${padTag}`, tx + tw / 2, 99, 12,
+         on ? "#ffffff" : "#8fa3c0", "center", 900);
+  }
+
+  const bw = 560, bx = (W - bw) / 2;
+  const top = 128;
+  const gap = 38;
+
+  ACTIONS.forEach((a, i) => {
+    const y = top + i * gap;
+    const on = game.ctrlRow === i;
+    const binding = game.ctrlBinding &&
+                    game.ctrlBinding.seat === game.ctrlSeat &&
+                    game.ctrlBinding.action === a.key;
+
+    ctx.fillStyle = binding ? "rgba(251,191,36,0.18)"
+                  : on ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.045)";
+    roundRect(bx, y, bw, 32, 8);
+    ctx.fill();
+    if (on || binding) {
+      ctx.strokeStyle = binding ? "#fbbf24" : "#7dd3fc";
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+    text(a.label, bx + 20, y + 16, 12, "#cddcf2", "left", 800);
+
+    // The bound key, in a keycap.
+    const code = SCHEME[game.ctrlSeat][a.key];
+    const cap = binding ? "PRESS A KEY…" : keyLabel(code);
+    const cw = Math.max(64, cap.length * 9 + 20);
+    ctx.fillStyle = binding ? "#fbbf24" : code ? "rgba(15,23,42,0.9)" : "rgba(248,113,113,0.25)";
+    roundRect(bx + bw - cw - 16, y + 4, cw, 24, 5);
+    ctx.fill();
+    ctx.strokeStyle = binding ? "#fde68a" : "rgba(255,255,255,0.2)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    text(cap, bx + bw - cw / 2 - 16, y + 16, 11,
+         binding ? "#0b1220" : code ? "#a7f3d0" : "#fca5a5", "center", 900);
+  });
+
+  // RESET and BACK.
+  [["RESET TO DEFAULTS", "#fbbf24"], ["BACK", "#4ade80"]].forEach(([label, col], k) => {
+    const i = ACTIONS.length + k;
+    const y = top + i * gap;
+    const on = game.ctrlRow === i;
+    ctx.fillStyle = on ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.045)";
+    roundRect(bx + bw / 4, y, bw / 2, 32, 8);
+    ctx.fill();
+    if (on) { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke(); }
+    text(label, W / 2, y + 16, 13, on ? col : "#cddcf2", "center", 900);
+  });
+
+  // Gamepad status, so a player knows whether a pad was seen.
+  const gy = top + (ACTIONS.length + 2) * gap + 8;
+  if (!padsAvailable()) {
+    text("gamepads: not supported by this browser", W / 2, gy, 10, "#6b819e", "center", 600);
+  } else if (pads.active[0] || pads.active[1]) {
+    const which = [0, 1].filter((i) => pads.active[i]).map((i) => `P${i + 1}`).join(" & ");
+    text(`🎮 gamepad connected for ${which} — it overrides the keyboard for that player`,
+         W / 2, gy, 10, "#4ade80", "center", 700);
+  } else {
+    text("🎮 connect a controller and press a button — it is detected automatically",
+         W / 2, gy, 10, "#8fa3c0", "center", 600);
+  }
+
+  text(game.ctrlBinding ? "press the key you want  ·  ESC to cancel"
+                        : "ENTER to rebind  ·  ESC to go back",
+       W / 2, H - 20, 11, "#6b819e", "center", 600);
+}
+
+function drawCredits() {
+  drawMenuBackdrop();
+  ctx.fillStyle = "rgba(5,10,18,0.7)";
+  ctx.fillRect(0, 0, W, H);
+
+  drawLogo(W / 2, 54);
+  text("CREDITS", W / 2, 92, 14, "#7dd3fc", "center", 900);
+
+  const lines = [
+    ["CREATED BY", null],
+    ["João Novo", "design & direction"],
+    ["Everyone at the office", "ideas, opinions and encouragement"],
+    ["", null],
+    ["SPECIAL THANKS", null],
+    ["Salvado", "an amazing play tester"],
+    ["", null],
+    ["BUILT WITH", null],
+    ["Claude Code", "pair programming"],
+    ["Vanilla JavaScript · HTML5 Canvas", "no dependencies, one file"],
+  ];
+
+  /*
+    Two-column layout: the name on the right of centre, its role on the left.
+    A few entries are highlighted — the author and the play tester — so the
+    screen has a focal point rather than reading as a uniform list.
+  */
+  const HIGHLIGHT = { "João Novo": "#ffffff", "Salvado": "#4ade80" };
+  creditProbe.lines = lines.filter(([l]) => l).map(([l, r]) => (r === null ? l : `${l} — ${r}`));
+
+  let y = 122;
+  for (const [left, right] of lines) {
+    if (!left) { y += 10; continue; }
+    if (right === null) {
+      text(left, W / 2, y, 11, "#fbbf24", "center", 900);
+      y += 20;
+    } else {
+      const hl = HIGHLIGHT[left];
+      text(left, W / 2 - 14, y, hl ? 15 : 12, hl || "#e8f1ff", "right", hl ? 900 : 700);
+      text(right, W / 2 + 14, y, 11, hl ? "#cddcf2" : "#8fa3c0", "left", 600);
+      y += hl ? 23 : 19;
+    }
+  }
+
+  // Sponsors.
+  const ready = readySponsors();
+  text("SPONSORS", W / 2, 352, 11, "#fbbf24", "center", 900);
+  drawSponsorStrip(140, 366, W - 280, 56, { dark: true, label: "YOUR LOGO HERE" });
+  if (!ready.length) {
+    text(`drop images in ${SPONSOR_DIR} and list them in sponsors.json`,
+         W / 2, 436, 9, "#5f7391", "center", 600);
+  }
+
+  text("kick, ENTER or ESC to go back", W / 2, H - 22, 11, "#6b819e", "center", 600);
 }
 
 function drawBoard() {
@@ -5999,79 +7619,199 @@ function drawBoard() {
   text("kick or ESC to go back", W / 2, H - 28, 12, "#6b819e", "center", 600);
 }
 
+/*
+  BRACKET
+
+  Drawn as a real tournament tree: one column per round, each tie a two-slot
+  card, with elbow connectors carrying the winner into the next round. Reads at a
+  glance as "who beat whom to get here", which a flat list of rows never did.
+
+  Everything comes from `game.bracket`, the recorded history, so completed rounds
+  keep showing their results instead of vanishing.
+*/
 function drawBracket() {
   drawMenuBackdrop();
 
   const alive = aliveEntrants();
-  text("TOURNAMENT", W / 2, 44, 30, "#ffffff", "center", 900);
-  text(`ROUND ${game.round}  ·  ${alive.length} still standing`, W / 2, 72, 13, "#8fa3c0", "center", 600);
+  const totalRounds = Math.max(1, Math.ceil(Math.log2(Math.max(2, game.entrantCount))));
 
-  // Last result, if any.
+  // ---- header ----------------------------------------------------------
+  text("TOURNAMENT", W / 2, 38, 26, "#ffffff", "center", 900);
+  const roundName = (r, of) => {
+    const left = of - r;                    // rounds remaining after this one
+    if (left === 0) return "FINAL";
+    if (left === 1) return "SEMI-FINAL";
+    if (left === 2) return "QUARTER-FINAL";
+    return `ROUND ${r}`;
+  };
+  text(`${roundName(game.round, totalRounds)}  ·  ${alive.length} STILL STANDING`,
+       W / 2, 60, 10, "#fbbf24", "center", 900);
+
+  // ---- last result ribbon ---------------------------------------------
   if (game.lastResult) {
     const w = entrantById(game.lastResult.winnerId);
     const l = entrantById(game.lastResult.loserId);
     const [s0, s1] = game.lastResult.score;
-    const bw = 520, bx = (W - bw) / 2;
-    ctx.fillStyle = "rgba(74,222,128,0.10)";
-    roundRect(bx, 92, bw, 46, 9);
-    ctx.fill();
-    ctx.strokeStyle = "rgba(74,222,128,0.5)";
-    ctx.lineWidth = 2;
-    ctx.stroke();
     const winSc = Math.max(s0, s1), loseSc = Math.min(s0, s1);
+    const rw = 460, rx = (W - rw) / 2;
+    ctx.fillStyle = "rgba(74,222,128,0.12)";
+    roundRect(rx, 72, rw, 26, 13);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(74,222,128,0.45)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
     text(`${w ? w.name : "?"} beat ${l ? l.name : "?"}  ${winSc}–${loseSc}` +
          (game.lastResult.byTime ? "  (on time)" : ""),
-         W / 2, 115, 15, "#a7f3d0", "center", 800);
+         W / 2, 85, 11, "#a7f3d0", "center", 800);
   }
 
-  // Pairs for this round.
-  const startY = game.lastResult ? 164 : 120;
-  const pairs = game.roundPairs;
-  for (let i = 0; i < pairs.length; i++) {
-    const [a, b] = pairs[i];
-    const ea = entrantById(a), eb = b === null ? null : entrantById(b);
-    const done = i < game.tieIndex;
-    const next = i === game.tieIndex;
-    const rowY = startY + i * 46;
-    const bw = 560, bx = (W - bw) / 2;
+  // ---- tree geometry ---------------------------------------------------
+  const top = game.lastResult ? 112 : 96;
+  const bottom = H - 42;
+  const colW = Math.min(200, (W - 80) / Math.max(1, totalRounds));
+  const cardW = colW - 26;
+  const slotH = 20;                          // one entrant slot
+  const cardH = slotH * 2 + 4;
+  const treeW = colW * totalRounds;
+  const x0 = (W - treeW) / 2;
 
-    ctx.fillStyle = next ? "rgba(125,211,252,0.13)" : "rgba(255,255,255,0.045)";
-    roundRect(bx, rowY, bw, 38, 8);
-    ctx.fill();
-    if (next) {
-      ctx.strokeStyle = "#7dd3fc";
-      ctx.lineWidth = 2;
+  /** Vertical centre of tie `i` in round `r` (0-based), spread over the space. */
+  const tieY = (r, i) => {
+    const ties = Math.max(1, Math.ceil(game.entrantCount / Math.pow(2, r + 1)));
+    const span = bottom - top;
+    const step = span / ties;
+    return top + step * (i + 0.5);
+  };
+
+  // Column headings.
+  for (let r = 0; r < totalRounds; r++) {
+    const cx = x0 + colW * r + colW / 2;
+    const isNow = r === game.round - 1;
+    text(roundName(r + 1, totalRounds), cx, top - 12, 8,
+         isNow ? "#7dd3fc" : "#5f7391", "center", 900);
+  }
+
+  // ---- connectors, drawn first so cards sit on top --------------------
+  ctx.strokeStyle = "rgba(148,163,184,0.35)";
+  ctx.lineWidth = 1.5;
+  for (let r = 0; r < totalRounds - 1; r++) {
+    const rec = game.bracket[r];
+    if (!rec) continue;
+    const fromX = x0 + colW * r + colW / 2 + cardW / 2;
+    const toX = x0 + colW * (r + 1) + colW / 2 - cardW / 2;
+    const midX = (fromX + toX) / 2;
+    for (let i = 0; i < rec.length; i++) {
+      const y = tieY(r, i);
+      const parentY = tieY(r + 1, Math.floor(i / 2));
+      const decided = rec[i].winner !== null && rec[i].winner !== undefined;
+      ctx.strokeStyle = decided ? "rgba(74,222,128,0.5)" : "rgba(148,163,184,0.28)";
+      ctx.beginPath();
+      ctx.moveTo(fromX, y);
+      ctx.lineTo(midX, y);
+      ctx.lineTo(midX, parentY);
+      ctx.lineTo(toX, parentY);
       ctx.stroke();
     }
+  }
 
-    const dim = done ? "#5f7391" : "#e8f1ff";
-    if (eb === null) {
-      text(`${ea ? ea.name : "?"} — BYE`, W / 2, rowY + 19, 14,
-           done ? "#5f7391" : "#fbbf24", "center", 800);
-    } else {
-      text(ea ? ea.name : "?", bx + 150, rowY + 19, 14,
-           done && !ea.alive ? "#5f7391" : dim, "center", 800);
-      text("vs", W / 2, rowY + 19, 11, "#6b819e", "center", 700);
-      text(eb ? eb.name : "?", bx + bw - 150, rowY + 19, 14,
-           done && !eb.alive ? "#5f7391" : dim, "center", 800);
-      if (next) text("NEXT", bx + 34, rowY + 19, 9, "#7dd3fc", "center", 900);
-      if (done) text("✓", bx + 34, rowY + 19, 13, "#4ade80", "center", 900);
+  // ---- the tie cards ---------------------------------------------------
+  for (let r = 0; r < totalRounds; r++) {
+    const rec = game.bracket[r];
+    const cx = x0 + colW * r + colW / 2;
+    const cardX = cx - cardW / 2;
 
-      // Online: mark the tie the two remote rivals will play against each other.
-      if (net.active && ea && eb) {
-        const isOnlineTie = (ea.owner === "host" && eb.owner === "guest") ||
+    const ties = Math.max(1, Math.ceil(game.entrantCount / Math.pow(2, r + 1)));
+    for (let i = 0; i < ties; i++) {
+      const y = tieY(r, i) - cardH / 2;
+      const tie = rec && rec[i];
+      const isNow = r === game.round - 1 && i === game.tieIndex;
+      const decided = tie && tie.winner !== null && tie.winner !== undefined;
+
+      // Card body. An unreached tie is a faint placeholder.
+      ctx.fillStyle = !tie ? "rgba(255,255,255,0.03)"
+                    : isNow ? "rgba(125,211,252,0.16)"
+                    : decided ? "rgba(74,222,128,0.07)"
+                    : "rgba(255,255,255,0.055)";
+      roundRect(cardX, y, cardW, cardH, 5);
+      ctx.fill();
+      ctx.strokeStyle = isNow ? "#7dd3fc"
+                      : decided ? "rgba(74,222,128,0.35)"
+                      : "rgba(255,255,255,0.10)";
+      ctx.lineWidth = isNow ? 2.5 : 1;
+      ctx.stroke();
+
+      if (!tie) continue;
+
+      // One row per entrant.
+      const slot = (id, k) => {
+        const sy = y + 2 + k * slotH;
+        const e = id === null || id === undefined ? null : entrantById(id);
+        const won = decided && tie.winner === id;
+        const lost = decided && tie.winner !== id && e;
+
+        if (won) {
+          ctx.fillStyle = "rgba(74,222,128,0.16)";
+          roundRect(cardX + 2, sy, cardW - 4, slotH - 2, 3);
+          ctx.fill();
+        }
+        const label = e ? e.name : (id === null ? "BYE" : "—");
+        const col = !e ? "#5f7391" : won ? "#a7f3d0" : lost ? "#6b7f96" : "#e8f1ff";
+        // Truncate to fit the card.
+        const maxChars = Math.max(6, Math.floor((cardW - 34) / 6.2));
+        const shown = label.length > maxChars ? label.slice(0, maxChars - 1) + "…" : label;
+        text(shown, cardX + 8, sy + slotH / 2 - 1, 10, col, "left", won ? 900 : 700);
+
+        // A CPU marker, and the score for a decided tie.
+        if (e && e.owner === "cpu") {
+          text("CPU", cardX + cardW - 8, sy + slotH / 2 - 1, 7, "#fbbf24", "right", 900);
+        } else if (decided && tie.score) {
+          const mine = tie.a === id ? tie.score[0] : tie.score[1];
+          text(String(mine), cardX + cardW - 8, sy + slotH / 2 - 1, 10,
+               won ? "#a7f3d0" : "#6b7f96", "right", 900);
+        }
+      };
+
+      slot(tie.a, 0);
+      slot(tie.b, 1);
+
+      // Divider between the two slots.
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cardX + 6, y + cardH / 2);
+      ctx.lineTo(cardX + cardW - 6, y + cardH / 2);
+      ctx.stroke();
+
+      if (isNow) {
+        text("NEXT UP", cx, y - 7, 7, "#7dd3fc", "center", 900);
+      }
+      // Online: mark the tie the two remote rivals play against each other.
+      if (net.active && tie.a !== null && tie.b !== null) {
+        const ea = entrantById(tie.a), eb = entrantById(tie.b);
+        if (ea && eb) {
+          const onlineTie = (ea.owner === "host" && eb.owner === "guest") ||
                             (ea.owner === "guest" && eb.owner === "host");
-        if (isOnlineTie) {
-          text("ONLINE", bx + bw - 34, rowY + 19, 8, "#a78bfa", "center", 900);
-        } else if (!done) {
-          text("LOCAL", bx + bw - 34, rowY + 19, 8, "#5f7391", "center", 700);
+          if (onlineTie && !decided) {
+            text("ONLINE", cx, y + cardH + 8, 7, "#a78bfa", "center", 900);
+          }
         }
       }
     }
   }
 
-  const msg = alive.length <= 1 ? "press kick to crown the champion" : "press kick to play the next tie";
-  text(msg, W / 2, H - 30, 13, "#9fb4d0", "center", 700);
+  // ---- trophy at the end of the tree ----------------------------------
+  {
+    const cx = x0 + colW * (totalRounds - 1) + colW / 2;
+    const ty = tieY(totalRounds - 1, 0) + cardH / 2 + 22;
+    const champ = game.champion;
+    text(champ ? "🏆" : "🏆", cx, ty, champ ? 20 : 15,
+         champ ? "#fde047" : "rgba(253,224,71,0.28)", "center", 900);
+    if (champ) text(champ.name, cx, ty + 18, 10, "#fde047", "center", 900);
+  }
+
+  const msg = alive.length <= 1 ? "press kick to crown the champion"
+                                : "press kick to play the next tie";
+  text(msg, W / 2, H - 22, 11, "#9fb4d0", "center", 700);
 }
 
 function drawChampion() {
@@ -6178,6 +7918,51 @@ function drawScoreboard() {
     roundRect(wx, wy, ww * (1 - frac), 17, 5); ctx.fill();
     text(`CHAOS #${game.chaosCount} · ${Math.ceil(game.chaosT)}s`,
          W / 2, wy + 9, 9, "#ffffff", "center", 900);
+  }
+
+  /*
+    Wall charges, one pip per charge, under each player's score. A recharging
+    pip fills as it comes back so the wait is visible.
+  */
+  for (let i = 0; i < 2; i++) {
+    const pl = game.players[i];
+    if (!pl || game.cpu[i]) continue;
+    const pipR = 5, pipGap = 14;
+    const baseX = i === 0 ? bx + 14 : bx + bw - 14 - (pl.wallMax - 1) * pipGap;
+    const py = by + bh + 40;
+    for (let k = 0; k < pl.wallMax; k++) {
+      const px2 = baseX + k * pipGap;
+      const filled = k < pl.wallCharges;
+      ctx.strokeStyle = "rgba(148,163,184,0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(px2, py, pipR, 0, Math.PI * 2);
+      ctx.stroke();
+      if (filled) {
+        ctx.fillStyle = pl.team.accent;
+        ctx.beginPath();
+        ctx.arc(px2, py, pipR - 1, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (k === pl.wallCharges) {
+        // The one currently refilling.
+        const frac = 1 - clamp(pl.wallRecharge / WALL_RECHARGE, 0, 1);
+        ctx.fillStyle = "rgba(148,163,184,0.55)";
+        ctx.beginPath();
+        ctx.moveTo(px2, py);
+        ctx.arc(px2, py, pipR - 1, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    text("WALLS", i === 0 ? bx + 14 : bx + bw - 14, py + 15, 7,
+         "#6b819e", i === 0 ? "left" : "right", 800);
+  }
+
+  // Roguelike: which stage this is, and the ladder.
+  if (inRun()) {
+    const st = RUN_STAGES[game.run.stage];
+    text(`RUN — ${st.name}   ·   STAGE ${game.run.stage + 1}/${RUN_STAGES.length}`,
+         W / 2, by + bh + 12, 10, "#c4b5fd", "center", 900);
   }
 
   // Online status: latency-free indicator of who is authoritative.
@@ -6467,6 +8252,11 @@ function draw() {
   if (game.scene === SCENE.PAUSE)    { drawPause();    ctx.restore(); return; }
   if (game.scene === SCENE.SETTINGS) { drawSettings(); ctx.restore(); return; }
   if (game.scene === SCENE.BOARD)    { drawBoard();    ctx.restore(); return; }
+  if (game.scene === SCENE.CONTROLS) { drawControls(); ctx.restore(); return; }
+  if (game.scene === SCENE.CREDITS)  { drawCredits();  ctx.restore(); return; }
+  if (game.scene === SCENE.UPGRADE)  { drawUpgrade();  ctx.restore(); return; }
+  if (game.scene === SCENE.RUNOVER)  { drawRunEnd(false); ctx.restore(); return; }
+  if (game.scene === SCENE.RUNWIN)   { drawRunEnd(true);  ctx.restore(); return; }
   if (game.scene === SCENE.RULES)    { drawRules();    ctx.restore(); return; }
   if (game.scene === SCENE.SELECT)   { drawSelect();   ctx.restore(); return; }
   if (game.scene === SCENE.BRACKET)  { drawBracket();  ctx.restore(); return; }
@@ -6481,6 +8271,7 @@ function draw() {
 
   drawPitch();
   drawPlatforms();
+  drawWalls();
   if (hasNet()) drawNet();
   if (game.mode === MODE.BASKET) drawHoops();
   drawMines();
@@ -6527,8 +8318,22 @@ const PHYS = {
   drawMenu, drawMenuBackdrop, drawLogo, stepMenuFx, menuFx, layoutProbe, MENU_GROUP,
   updateMenu, MENU_ROWS,
   loadBoard, saveBoard, boardRecord, rankBoard, recordResult, lbPlayed, lbWinPct,
-  MAPS, mapById, activePlatforms, resolvePlatform, ballVsPlatforms, playerVsPlatforms,
+  MAPS, mapById, activePlatforms, MODE_PLATFORMS, resolvePlatform, ballVsPlatforms, playerVsPlatforms,
   FACES, HATS, faceById, hatById, faceMood, lookOf, drawFace, drawHat, drawProbe,
+  WALL_W, WALL_H, WALL_LIFE, WALL_HP, WALL_CHARGES, WALL_RECHARGE, WALL_BREAK_V,
+  WALL_MIN_GOAL_GAP, canBuildWall, buildWall, updateWalls, ballVsWalls,
+  playerVsWalls, kickVsWalls, drawWalls, WALL_KICK_LIFE, WALL_HIT_CD, WALL_BALL_MIN_V,
+  buildsPlatform, PLATFORM_W, PLATFORM_H, music, musicInit, musicPlay, musicStop,
+  musicPump, musicTrackForScene, MUSIC_TRACKS, MUSIC_BPM, midiToHz,
+  shuffled, makeDraw, aliveInDrawOrder, drawBracket,
+  RUN_STAGES, UPGRADES, upgradeById, freshMods, startRun, beginRunStage,
+  SCHEME, SCHEME_DEFAULTS, ACTIONS, keyLabel, RESERVED_KEYS, loadScheme,
+  saveScheme, resetScheme, rebuildWatched, WATCHED, pollPads, pads,
+  padsAvailable, setPadSource, getPadSource: () => padSource,
+  sponsors, cleanSponsor, readySponsors, drawSponsorStrip,
+  SPONSOR_DIR, SPONSOR_TIERS, drawControls, drawCredits, creditProbe, updateControls,
+  updateCredits,
+  rollOffer, takeUpgrade, endRun, inRun, updateUpgrade, drawUpgrade, drawRunEnd,
   loadLooks, saveLooks, LOOK_DEFAULTS,
   drawPlatforms, RULE_DEFS, RULE_DEFAULTS, clampRule, loadRules, saveRules, ruleDef,
   puInterval, mineInterval, puLifetime, puCap, mineCap, chaosInterval,
@@ -8344,16 +10149,20 @@ function runTests() {
          basketScored({ x: W / 2, y: 300, vx: 0, vy: 400, r, mass: 1 }, 290) === 0);
     }
 
-    // The rim is solid: a ball fired at it must be deflected, not pass through.
+    /*
+      The rim is solid to a ball arriving from the SIDE. It deliberately does not
+      block a ball already dropping through the ring — that behaviour was what
+      made honest shots rattle out, and it has its own coverage below.
+    */
     {
       const r = MODE_CFG[MODE.BASKET].ballR;
-      const b = { x: hl.x - HOOP_R, y: hl.y - 30, vx: 0, vy: 600, r, mass: 1 };
+      const b = { x: hl.x - HOOP_R - 40, y: hl.y, vx: 800, vy: 0, r, mass: 1 };
       let deflected = false;
       for (let i = 0; i < 60; i++) {
         integrate(b, DT, 0, 0);
         if (ballVsHoops(b)) { deflected = true; break; }
       }
-      ok("the rim deflects the ball", deflected);
+      ok("the rim deflects a ball arriving from the side", deflected);
     }
 
     // The ball must stay in the court through a long chaotic run.
@@ -9708,12 +11517,22 @@ function runTests() {
       game.mapId = "towers";
       game.mode = MODE.SINGLE;
       ok("platforms are active in soccer", activePlatforms().length > 0);
+      /*
+        Net and hoop modes now get their OWN purpose-built platforms rather than
+        none: the arena maps are authored for a soccer pitch and would wall off a
+        rally, but a bespoke symmetric layout adds height without blocking play.
+      */
       game.mode = MODE.VOLLEY;
-      ok("platforms are suppressed in volleyball", activePlatforms().length === 0);
+      ok("volleyball has its own platforms", activePlatforms().length > 0,
+         `${activePlatforms().length}`);
+      ok("volleyball ignores the arena choice",
+         activePlatforms() === MODE_PLATFORMS.volley);
       game.mode = MODE.TENNIS;
-      ok("platforms are suppressed in tennis", activePlatforms().length === 0);
+      ok("tennis has its own platforms", activePlatforms().length > 0,
+         `${activePlatforms().length}`);
       game.mode = MODE.BASKET;
-      ok("platforms are active in basketball", activePlatforms().length > 0);
+      ok("basketball has its own platforms", activePlatforms().length > 0,
+         `${activePlatforms().length}`);
       game.mode = MODE.SINGLE;
     }
 
@@ -10588,6 +12407,1919 @@ function runTests() {
     game.particles = [];
   }
 
+  // 19af7. Temporary walls.
+  {
+    const saved = { players: game.players, ball: game.ball, walls: game.walls,
+                    mode: game.mode, cpu: [...game.cpu], run: game.run, scene: game.scene };
+    game.run = null;
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, false];
+    game.sel = [0, 3];
+    startMatch();
+    game.walls = [];
+
+    const pl = game.players[0];
+
+    // ---- placement and charges ----
+    pl.reset();
+    pl.x = W / 2;
+    pl.facing = 1;
+    ok("a fresh player has wall charges", pl.wallCharges === WALL_CHARGES, `${pl.wallCharges}`);
+    ok("a fresh player can build", canBuildWall(pl));
+
+    const w1 = buildWall(pl);
+    ok("building produces a wall", !!w1 && game.walls.length === 1);
+    ok("the wall is in front of the player", w1 && w1.x > pl.x, `${w1 && w1.x} vs ${pl.x}`);
+    ok("building spends a charge", pl.wallCharges === WALL_CHARGES - 1, `${pl.wallCharges}`);
+    ok("there is a cooldown", !canBuildWall(pl));
+
+    // Facing left builds to the left.
+    pl.wallCD = 0;
+    pl.facing = -1;
+    const w2 = buildWall(pl);
+    ok("facing left builds to the left", w2 && w2.x < pl.x, `${w2 && w2.x}`);
+
+    // Out of charges.
+    pl.wallCD = 0;
+    ok("a player out of charges cannot build",
+       pl.wallCharges === 0 && buildWall(pl) === null, `${pl.wallCharges}`);
+
+    // A stunned player cannot build.
+    pl.wallCharges = 2;
+    pl.wallCD = 0;
+    pl.stun = 0.5;
+    ok("a stunned player cannot build", buildWall(pl) === null);
+    pl.stun = 0;
+
+    /*
+      Safety: a wall must never sit in a goal mouth, or it could make scoring
+      impossible. Test from every position along the pitch.
+    */
+    {
+      let bad = null;
+      for (let x = WALL; x < W - WALL; x += 7) {
+        for (const face of [-1, 1]) {
+          game.walls = [];
+          pl.reset();
+          pl.x = clamp(x, WALL + pl.r, W - WALL - pl.r);
+          pl.facing = face;
+          pl.wallCharges = 5;
+          pl.wallCD = 0;
+          const w = buildWall(pl);
+          if (!w) continue;
+          if (w.x < WALL + WALL_MIN_GOAL_GAP - 0.01) {
+            bad = `x=${x} face=${face}: wall at ${w.x.toFixed(0)} too close to the left goal`;
+            break;
+          }
+          if (w.x + w.w > W - WALL - WALL_MIN_GOAL_GAP + 0.01) {
+            bad = `x=${x} face=${face}: wall at ${w.x.toFixed(0)} too close to the right goal`;
+            break;
+          }
+          if (w.x < WALL || w.x + w.w > W - WALL) {
+            bad = `x=${x}: wall outside the pitch at ${w.x.toFixed(0)}`;
+            break;
+          }
+        }
+        if (bad) break;
+      }
+      ok("a wall can never block a goal mouth", !bad, bad || "");
+    }
+
+    // ---- the ball collides with a wall ----
+    {
+      game.walls = [];
+      pl.reset();
+      pl.x = W / 2;
+      pl.facing = 1;
+      pl.wallCharges = 3;
+      pl.wallCD = 0;
+      const w = buildWall(pl);
+      w.born = 1;                                   // fully risen
+      const sb = game.ball;
+      game.ball = { x: w.x - BALL_R - 6, y: GROUND_Y - 40, vx: 600, vy: 0,
+                    r: BALL_R, mass: BALL_MASS, bounces: 0 };
+      let bounced = false;
+      for (let i = 0; i < 40; i++) {
+        integrate(game.ball, DT, 0, 0);
+        ballVsWalls(game.ball);
+        if (game.ball.vx < 0) { bounced = true; break; }
+      }
+      ok("the ball rebounds off a wall", bounced, `vx=${game.ball.vx.toFixed(0)}`);
+
+      // A wall still rising must not block yet.
+      game.walls = [];
+      pl.wallCD = 0;
+      const w3 = buildWall(pl);
+      w3.born = 0.2;
+      game.ball = { x: w3.x, y: GROUND_Y - 40, vx: 500, vy: 0, r: BALL_R, mass: BALL_MASS };
+      const vx0 = game.ball.vx;
+      ballVsWalls(game.ball);
+      ok("a wall that is still rising does not block", game.ball.vx === vx0);
+      game.ball = sb;
+    }
+
+    // ---- a hard shot damages and destroys a wall ----
+    {
+      game.walls = [];
+      /*
+        The wall belongs to P2 and the ball is attributed to P1: a player cannot
+        damage their own wall, so the attacker must be the opponent.
+
+        Two other notes carried over from earlier fixes: march the ball IN rather
+        than placing it by hand (a hand-placed ball 16px from a 14px radius never
+        touched), and assert DESTRUCTION rather than hp reaching zero, since a
+        hard shot now costs both life and a hit point.
+      */
+      const owner2 = game.players[1];
+      owner2.reset(); owner2.x = W / 2; owner2.facing = 1;
+      owner2.wallCharges = 3; owner2.wallCD = 0;
+      const w = buildWall(owner2);
+      w.born = 1;
+      game.ballLastTouch = 0;
+      const sb = game.ball;
+      let hits = 0;
+      while (game.walls.includes(w) && hits < 10) {
+        game.ball = { x: w.x - BALL_R - 30, y: w.y + w.h / 2,
+                      vx: WALL_BREAK_V + 400, vy: 0, r: BALL_R, mass: BALL_MASS };
+        w.hitCD = 0;
+        for (let i = 0; i < 30; i++) {
+          integrate(game.ball, DT, 0, 0);
+          const before = w.life;
+          ballVsWalls(game.ball);
+          if (w.life < before) break;           // that hit landed
+        }
+        hits++;
+      }
+      ok("hard shots knock a wall down", !game.walls.includes(w), `${hits} hits`);
+      ok("it takes more than one hard shot", hits >= 2, `${hits}`);
+
+      // A soft touch must NOT damage it.
+      game.walls = [];
+      pl.wallCD = 0;
+      const w4 = buildWall(pl);
+      w4.born = 1;
+      game.ball = { x: w4.x - BALL_R - 25, y: w4.y + w4.h / 2, vx: 200, vy: 0,
+                    r: BALL_R, mass: BALL_MASS };
+      for (let i = 0; i < 40; i++) { integrate(game.ball, DT, 0, 0); ballVsWalls(game.ball); }
+      ok("a soft touch leaves a wall intact", w4.hp === WALL_HP, `hp=${w4.hp}`);
+      game.ball = sb;
+    }
+
+    // ---- walls expire, and charges come back ----
+    {
+      game.walls = [];
+      pl.reset(); pl.x = W / 2; pl.wallCharges = 2; pl.wallCD = 0;
+      buildWall(pl);
+      ok("a wall stands at first", game.walls.length === 1);
+      for (let i = 0; i < Math.ceil((WALL_LIFE + 1) / DT); i++) updateWalls(DT);
+      ok("walls expire on their own", game.walls.length === 0);
+
+      pl.wallCharges = 0;
+      pl.wallRecharge = WALL_RECHARGE;
+      for (let i = 0; i < Math.ceil((WALL_RECHARGE + 0.5) / DT); i++) updateWalls(DT);
+      ok("a spent charge comes back", pl.wallCharges >= 1, `${pl.wallCharges}`);
+
+      // Charges must not exceed the maximum.
+      for (let i = 0; i < Math.ceil((WALL_RECHARGE * 6) / DT); i++) updateWalls(DT);
+      ok("charges cap at the maximum", pl.wallCharges === pl.wallMax,
+         `${pl.wallCharges}/${pl.wallMax}`);
+    }
+
+    // ---- a player can stand on a wall ----
+    {
+      game.walls = [];
+      pl.reset(); pl.x = W / 2; pl.facing = 1; pl.wallCharges = 2; pl.wallCD = 0;
+      const w = buildWall(pl);
+      w.born = 1;
+      const p2 = new Player(0, TEAMS[0]);
+      p2.reset();
+      p2.x = w.x + w.w / 2;
+      p2.y = w.y - p2.r - 30;
+      p2.vy = 0;
+      for (let i = 0; i < 200; i++) { p2.update(DT, null); playerVsWalls(p2); }
+      ok("a player can stand on a wall",
+         p2.onGround && Math.abs(p2.y + p2.r - w.y) < 2,
+         `feet=${(p2.y + p2.r).toFixed(1)} top=${w.y}`);
+    }
+
+    // ---- a long soak with walls flying up must stay sane ----
+    {
+      game.walls = [];
+      let bad = null;
+      const sb = game.ball;
+      game.ball = { x: W / 2, y: 150, vx: 900, vy: -400, r: BALL_R, mass: BALL_MASS, bounces: 0 };
+      for (let i = 0; i < 6000; i++) {
+        if (i % 120 === 0) { pl.wallCD = 0; pl.wallCharges = 2; pl.x = rand(WALL + 40, W - WALL - 40);
+                             pl.facing = Math.random() < 0.5 ? -1 : 1; buildWall(pl); }
+        stepBall(DT);
+        ballVsWalls(game.ball);
+        updateWalls(DT);
+        const b = game.ball;
+        if (!Number.isFinite(b.x)) { bad = "ball NaN"; break; }
+        if (b.x < -GOAL_D - 40 || b.x > W + GOAL_D + 40 || b.y < -40 || b.y > H + 40) {
+          bad = `ball escaped to ${b.x.toFixed(0)},${b.y.toFixed(0)}`; break;
+        }
+        if (game.walls.length > 20) { bad = `${game.walls.length} walls accumulated`; break; }
+      }
+      game.ball = sb;
+      ok("a wall soak stays sane", !bad, bad || "");
+    }
+
+    // ---- rendering ----
+    {
+      game.walls = [];
+      pl.reset(); pl.wallCharges = 2; pl.wallCD = 0;
+      const w = buildWall(pl);
+      let drew = true, err = "";
+      for (const born of [0.1, 0.6, 1]) {
+        for (const hp of [WALL_HP, 2, 1]) {
+          for (const life of [WALL_LIFE, 1, 0.2]) {
+            w.born = born; w.hp = hp; w.life = life;
+            drawProbe.walls = 0;
+            try { drawWalls(); } catch (e) { drew = false; err = e.message; }
+          }
+        }
+      }
+      ok("walls render at every stage of life and damage", drew, err);
+      ok("the wall renderer reports what it painted", drawProbe.walls === 1,
+         `${drawProbe.walls}`);
+
+      // And they reach the live canvas, not just the pause backdrop.
+      game.scene = SCENE.PLAY;
+      drawProbe.walls = 0;
+      draw();
+      ok("walls are painted during live play", drawProbe.walls === game.walls.length,
+         `${drawProbe.walls} of ${game.walls.length}`);
+    }
+
+    game.walls = [];
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af8. Roguelike run.
+  {
+    const saved = { run: game.run, mode: game.mode, cpu: [...game.cpu],
+                    scene: game.scene, players: game.players, score: [...game.score],
+                    goalsToWin: game.goalsToWin, mapId: game.mapId, chaos: game.chaos };
+
+    ok("the ladder has several stages", RUN_STAGES.length >= 6, `${RUN_STAGES.length}`);
+    ok("every stage is fully specified",
+       RUN_STAGES.every((s) => s.name && s.label && s.goals >= 1 &&
+                               s.cpu >= 0 && s.cpu < CPU_LEVELS.length && s.mode));
+    ok("stage difficulty never decreases",
+       RUN_STAGES.every((s, i) => i === 0 || s.cpu >= RUN_STAGES[i - 1].cpu),
+       RUN_STAGES.map((s) => s.cpu).join(","));
+    ok("the ladder ends on the hardest CPU",
+       RUN_STAGES[RUN_STAGES.length - 1].cpu === CPU_LEVELS.length - 1);
+    ok("more than one mode appears in a run",
+       new Set(RUN_STAGES.map((s) => s.mode)).size >= 3,
+       [...new Set(RUN_STAGES.map((s) => s.mode))].join(","));
+
+    ok("there are plenty of upgrades", UPGRADES.length >= 8, `${UPGRADES.length}`);
+    ok("upgrade ids are unique", new Set(UPGRADES.map((u) => u.id)).size === UPGRADES.length);
+    ok("every upgrade is described and applies",
+       UPGRADES.every((u) => u.name && u.desc && typeof u.apply === "function"));
+
+    // Every upgrade must actually change the modifier bag.
+    {
+      let bad = null;
+      for (const u of UPGRADES) {
+        const before = freshMods();
+        const after = freshMods();
+        u.apply(after);
+        if (JSON.stringify(before) === JSON.stringify(after)) {
+          bad = `${u.id} changed nothing`; break;
+        }
+      }
+      ok("every upgrade has an effect", !bad, bad || "");
+    }
+
+    // ---- starting a run ----
+    startRun();
+    ok("a run starts active at stage 0",
+       inRun() && game.run.stage === 0, `${game.run && game.run.stage}`);
+    ok("a run starts against the CPU", game.cpu[0] === false && game.cpu[1] === true);
+    ok("a run starts with neutral modifiers",
+       JSON.stringify(game.run.mods) === JSON.stringify(freshMods()));
+    ok("a run opens on team select", game.scene === SCENE.SELECT, game.scene);
+    ok("the first stage uses its configured target",
+       game.goalsToWin === RUN_STAGES[0].goals, `${game.goalsToWin}`);
+
+    // ---- upgrades change the player ----
+    {
+      startRun();
+      game.sel = [0, 3];
+      startMatch();
+      const base = game.players[0].maxv;
+      game.run.mods.speed *= 1.5;
+      game.players[0].applyChaos();
+      ok("a speed upgrade raises top speed", game.players[0].maxv > base * 1.4,
+         `${base.toFixed(0)} -> ${game.players[0].maxv.toFixed(0)}`);
+
+      const baseShot = game.players[0].shotP;
+      game.run.mods.shot *= 1.5;
+      game.players[0].applyChaos();
+      ok("a power upgrade raises shot power", game.players[0].shotP > baseShot * 1.4,
+         `${baseShot.toFixed(0)} -> ${game.players[0].shotP.toFixed(0)}`);
+
+      // Upgrades must NOT leak onto the CPU seat.
+      const cpuBefore = game.players[1].maxv;
+      game.run.mods.speed *= 2;
+      game.players[1].applyChaos();
+      ok("upgrades do not buff the CPU", game.players[1].maxv === cpuBefore,
+         `${cpuBefore.toFixed(0)} -> ${game.players[1].maxv.toFixed(0)}`);
+
+      // Extra wall charges reach the player.
+      game.run.mods.wallCharges += 2;
+      game.players[0].applyChaos();
+      ok("a wall upgrade raises the charge cap",
+         game.players[0].wallMax === WALL_CHARGES + 2, `${game.players[0].wallMax}`);
+    }
+
+    // ---- winning advances, losing ends ----
+    {
+      startRun();
+      game.sel = [0, 3];
+      startMatch();
+      game.score = [RUN_STAGES[0].goals, 0];
+      finishMatch(0, false);
+      ok("winning a stage offers upgrades",
+         game.scene === SCENE.UPGRADE && game.run.offer.length === 3,
+         `${game.scene} / ${game.run.offer.length}`);
+      ok("the offer holds distinct upgrades",
+         new Set(game.run.offer.map((u) => u.id)).size === game.run.offer.length);
+
+      const stage0 = game.run.stage;
+      takeUpgrade(game.run.offer[0]);
+      ok("taking an upgrade advances the stage", game.run.stage === stage0 + 1);
+      ok("the taken upgrade is recorded", game.run.taken.length === 1);
+      /*
+        The fix for the reported bug: only the FIRST stage shows team select.
+        Later stages go straight into the countdown, keeping the team the player
+        chose — returning to select let them switch teams mid-run, which changed
+        their stats and looked like the upgrades had been lost.
+      */
+      ok("the next stage skips team select", game.scene === SCENE.COUNTDOWN, game.scene);
+      ok("the run keeps the team it started with",
+         game.players[0].team === TEAMS[game.run.teamIdx],
+         `${game.players[0].team.name} vs sel ${game.run.teamIdx}`);
+
+      // Losing ends the run.
+      startMatch();
+      game.score = [0, RUN_STAGES[game.run.stage].goals];
+      finishMatch(1, false);
+      ok("losing a stage ends the run",
+         game.scene === SCENE.RUNOVER && !inRun(), game.scene);
+    }
+
+    // ---- a draw also ends the run ----
+    {
+      startRun();
+      game.sel = [0, 3];
+      startMatch();
+      game.score = [1, 1];
+      finishMatch(-1, true);
+      ok("a drawn stage ends the run", game.scene === SCENE.RUNOVER && !inRun());
+    }
+
+    // ---- a full run can be completed ----
+    {
+      startRun();
+      let guard = 0, stages = 0;
+      // Play each stage, then take the offered upgrade, until the run resolves.
+      while (guard++ < 60) {
+        if (game.scene === SCENE.RUNWIN || game.scene === SCENE.RUNOVER) break;
+        if (game.scene === SCENE.UPGRADE) { takeUpgrade(game.run.offer[0]); continue; }
+        game.sel = [0, 3];
+        startMatch();
+        game.score = [game.goalsToWin, 0];
+        finishMatch(0, false);
+        stages++;
+      }
+      ok("a full run can be cleared", game.scene === SCENE.RUNWIN, game.scene);
+      ok("clearing the run plays every stage", stages === RUN_STAGES.length,
+         `${stages} of ${RUN_STAGES.length}`);
+      ok("the run collected an upgrade per stage",
+         game.run.taken.length === RUN_STAGES.length, `${game.run.taken.length}`);
+    }
+
+    // ---- the offer never runs dry ----
+    {
+      startRun();
+      let bad = null;
+      for (let i = 0; i < UPGRADES.length + 6; i++) {
+        rollOffer();
+        if (game.run.offer.length < 1) { bad = `empty offer at pick ${i}`; break; }
+        game.run.taken.push(game.run.offer[0].id);
+      }
+      ok("the offer never runs dry", !bad, bad || "");
+    }
+
+    // ---- screens render ----
+    {
+      startRun();
+      rollOffer();
+      let drew = true, err = "";
+      for (let r = 0; r < game.run.offer.length; r++) {
+        game.run.offerRow = r;
+        try { drawUpgrade(); } catch (e) { drew = false; err = `upgrade: ${e.message}`; }
+      }
+      // With a long list of taken upgrades, too.
+      game.run.taken = UPGRADES.map((u) => u.id);
+      try { drawUpgrade(); } catch (e) { drew = false; err = `upgrade+taken: ${e.message}`; }
+      for (const won of [false, true]) {
+        try { drawRunEnd(won); } catch (e) { drew = false; err = `runend: ${e.message}`; }
+      }
+      // And at the very last stage, where there is no "next".
+      game.run.stage = RUN_STAGES.length - 1;
+      try { drawUpgrade(); } catch (e) { drew = false; err = `final: ${e.message}`; }
+      ok("every run screen renders", drew, err);
+    }
+
+    game.run = null;
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af9. The reported roguelike bug: upgrades must carry, and a won stage
+  //        must go straight into the next match.
+  {
+    const saved = { run: game.run, mode: game.mode, cpu: [...game.cpu],
+                    scene: game.scene, players: game.players, sel: [...game.sel],
+                    score: [...game.score], goalsToWin: game.goalsToWin };
+
+    startRun();
+    ok("a run opens on team select once", game.scene === SCENE.SELECT, game.scene);
+    game.sel = [2, 5];                       // a deliberate, distinctive team
+    startMatch();
+    ok("the run remembers the chosen team", game.run.teamIdx === 2, `${game.run.teamIdx}`);
+
+    // Measure the stat that a speed upgrade should raise, across three stages.
+    const speedUp = UPGRADES.find((u) => u.id === "speed");
+    const seen = [];
+    for (let stage = 0; stage < 3; stage++) {
+      seen.push({
+        team: game.players[0].team,
+        maxv: game.players[0].maxv,
+        scene: game.scene,
+      });
+      game.score = [game.goalsToWin, 0];
+      finishMatch(0, false);
+      ok(`stage ${stage + 1} offers an upgrade`, game.scene === SCENE.UPGRADE, game.scene);
+      game.run.offer = [speedUp];
+      game.run.offerRow = 0;
+      takeUpgrade(speedUp);
+      ok(`stage ${stage + 2} skips team select`, game.scene === SCENE.COUNTDOWN, game.scene);
+    }
+
+    ok("the team is held for the whole run",
+       seen.every((s) => s.team === TEAMS[2]),
+       seen.map((s) => s.team.name).join(","));
+    ok("speed compounds across stages",
+       seen[1].maxv > seen[0].maxv * 1.15 && seen[2].maxv > seen[1].maxv * 1.15,
+       seen.map((s) => s.maxv.toFixed(0)).join(" -> "));
+    ok("the modifier bag accumulated", game.run.mods.speed > 1.5,
+       `${game.run.mods.speed.toFixed(2)}`);
+
+    // Every upgrade type must survive into the NEXT match's fresh Player object.
+    {
+      startRun();
+      game.sel = [0, 3];
+      startMatch();
+      const before = {
+        maxv: game.players[0].maxv, shot: game.players[0].shotP,
+        jump: game.players[0].jumpV, r: game.players[0].r,
+        wallMax: game.players[0].wallMax,
+      };
+      for (const id of ["speed", "power", "jump", "size", "walls"]) {
+        const u = UPGRADES.find((x) => x.id === id);
+        u.apply(game.run.mods);
+      }
+      // Win, take a throwaway upgrade, and land in the next match.
+      game.score = [game.goalsToWin, 0];
+      finishMatch(0, false);
+      takeUpgrade(UPGRADES.find((u) => u.id === "recharge"));
+
+      const after = game.players[0];
+      ok("speed carried into the next match", after.maxv > before.maxv,
+         `${before.maxv.toFixed(0)} -> ${after.maxv.toFixed(0)}`);
+      ok("shot power carried into the next match", after.shotP > before.shot,
+         `${before.shot.toFixed(0)} -> ${after.shotP.toFixed(0)}`);
+      ok("jump carried into the next match", after.jumpV > before.jump,
+         `${before.jump.toFixed(0)} -> ${after.jumpV.toFixed(0)}`);
+      ok("size carried into the next match", after.r > before.r,
+         `${before.r.toFixed(1)} -> ${after.r.toFixed(1)}`);
+      ok("wall charges carried into the next match", after.wallMax > before.wallMax,
+         `${before.wallMax} -> ${after.wallMax}`);
+    }
+
+    game.run = null;
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af10. Run PERKS must actually reach the player.
+  //         Regression: perks were granted in startMatch BEFORE kickoff, and
+  //         kickoff calls player.reset() (zeroing ammo and effects) and empties
+  //         game.helpers — so GUNSLINGER and the free helpers were handed out
+  //         and instantly wiped. Every earlier test passed because they checked
+  //         the modifier bag, never the player.
+  {
+    const saved = { run: game.run, mode: game.mode, cpu: [...game.cpu],
+                    scene: game.scene, players: game.players, sel: [...game.sel],
+                    score: [...game.score], helpers: game.helpers };
+
+    const gun = UPGRADES.find((u) => u.id === "ammo");
+    const keep = UPGRADES.find((u) => u.id === "keeper");
+    const strike = UPGRADES.find((u) => u.id === "striker");
+
+    // ---- GUNSLINGER ----
+    startRun();
+    game.sel = [0, 3];
+    startMatch();
+    ok("a run starts unarmed without the upgrade", game.players[0].ammo === 0,
+       `${game.players[0].ammo}`);
+
+    gun.apply(game.run.mods);
+    startMatch();                      // the next stage
+    ok("GUNSLINGER arms the player at the start of a stage",
+       game.players[0].ammo === PISTOL_AMMO, `${game.players[0].ammo}`);
+    ok("GUNSLINGER shows the pistol chip", !!game.players[0].effects.pistol);
+
+    // It must survive a goal, which triggers a kickoff and resets the players.
+    game.scene = SCENE.PLAY;
+    game.score = [1, 0];
+    kickoff(-1, true);
+    ok("the pistol survives a goal reset",
+       game.players[0].ammo === PISTOL_AMMO, `${game.players[0].ammo}`);
+    ok("the pistol chip survives a goal reset", !!game.players[0].effects.pistol);
+
+    // And across a stage transition, which is what the report was about.
+    game.score = [game.goalsToWin, 0];
+    finishMatch(0, false);
+    takeUpgrade(UPGRADES.find((u) => u.id === "recharge"));
+    ok("the pistol carries into the NEXT stage",
+       game.players[0].ammo === PISTOL_AMMO, `${game.players[0].ammo}`);
+
+    // ---- free helpers ----
+    startRun();
+    game.sel = [0, 3];
+    startMatch();
+    ok("no free helpers without the upgrades", game.helpers.length === 0,
+       `${game.helpers.length}`);
+
+    keep.apply(game.run.mods);
+    startMatch();
+    ok("LOYAL KEEPER spawns a keeper",
+       game.helpers.some((h) => h.kind === "keeper" && h.owner === 0),
+       game.helpers.map((h) => h.kind).join(","));
+
+    strike.apply(game.run.mods);
+    startMatch();
+    ok("STRIKE PARTNER spawns a striker too",
+       game.helpers.some((h) => h.kind === "striker" && h.owner === 0) &&
+       game.helpers.some((h) => h.kind === "keeper"),
+       game.helpers.map((h) => h.kind).join(","));
+
+    // Helpers must come back after a goal, since kickoff clears the list.
+    game.scene = SCENE.PLAY;
+    kickoff(1, true);
+    ok("free helpers return after a goal reset",
+       game.helpers.filter((h) => h.owner === 0).length === 2,
+       `${game.helpers.length} helpers`);
+
+    // They belong to the player, never the CPU.
+    ok("free helpers are never given to the CPU",
+       game.helpers.every((h) => h.owner === 0),
+       game.helpers.map((h) => h.owner).join(","));
+
+    // ---- perks must not leak outside a run ----
+    {
+      game.run = null;
+      game.cpu = [false, false];
+      game.mode = MODE.SINGLE;
+      game.sel = [0, 3];
+      startMatch();
+      ok("a normal match grants no run perks",
+         game.players[0].ammo === 0 && game.helpers.length === 0,
+         `ammo=${game.players[0].ammo} helpers=${game.helpers.length}`);
+    }
+
+    // ---- every stage of a full run keeps the perks ----
+    {
+      startRun();
+      game.sel = [0, 3];
+      startMatch();
+      gun.apply(game.run.mods);
+      keep.apply(game.run.mods);
+
+      let bad = null, guard = 0;
+      while (guard++ < 40) {
+        if (game.scene === SCENE.RUNWIN || game.scene === SCENE.RUNOVER) break;
+        if (game.scene === SCENE.UPGRADE) {
+          takeUpgrade(UPGRADES.find((u) => u.id === "recharge"));
+          // Straight after the transition the new stage must be armed.
+          if (game.players[0].ammo !== PISTOL_AMMO) {
+            bad = `stage ${game.run.stage}: ammo=${game.players[0].ammo}`; break;
+          }
+          if (!game.helpers.some((h) => h.kind === "keeper")) {
+            bad = `stage ${game.run.stage}: keeper missing`; break;
+          }
+          continue;
+        }
+        game.score = [game.goalsToWin, 0];
+        finishMatch(0, false);
+      }
+      ok("perks hold for every stage of a run", !bad, bad || "");
+    }
+
+    game.run = null;
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af11. A size change must never bury the player.
+  //         Found via a flaky "players sink through the ground" report: growing
+  //         with BIGGER while grounded left the feet 12.2px under the floor for
+  //         a frame, because the radius changed without moving the body.
+  {
+    const saved = { players: game.players, mode: game.mode, cpu: [...game.cpu],
+                    run: game.run };
+    game.run = null;
+    game.mode = MODE.SINGLE;
+
+    let worst = 0, at = null;
+    for (const t of TEAMS) {
+      for (const seat of [0, 1]) {
+        // Every order of grant and cancel, from the ground and from mid-air.
+        for (const seq of [["bigger"], ["smaller"], ["bigger", "smaller"],
+                           ["smaller", "bigger"], ["bigger", "bigger"]]) {
+          const p = new Player(seat, t);
+          p.reset();
+          for (const fx of seq) {
+            p.grant(fx);
+            const over = (p.y + p.r) - GROUND_Y;
+            if (over > worst) { worst = over; at = `${t.name} ${seq.join("+")}`; }
+            const above = p.r - p.y;
+            if (above > worst) { worst = above; at = `${t.name} ${seq.join("+")} (ceiling)`; }
+          }
+        }
+      }
+    }
+    ok("a size change never pushes a player through the floor", worst <= 0.001,
+       `worst ${worst.toFixed(3)}px — ${at || "none"}`);
+
+    // The same must hold under chaos, which also scales players.
+    {
+      const savedMul = playerSizeMul;
+      let bad = null;
+      for (const mul of [0.7, 1, 1.35]) {
+        playerSizeMul = mul;
+        const p = new Player(0, TEAMS[2]);
+        p.reset();
+        p.grant("bigger");
+        const over = (p.y + p.r) - GROUND_Y;
+        if (over > 0.001) { bad = `mul ${mul}: ${over.toFixed(2)}px`; break; }
+      }
+      playerSizeMul = savedMul;
+      ok("chaos size scaling also keeps players above the floor", !bad, bad || "");
+    }
+
+    // And growing while grounded must leave them standing, not falling.
+    {
+      const p = new Player(0, TEAMS[0]);
+      p.reset();
+      p.grant("bigger");
+      ok("a player who grows stays grounded", p.onGround && p.vy <= 0,
+         `onGround=${p.onGround} vy=${p.vy}`);
+    }
+
+    Object.assign(game, saved);
+  }
+
+  // 19af12. Mode feel: kickable walls, per-mode platforms, and the tuning for
+  //         tennis contact and basketball scoring.
+  {
+    const saved = { players: game.players, ball: game.ball, walls: game.walls,
+                    mode: game.mode, cpu: [...game.cpu], run: game.run,
+                    scene: game.scene, mapId: game.mapId };
+    game.run = null;
+
+    // ---- kicking a wall shortens its life ----
+    {
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, false];
+      game.sel = [0, 3];
+      startMatch();
+      game.walls = [];
+
+      /*
+        The wall belongs to P2 and P1 attacks it: a player can no longer damage
+        their OWN wall, so a same-seat test would (correctly) measure nothing.
+      */
+      const owner = game.players[1];
+      const pl = game.players[0];
+      owner.reset();
+      owner.x = W / 2;
+      owner.facing = 1;
+      owner.wallCharges = 3;
+      owner.wallCD = 0;
+      const w = buildWall(owner);
+      w.born = 1;
+      const life0 = w.life;
+
+      // P1 stands beside it and swings.
+      pl.reset();
+      pl.x = w.x - pl.r - 8;
+      pl.facing = 1;
+      pl.kickT = KICK_TIME * 0.5;
+      pl.wallKicked = false;
+      const hit = kickVsWalls(pl);
+      ok("a kick connects with a wall", !!hit);
+      ok("a kick takes time off the wall", w.life < life0 - 1,
+         `${life0.toFixed(2)}s -> ${w.life.toFixed(2)}s`);
+      ok("a kick flashes the wall", w.kickFlash > 0);
+
+      // One wall per swing, so holding the leg there is not a free demolition.
+      const afterOne = w.life;
+      kickVsWalls(pl);
+      ok("one swing damages a wall only once", w.life === afterOne,
+         `${afterOne.toFixed(2)} -> ${w.life.toFixed(2)}`);
+
+      // A fresh swing damages it again, and enough kicks destroy it.
+      let kicks = 1;
+      while (game.walls.includes(w) && kicks < 20) {
+        pl.wallKicked = false;
+        pl.kickT = KICK_TIME * 0.5;
+        kickVsWalls(pl);
+        kicks++;
+      }
+      ok("a player cannot kick down their own wall", (() => {
+        game.walls = [];
+        owner.wallCharges = 2; owner.wallCD = 0; owner.x = W / 2;
+        const own = buildWall(owner);
+        own.born = 1;
+        owner.x = own.x - owner.r - 8;
+        owner.kickT = KICK_TIME * 0.5;
+        owner.wallKicked = false;
+        const before = own.life;
+        kickVsWalls(owner);
+        return own.life === before;
+      })());
+      ok("enough kicks demolish a wall", !game.walls.includes(w), `${kicks} kicks`);
+      ok("demolition takes a few kicks, not one", kicks >= 3, `${kicks}`);
+
+      // A kick that is nowhere near must not damage it.
+      game.walls = [];
+      owner.wallCharges = 2; owner.wallCD = 0; owner.x = W / 2; owner.facing = 1;
+      const w2 = buildWall(owner);
+      w2.born = 1;
+      pl.x = 120;                          // far away
+      pl.kickT = KICK_TIME * 0.5;
+      pl.wallKicked = false;
+      const l2 = w2.life;
+      kickVsWalls(pl);
+      ok("a kick out of range leaves a wall alone", w2.life === l2,
+         `${l2.toFixed(2)} -> ${w2.life.toFixed(2)}`);
+
+      // A wall still rising is not kickable.
+      w2.born = 0.2;
+      pl.x = w2.x - pl.r - 8;
+      pl.wallKicked = false;
+      const l3 = w2.life;
+      kickVsWalls(pl);
+      ok("a rising wall cannot be kicked", w2.life === l3);
+    }
+
+    // ---- a ball striking a wall shortens its life, like a kick ----
+    {
+      game.mode = MODE.SINGLE;
+      game.sel = [0, 3];
+      startMatch();
+
+      /*
+        Walls belong to P2, and the ball is attributed to P1 — a player can no
+        longer break their own wall, so the toucher has to be the opponent for
+        any damage to register.
+      */
+      const freshWall = () => {
+        game.walls = [];
+        const p = game.players[1];
+        p.reset();
+        p.x = W / 2;
+        p.facing = 1;
+        p.wallCharges = 3;
+        p.wallCD = 0;
+        const w = buildWall(p);
+        w.born = 1;
+        game.ballLastTouch = 0;         // P1 kicked it
+        return w;
+      };
+
+      /** Fire the ball into a wall and report the life it cost. */
+      const strike = (speed) => {
+        const w = freshWall();
+        game.ball = { x: w.x - BALL_R - 30, y: w.y + w.h / 2, vx: speed, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        const before = w.life;
+        for (let i = 0; i < 60; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+        }
+        return { cost: before - w.life, alive: game.walls.includes(w) };
+      };
+
+      const firm = strike(700);
+      ok("a ball impact takes time off a wall", firm.cost > 0.2,
+         `${firm.cost.toFixed(2)}s`);
+
+      // Harder hits must cost more.
+      const soft = strike(320), hard = strike(1400);
+      ok("harder ball impacts cost more life", hard.cost > soft.cost * 1.5,
+         `${soft.cost.toFixed(2)}s vs ${hard.cost.toFixed(2)}s`);
+
+      // Below the floor, a ball just bounces.
+      const trickle = strike(120);
+      ok("a slow ball does not damage a wall", trickle.cost === 0,
+         `${trickle.cost.toFixed(2)}s`);
+
+      /*
+        The guard that matters most: ballVsWalls runs every substep, so a ball
+        RESTING against a wall would otherwise land 120 hits a second and
+        vaporise it. Only natural decay may apply.
+      */
+      {
+        const w = freshWall();
+        game.ball = { x: w.x - BALL_R, y: w.y + w.h - BALL_R, vx: 0, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        const before = w.life;
+        const secs = 3;
+        for (let i = 0; i < secs / DT; i++) {
+          ballVsWalls(game.ball);
+          updateWalls(DT);
+        }
+        const expected = before - secs;          // decay only
+        ok("a ball resting on a wall does not drain it",
+           Math.abs(w.life - expected) < 0.15,
+           `life ${w.life.toFixed(2)} vs decay-only ${expected.toFixed(2)}`);
+      }
+
+      // A per-wall cooldown stops one pass registering many hits.
+      {
+        const w = freshWall();
+        // March it in rather than positioning by hand: placing the ball a few
+        // pixels "away" repeatedly turned out to be outside its own radius.
+        game.ball = { x: w.x - BALL_R - 20, y: w.y + w.h / 2, vx: 900, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        for (let i = 0; i < 40; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+          if (w.life < WALL_LIFE) break;
+        }
+        const afterFirst = w.life;
+        ok("the first impact registers", afterFirst < WALL_LIFE, `${afterFirst.toFixed(2)}`);
+        // Immediately again: the cooldown must block it.
+        ballVsWalls(game.ball);
+        ok("a second impact inside the cooldown is ignored", w.life === afterFirst,
+           `${afterFirst.toFixed(2)} -> ${w.life.toFixed(2)}`);
+        // After the cooldown it can hit again.
+        for (let i = 0; i < (WALL_HIT_CD + 0.05) / DT; i++) updateWalls(DT);
+        game.ball.vx = 900;
+        ballVsWalls(game.ball);
+        ok("an impact after the cooldown registers again", w.life < afterFirst - 0.2,
+           `${w.life.toFixed(2)}`);
+      }
+
+      // A wall that is still rising is immune, as with kicks.
+      {
+        const w = freshWall();
+        w.born = 0.2;
+        const before = w.life;
+        game.ball = { x: w.x - BALL_R - 20, y: w.y + w.h / 2, vx: 900, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        for (let i = 0; i < 40; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+        }
+        ok("a rising wall takes no ball damage", w.life === before);
+      }
+
+      // Enough ball impacts destroy it, and it is removed cleanly.
+      {
+        const w = freshWall();
+        let n = 0;
+        while (game.walls.includes(w) && n < 12) {
+          game.ball = { x: w.x - BALL_R - 30, y: w.y + w.h / 2, vx: 1300, vy: 0,
+                        r: BALL_R, mass: BALL_MASS };
+          w.hitCD = 0;
+          for (let i = 0; i < 40; i++) {
+            integrate(game.ball, DT, 0, 0);
+            const before = w.life;
+            ballVsWalls(game.ball);
+            if (w.life < before) break;
+          }
+          n++;
+        }
+        ok("repeated ball impacts demolish a wall", !game.walls.includes(w), `${n} hits`);
+        ok("demolition by ball takes several hits", n >= 2, `${n}`);
+      }
+
+      game.walls = [];
+    }
+
+    // ---- your own wall is immune to you ----
+    {
+      game.mode = MODE.SINGLE;
+      game.sel = [0, 3];
+      startMatch();
+
+      /** Build a wall owned by `seat`, fully risen. */
+      const wallFor = (seat) => {
+        game.walls = [];
+        const p = game.players[seat];
+        p.reset();
+        p.x = W / 2;
+        p.facing = 1;
+        p.wallCharges = 3;
+        p.wallCD = 0;
+        const w = buildWall(p);
+        w.born = 1;
+        return w;
+      };
+
+      /** Fire the ball into `w`, attributed to `toucher`. Returns life lost. */
+      const ballInto = (w, toucher) => {
+        game.ballLastTouch = toucher;
+        w.hitCD = 0;
+        game.ball = { x: w.x - BALL_R - 30, y: w.y + w.h / 2, vx: 1200, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        const before = w.life;
+        for (let i = 0; i < 60; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+        }
+        return before - w.life;
+      };
+
+      // The heart of it: own ball into own wall costs nothing.
+      {
+        const mine = wallFor(0);
+        ok("your own ball does not damage your own wall", ballInto(mine, 0) === 0,
+           `${ballInto(mine, 0).toFixed(2)}s`);
+      }
+      {
+        const theirs = wallFor(1);
+        ok("your ball does damage their wall", ballInto(theirs, 0) > 0.2,
+           `${ballInto(theirs, 0).toFixed(2)}s`);
+      }
+      // And symmetrically, from the other seat.
+      {
+        const theirs = wallFor(1);
+        ok("their own ball does not damage their own wall",
+           ballInto(theirs, 1) === 0);
+      }
+      {
+        const mine = wallFor(0);
+        ok("their ball does damage your wall", ballInto(mine, 1) > 0.2,
+           `${ballInto(mine, 1).toFixed(2)}s`);
+      }
+
+      // An unattributed ball (mine blast, stray rebound) harms nobody's wall.
+      {
+        const mine = wallFor(0);
+        ok("an untouched ball damages no wall", ballInto(mine, -1) === 0);
+      }
+
+      // Same rule for kicks, both directions.
+      {
+        const kickInto = (w, seat) => {
+          const p = game.players[seat];
+          p.reset();
+          p.x = w.x - p.r - 8;
+          p.facing = 1;
+          p.kickT = KICK_TIME * 0.5;
+          p.wallKicked = false;
+          const before = w.life;
+          kickVsWalls(p);
+          return before - w.life;
+        };
+        const mine = wallFor(0);
+        ok("you cannot kick down your own wall", kickInto(mine, 0) === 0,
+           `${kickInto(mine, 0).toFixed(2)}s`);
+        const theirs = wallFor(1);
+        ok("you can kick down their wall", kickInto(theirs, 0) > 0.5,
+           `${kickInto(theirs, 0).toFixed(2)}s`);
+      }
+
+      // Your own wall must still be SOLID to your ball — immune, not intangible.
+      {
+        const mine = wallFor(0);
+        game.ballLastTouch = 0;
+        game.ball = { x: mine.x - BALL_R - 30, y: mine.y + mine.h / 2,
+                      vx: 900, vy: 0, r: BALL_R, mass: BALL_MASS };
+        let bounced = false;
+        for (let i = 0; i < 60; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+          if (game.ball.vx < 0) { bounced = true; break; }
+        }
+        ok("your own wall still blocks your ball", bounced,
+           `vx=${game.ball.vx.toFixed(0)}`);
+        ok("and it survived the bounce", game.walls.includes(mine));
+      }
+
+      // Touching the ball must set the attribution, so this is not stale state.
+      {
+        const p0 = game.players[0];
+        p0.reset();
+        game.ballLastTouch = -1;
+        game.ball = { x: p0.x + p0.r + BALL_R - 3, y: p0.y, vx: -200, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        ballVsPlayer(p0);
+        ok("touching the ball records the toucher", game.ballLastTouch === 0,
+           `${game.ballLastTouch}`);
+      }
+
+      game.walls = [];
+      game.ballLastTouch = -1;
+    }
+
+    // ---- the build ability becomes a PLATFORM in the net and hoop modes ----
+    {
+      const buildIn = (mode, seat, atX, facing) => {
+        game.mode = mode;
+        game.cpu = [false, false];
+        game.sel = [0, 3];
+        startMatch();
+        game.walls = [];
+        const p = game.players[seat];
+        p.reset();
+        p.x = atX;
+        p.facing = facing;
+        p.wallCharges = 3;
+        p.wallCD = 0;
+        return buildWall(p);
+      };
+
+      // Soccer keeps the tall wall.
+      {
+        const w = buildIn(MODE.SINGLE, 0, W * 0.3, 1);
+        ok("soccer still builds a tall wall", !w.platform && w.h > w.w,
+           `${w.w}x${w.h}`);
+        ok("the soccer wall reaches the ground",
+           Math.abs(w.y + w.h - GROUND_Y) < 1, `${(w.y + w.h).toFixed(0)}`);
+      }
+
+      // The three sport modes build a wide, raised platform instead.
+      for (const md of [MODE.VOLLEY, MODE.TENNIS, MODE.BASKET]) {
+        const w = buildIn(md, 0, W * 0.3, 1);
+        ok(`${md} builds a platform, not a wall`, w.platform === true);
+        ok(`${md}'s build is wider than it is tall`, w.w > w.h * 3,
+           `${w.w}x${w.h}`);
+        ok(`${md}'s platform is off the ground`, w.y + w.h < GROUND_Y - 40,
+           `bottom ${(w.y + w.h).toFixed(0)} vs ground ${GROUND_Y}`);
+        ok(`${md}'s platform is inside the pitch`,
+           w.x >= WALL && w.x + w.w <= W - WALL, `${w.x.toFixed(0)}`);
+      }
+
+      /*
+        A platform built right at the net must land on the builder's own side —
+        otherwise the ability would let you plant a step in your opponent's court.
+      */
+      for (const md of [MODE.VOLLEY, MODE.TENNIS]) {
+        for (const seat of [0, 1]) {
+          const atNet = seat === 0 ? W * 0.46 : W * 0.54;
+          const w = buildIn(md, seat, atNet, seat === 0 ? 1 : -1);
+          const ownSide = seat === 0 ? (w.x + w.w < W / 2) : (w.x > W / 2);
+          ok(`${md}: seat ${seat} builds on its own side of the net`, ownSide,
+             `x=${w.x.toFixed(0)}..${(w.x + w.w).toFixed(0)}`);
+        }
+      }
+
+      // Basketball platforms must not sit in a hoop's drop path.
+      {
+        let bad = null;
+        for (let x = WALL + 20; x < W - WALL - 20; x += 23) {
+          for (const facing of [-1, 1]) {
+            const w = buildIn(MODE.BASKET, 0, x, facing);
+            for (const side of [0, 1]) {
+              const h = hoopPos(side);
+              const under = w.x < h.x + HOOP_R && w.x + w.w > h.x - HOOP_R;
+              if (under && w.y > h.y && w.y < h.y + 90) {
+                bad = `x=${x}: platform under hoop ${side}`;
+                break;
+              }
+            }
+            if (bad) break;
+          }
+          if (bad) break;
+        }
+        ok("a built platform never blocks a hoop", !bad, bad || "");
+      }
+
+      // It must be standable, and still take damage from the opponent.
+      {
+        const w = buildIn(MODE.BASKET, 1, W * 0.6, -1);
+        w.born = 1;
+        const p = game.players[0];
+        p.reset();
+        p.x = w.x + w.w / 2;
+        p.y = w.y - p.r - 40;
+        p.vy = 0;
+        for (let i = 0; i < 240; i++) {
+          p.update(DT, null);
+          playerVsWalls(p);
+          if (p.onGround && Math.abs(p.y + p.r - w.y) < 2) break;
+        }
+        ok("a player can stand on a built platform",
+           p.onGround && Math.abs(p.y + p.r - w.y) < 2,
+           `feet ${(p.y + p.r).toFixed(1)} vs top ${w.y}`);
+
+        game.ballLastTouch = 0;
+        w.hitCD = 0;
+        game.ball = { x: w.x - BALL_R - 30, y: w.y + w.h / 2, vx: 1200, vy: 0,
+                      r: BALL_R, mass: BALL_MASS };
+        const before = w.life;
+        for (let i = 0; i < 60; i++) {
+          integrate(game.ball, DT, 0, 0);
+          ballVsWalls(game.ball);
+        }
+        ok("a built platform still takes opponent damage", w.life < before,
+           `${before.toFixed(2)} -> ${w.life.toFixed(2)}`);
+      }
+
+      game.walls = [];
+      game.mode = MODE.SINGLE;
+    }
+
+    // ---- every mode has platforms, and they do not block play ----
+    {
+      let bad = null;
+      for (const md of [MODE.VOLLEY, MODE.TENNIS, MODE.BASKET]) {
+        game.mode = md;
+        const pls = activePlatforms();
+        if (!pls.length) { bad = `${md} has no platforms`; break; }
+
+        for (const pl of pls) {
+          // Inside the pitch.
+          if (pl.x < WALL || pl.x + pl.w > W - WALL) {
+            bad = `${md}: platform crosses a wall`; break;
+          }
+          if (pl.y < 40 || pl.y + pl.h > GROUND_Y - 20) {
+            bad = `${md}: platform out of bounds at y=${pl.y}`; break;
+          }
+          // Net modes: nothing may sit in the net column.
+          if (MODE_CFG[md].net > 0) {
+            const netL = W / 2 - NET_W / 2 - 30, netR = W / 2 + NET_W / 2 + 30;
+            if (pl.x < netR && pl.x + pl.w > netL) {
+              bad = `${md}: platform blocks the net column`; break;
+            }
+          }
+          // Basketball: nothing directly under a hoop's drop path.
+          if (md === MODE.BASKET) {
+            for (const side of [0, 1]) {
+              const h = hoopPos(side);
+              const under = pl.x < h.x + HOOP_R && pl.x + pl.w > h.x - HOOP_R;
+              if (under && pl.y < h.y + 120 && pl.y > h.y) {
+                bad = `${md}: platform under a hoop`; break;
+              }
+            }
+          }
+          if (bad) break;
+        }
+        if (bad) break;
+
+        // Symmetric, so neither side is favoured.
+        const mid = W / 2;
+        const leftN = pls.filter((p) => p.x + p.w / 2 < mid).length;
+        const rightN = pls.filter((p) => p.x + p.w / 2 > mid).length;
+        if (leftN !== rightN) {
+          bad = `${md}: asymmetric platforms (${leftN} vs ${rightN})`; break;
+        }
+      }
+      ok("net and hoop modes have safe, symmetric platforms", !bad, bad || "");
+
+      // The soccer modes still use the arena the player picked.
+      game.mode = MODE.SINGLE;
+      game.mapId = "towers";
+      ok("soccer still uses the chosen arena",
+         activePlatforms() === mapById("towers").platforms);
+      game.mapId = "classic";
+      ok("the classic arena is still empty in soccer", activePlatforms().length === 0);
+    }
+
+    // ---- tennis is hittable ----
+    {
+      const tc = MODE_CFG[MODE.TENNIS], sc = MODE_CFG[MODE.SINGLE];
+      ok("the tennis ball is lighter than the soccer ball", tc.ballMass < sc.ballMass,
+         `${tc.ballMass} vs ${sc.ballMass}`);
+      ok("tennis gets a kick bonus", (tc.kickMul || 1) > 1, `${tc.kickMul}`);
+      ok("tennis gets a wider contact window", (tc.reachMul || 1) > 1, `${tc.reachMul}`);
+
+      // The measured contact window must now beat soccer's, not trail it.
+      const win = (m) => {
+        const c = MODE_CFG[m];
+        return (LEG_R + c.ballR) * (c.reachMul || 1);
+      };
+      ok("tennis is easier to connect with than soccer", win(MODE.TENNIS) > win(MODE.SINGLE),
+         `${win(MODE.TENNIS).toFixed(0)}px vs ${win(MODE.SINGLE).toFixed(0)}px`);
+
+      // And a kick sends it further.
+      const launch = (m) => {
+        game.mode = m;
+        const c = MODE_CFG[m];
+        const q = new Player(0, TEAMS[0]);
+        q.reset(); q.facing = 1;
+        q.kickT = KICK_TIME * 0.5; q.kickConsumed = false;
+        const tp = q.legTip;
+        game.ball = { x: tp.x + 4, y: tp.y, vx: 0, vy: 0, r: c.ballR, mass: c.ballMass };
+        ballVsPlayer(q);
+        return len(game.ball.vx, game.ball.vy);
+      };
+      const tl = launch(MODE.TENNIS), sl = launch(MODE.SINGLE);
+      ok("a tennis kick is stronger than a soccer kick", tl > sl * 1.2,
+         `${tl.toFixed(0)} vs ${sl.toFixed(0)} px/s`);
+    }
+
+    // ---- basketball is scoreable ----
+    {
+      game.mode = MODE.BASKET;
+      const c = MODE_CFG[MODE.BASKET];
+      ok("the basketball is bouncier still", c.rest >= 1.15, `${c.rest}`);
+      ok("the basketball is lighter", c.ballMass < 1, `${c.ballMass}`);
+
+      /*
+        Measure an AIMED shot, not a random one: a blind-velocity test mostly
+        produces shots that were never on target, which hides whether the hoop
+        itself is fair. Grid-search a scoring launch, then add aim error.
+      */
+      const h = hoopPos(1);
+      const shoot = (vx, vy) => {
+        game.ball = { x: 600, y: GROUND_Y - 40, vx, vy,
+                      r: c.ballR, mass: c.ballMass, bounces: 0 };
+        for (let i = 0; i < 900; i++) {
+          const py = game.ball.y;
+          stepBall(DT);
+          ballVsHoops(game.ball);
+          if (basketScored(game.ball, py) !== 0) return true;
+          if (game.ball.x < 0 || game.ball.x > W) return false;
+        }
+        return false;
+      };
+
+      let solved = null;
+      for (let vx = 200; vx <= 800 && !solved; vx += 20) {
+        for (let vy = -1200; vy <= -400; vy += 20) {
+          if (shoot(vx, vy)) { solved = { vx, vy }; break; }
+        }
+      }
+      ok("a scoring shot exists at all", !!solved,
+         solved ? `vx=${solved.vx} vy=${solved.vy}` : "none found");
+
+      if (solved) {
+        ok("a perfectly aimed shot always scores", shoot(solved.vx, solved.vy));
+        // With a human-sized aim error it should still go in reasonably often.
+        let n = 0;
+        for (let i = 0; i < 300; i++) {
+          const vx = solved.vx * (1 + (Math.random() * 2 - 1) * 0.03);
+          const vy = solved.vy * (1 + (Math.random() * 2 - 1) * 0.03);
+          if (shoot(vx, vy)) n++;
+        }
+        const pct = (n / 300) * 100;
+        ok("a near-aimed shot scores often enough to feel fair", pct >= 12,
+           `${pct.toFixed(1)}% with 3% aim error`);
+      }
+
+      // A ball dropping cleanly through must not be rejected by the rim.
+      {
+        const through = { x: h.x, y: h.y - 4, vx: 0, vy: 400,
+                          r: c.ballR, mass: c.ballMass };
+        ballVsHoops(through);
+        ok("the rim does not deflect a ball dropping through the ring",
+           through.vy > 0, `vy=${through.vy.toFixed(0)}`);
+      }
+
+      // But the rim must still stop a ball coming in from the side.
+      {
+        const side = { x: h.x - HOOP_R - 40, y: h.y, vx: 800, vy: 0,
+                       r: c.ballR, mass: c.ballMass };
+        let deflected = false;
+        for (let i = 0; i < 60; i++) {
+          integrate(side, DT, 0, 0);
+          if (ballVsHoops(side)) { deflected = true; break; }
+        }
+        ok("the rim still blocks a sideways ball", deflected);
+      }
+
+      // And a clear miss still misses.
+      ok("a shot well wide still misses",
+         basketScored({ x: h.x + HOOP_R + 40, y: h.y + 2, vx: 0, vy: 300,
+                        r: c.ballR, mass: c.ballMass }, h.y - 2) === 0);
+      ok("a rising ball still does not score",
+         basketScored({ x: h.x, y: h.y - 2, vx: 0, vy: -300,
+                        r: c.ballR, mass: c.ballMass }, h.y + 2) === 0);
+    }
+
+    game.walls = [];
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19af13. Music: it must never break the game, and must pick a sane track.
+  {
+    const saved = { scene: game.scene, music: game.opt.music };
+
+    ok("there are at least two tracks", Object.keys(MUSIC_TRACKS).length >= 2);
+    ok("every track is fully specified",
+       Object.values(MUSIC_TRACKS).every((t) =>
+         Array.isArray(t.chords) && t.chords.length &&
+         Array.isArray(t.bass) && t.bass.length === t.chords.length &&
+         Array.isArray(t.arp) && t.arp.length && t.gain > 0));
+    ok("the tempo is musical", MUSIC_BPM >= 60 && MUSIC_BPM <= 200, `${MUSIC_BPM}`);
+
+    // Chord and bass notes must be in a playable range.
+    {
+      let bad = null;
+      for (const [name, t] of Object.entries(MUSIC_TRACKS)) {
+        for (const ch of t.chords) {
+          for (const n of ch) {
+            if (n < 24 || n > 96) { bad = `${name}: note ${n} out of range`; break; }
+          }
+        }
+        for (const n of t.bass) {
+          if (n < 20 || n > 60) { bad = `${name}: bass ${n} out of range`; break; }
+        }
+        if (bad) break;
+      }
+      ok("all notes sit in a sensible register", !bad, bad || "");
+      ok("midi 69 is concert A", Math.abs(midiToHz(69) - 440) < 0.01,
+         `${midiToHz(69).toFixed(2)}Hz`);
+      ok("an octave doubles the frequency",
+         Math.abs(midiToHz(81) - 880) < 0.01, `${midiToHz(81).toFixed(2)}Hz`);
+    }
+
+    // Track choice follows the scene.
+    {
+      const pairs = [
+        [SCENE.MENU, "menu"], [SCENE.CREDITS, "menu"], [SCENE.SETTINGS, "menu"],
+        [SCENE.PLAY, "play"], [SCENE.COUNTDOWN, "play"], [SCENE.CELEBRATE, "play"],
+      ];
+      let bad = null;
+      for (const [sc, want] of pairs) {
+        game.scene = sc;
+        if (musicTrackForScene() !== want) {
+          bad = `${sc} chose ${musicTrackForScene()}, wanted ${want}`;
+          break;
+        }
+      }
+      ok("each scene picks a suitable track", !bad, bad || "");
+      ok("every chosen track exists",
+         pairs.every(([, w]) => !!MUSIC_TRACKS[w]));
+    }
+
+    /*
+      The critical property: audio is unavailable in some environments and
+      blocked in others until the user interacts. Every entry point must be safe
+      to call regardless — the game must never fail because sound cannot play.
+    */
+    {
+      let threw = null;
+      try {
+        game.opt.music = true;
+        musicInit();
+        musicPlay("menu");
+        musicPump();
+        musicPlay("play");
+        for (let i = 0; i < 100; i++) musicPump();
+        musicStop();
+        musicPump();
+        musicPlay("nonexistent-track");
+        musicPump();
+        musicStop();
+        musicStop();                    // twice in a row
+      } catch (e) { threw = e.message; }
+      ok("the whole music path is safe to call without audio", !threw, threw || "");
+
+      // With music off it must not start.
+      game.opt.music = false;
+      musicPlay("menu");
+      ok("music does not start when the option is off", !music.started);
+      game.opt.music = true;
+    }
+
+    Object.assign(game, saved);
+    game.opt.music = saved.music;
+  }
+
+  // 19af14. Tournament entrants can be CPUs.
+  {
+    const saved = { mode: game.mode, entrantCount: game.entrantCount,
+                    entrants: game.entrants, rosterCpu: [...(game.rosterCpu || [])],
+                    rosterNames: [...(game.rosterNames || [])], cpu: [...game.cpu],
+                    scene: game.scene, seats: [...game.seats], run: game.run };
+    const savedNet = { ...net };
+    net.active = false;
+    game.run = null;
+    game.mode = MODE.TOURNAMENT;
+
+    const setup = (n, cpuFlags) => {
+      game.entrantCount = n;
+      game.rosterNames = Array.from({ length: n }, (_, i) => `P${i + 1}`);
+      game.rosterCpu = cpuFlags;
+      game.goalsToWin = 3;
+      game.timeIdx = 0;
+      startTournament();
+    };
+
+    // Marked seats become CPU-owned entrants.
+    setup(4, [false, false, true, true]);
+    ok("a marked entrant is owned by the CPU",
+       game.entrants[2].owner === "cpu" && game.entrants[3].owner === "cpu",
+       game.entrants.map((e) => e.owner).join(","));
+    ok("unmarked entrants stay human",
+       game.entrants[0].owner === "host" && game.entrants[1].owner === "host");
+    ok("a CPU entrant is named as one", /CPU/.test(game.entrants[2].name),
+       game.entrants[2].name);
+
+    // Seat 0 can never be a CPU — somebody has to be playing.
+    setup(4, [true, true, true, true]);
+    ok("seat 1 is always human", game.entrants[0].owner !== "cpu",
+       game.entrants[0].owner);
+    ok("the others can all be CPUs",
+       game.entrants.slice(1).every((e) => e.owner === "cpu"),
+       game.entrants.map((e) => e.owner).join(","));
+
+    /*
+      The real fix: applyTieControl used to bail out unless a network match was
+      running, so an offline bracket never handed a tie to the computer — an
+      entrant marked CPU was still played by hand.
+    */
+    {
+      setup(4, [false, false, true, true]);
+      game.seats = [2, 3];
+      game.cpu = [false, false];
+      applyTieControl();
+      ok("a CPU-vs-CPU tie puts both seats under CPU control",
+         game.cpu[0] && game.cpu[1], `[${game.cpu}]`);
+
+      game.seats = [0, 2];
+      applyTieControl();
+      ok("a human-vs-CPU tie only automates the CPU seat",
+         !game.cpu[0] && game.cpu[1], `[${game.cpu}]`);
+
+      game.seats = [0, 1];
+      applyTieControl();
+      ok("a human-vs-human tie automates neither seat",
+         !game.cpu[0] && !game.cpu[1], `[${game.cpu}]`);
+    }
+
+    // A bracket full of CPUs must still resolve to one champion.
+    {
+      for (const n of [2, 4, 8]) {
+        const flags = Array.from({ length: n }, (_, i) => i > 0);
+        setup(n, flags);
+        let ties = 0, cpuTies = 0, guard = 0, bad = null;
+        while (game.scene !== SCENE.CHAMPION && guard++ < 200) {
+          if (game.scene === SCENE.BRACKET) {
+            if (aliveEntrants().length <= 1) beginRound(); else nextTie();
+            continue;
+          }
+          if (game.scene === SCENE.SELECT) {
+            if (game.cpu[0] && game.cpu[1]) cpuTies++;
+            startMatch();
+            const w = game.seats[0] < game.seats[1] ? 0 : 1;
+            game.score = w === 0 ? [3, 0] : [0, 3];
+            finishMatch(w, false);
+            ties++;
+            game.scene = SCENE.BRACKET;
+            continue;
+          }
+          bad = `stuck in ${game.scene}`;
+          break;
+        }
+        ok(`a ${n}-player bracket of CPUs resolves`,
+           !bad && game.scene === SCENE.CHAMPION, bad || game.scene);
+        ok(`it plays all ${tiesRemaining(n)} ties`, ties === tiesRemaining(n), `${ties}`);
+        if (n === 8) {
+          ok("an 8-player CPU bracket includes CPU-vs-CPU ties", cpuTies >= 2,
+             `${cpuTies}`);
+        }
+      }
+    }
+
+    // Online, the guest's seat must never be turned into a CPU.
+    {
+      net.active = true;
+      net.role = "host";
+      setup(4, [true, true, true, true]);
+      ok("an online guest seat is not made a CPU",
+         game.entrants[1].owner === "guest", game.entrants[1].owner);
+      ok("the local seat is still human", game.entrants[0].owner === "host");
+      net.active = false;
+    }
+
+    // The roster screen renders with any mix.
+    {
+      let drew = true, err = "";
+      for (const n of [2, 4, 8]) {
+        game.entrantCount = n;
+        game.rosterNames = Array.from({ length: n }, (_, i) => `P${i + 1}`);
+        for (const flags of [Array(n).fill(false), Array(n).fill(true),
+                             Array.from({ length: n }, (_, i) => i % 2 === 0)]) {
+          game.rosterCpu = flags;
+          for (const cur of [0, 1, n]) {
+            game.rosterCursor = cur;
+            game.rosterEdit = -1;
+            try { drawRoster(); } catch (e) { drew = false; err = e.message; }
+          }
+        }
+      }
+      ok("the roster renders with any human/CPU mix", drew, err);
+    }
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+    game.rosterCpu = saved.rosterCpu;
+    game.particles = [];
+  }
+
+  // 19af15. The bracket draw is randomised, and the tree renders at every size.
+  {
+    /*
+      `cpu` and `seats` must be restored too: this block seats CPU entrants, and
+      leaving that state behind made the select-screen tests further down see
+      auto-locking CPU players instead of humans.
+    */
+    const saved = { mode: game.mode, entrantCount: game.entrantCount,
+                    entrants: game.entrants, rosterCpu: [...(game.rosterCpu || [])],
+                    rosterNames: [...(game.rosterNames || [])], scene: game.scene,
+                    run: game.run, drawOrder: [...(game.drawOrder || [])],
+                    bracket: game.bracket, cpu: [...game.cpu],
+                    seats: [...game.seats], locked: [...game.locked],
+                    sel: [...game.sel] };
+    const savedNet = { ...net };
+    net.active = false;
+    game.run = null;
+    game.mode = MODE.TOURNAMENT;
+
+    const setup = (n) => {
+      game.entrantCount = n;
+      game.rosterNames = Array.from({ length: n }, (_, i) => `PLAYER ${i + 1}`);
+      game.rosterCpu = Array.from({ length: n }, (_, i) => i > 0);
+      game.goalsToWin = 3;
+      game.timeIdx = 0;
+      startTournament();
+    };
+
+    // ---- the shuffle itself ----
+    {
+      ok("a shuffle keeps every element",
+         shuffled([0, 1, 2, 3, 4]).sort((a, b) => a - b).join(",") === "0,1,2,3,4");
+      ok("a shuffle keeps the length", shuffled([1, 2, 3]).length === 3);
+      ok("shuffling an empty list is safe", shuffled([]).length === 0);
+      ok("a draw preserves every entrant",
+         makeDraw([0, 1, 2, 3]).sort((a, b) => a - b).join(",") === "0,1,2,3");
+
+      // All six permutations of three items must be reachable.
+      const perms = new Set();
+      for (let i = 0; i < 400; i++) perms.add(shuffled([0, 1, 2]).join(""));
+      ok("the shuffle reaches every permutation", perms.size === 6, `${perms.size}`);
+    }
+
+    // ---- the draw actually varies, and is fair ----
+    {
+      const firstPairings = new Set();
+      for (let t = 0; t < 40; t++) {
+        setup(8);
+        firstPairings.add(game.roundPairs.map((p) => p.join("v")).join("|"));
+      }
+      ok("the opening draw varies between tournaments", firstPairings.size > 20,
+         `${firstPairings.size} distinct draws in 40`);
+
+      // Seed 1 must be able to meet ANY other entrant, not just seed 2.
+      const opponents = new Set();
+      for (let t = 0; t < 400; t++) {
+        setup(8);
+        const pair = game.roundPairs.find((p) => p.includes(0));
+        opponents.add(pair[0] === 0 ? pair[1] : pair[0]);
+      }
+      ok("seed 1 can draw any opponent", opponents.size >= 6,
+         `${opponents.size} of 7 possible`);
+
+      // Every entrant must appear exactly once in the opening round.
+      let bad = null;
+      for (let t = 0; t < 60; t++) {
+        setup(8);
+        const seen = game.roundPairs.flat().filter((x) => x !== null).sort((a, b) => a - b);
+        if (seen.join(",") !== "0,1,2,3,4,5,6,7") { bad = seen.join(","); break; }
+      }
+      ok("every entrant is drawn exactly once", !bad, bad || "");
+
+      // Odd counts still produce exactly one bye.
+      for (const n of [3, 5, 7]) {
+        setup(n);
+        const byes = game.roundPairs.filter((p) => p[1] === null).length;
+        ok(`a ${n}-player draw has exactly one bye`, byes === 1, `${byes}`);
+      }
+    }
+
+    // ---- the recorded bracket history ----
+    {
+      setup(4);
+      ok("the bracket records the opening round",
+         Array.isArray(game.bracket[0]) && game.bracket[0].length === 2,
+         `${game.bracket[0] && game.bracket[0].length}`);
+      ok("a fresh tie has no winner yet", game.bracket[0][0].winner === null);
+
+      // Play a tie and check the result is stamped in.
+      nextTie();
+      startMatch();
+      const winSeat = 0;
+      const winId = game.seats[winSeat];
+      game.score = [3, 0];
+      finishMatch(winSeat, false);
+      ok("a decided tie records its winner", game.bracket[0][0].winner === winId,
+         `${game.bracket[0][0].winner} vs ${winId}`);
+      ok("a decided tie records its score",
+         Array.isArray(game.bracket[0][0].score), JSON.stringify(game.bracket[0][0].score));
+
+      // A bye is recorded as already won.
+      setup(3);
+      const byeTie = game.bracket[0].find((t) => t.b === null);
+      ok("a bye is recorded as already decided", byeTie && byeTie.winner === byeTie.a);
+    }
+
+    // ---- the tree renders at every size, all the way through ----
+    {
+      let bad = null;
+      for (const n of [2, 3, 4, 5, 6, 7, 8]) {
+        setup(n);
+        let guard = 0;
+        while (game.scene !== SCENE.CHAMPION && guard++ < 200) {
+          if (game.scene === SCENE.BRACKET) {
+            try { drawBracket(); } catch (e) { bad = `${n} players: ${e.message}`; break; }
+            if (aliveEntrants().length <= 1) beginRound(); else nextTie();
+            continue;
+          }
+          if (game.scene === SCENE.SELECT) {
+            startMatch();
+            const w = game.seats[0] < game.seats[1] ? 0 : 1;
+            game.score = w === 0 ? [3, 0] : [0, 3];
+            finishMatch(w, false);
+            game.scene = SCENE.BRACKET;
+            continue;
+          }
+          break;
+        }
+        if (bad) break;
+        if (game.scene !== SCENE.CHAMPION) { bad = `${n} players never resolved`; break; }
+      }
+      ok("the bracket tree renders through a whole tournament at every size",
+         !bad, bad || "");
+    }
+
+    // Online mode must render too, with its ONLINE markers.
+    {
+      net.active = true;
+      net.role = "host";
+      setup(4);
+      let drew = true, err = "";
+      try { drawBracket(); } catch (e) { drew = false; err = e.message; }
+      ok("the bracket renders in an online tournament", drew, err);
+      net.active = false;
+    }
+
+    // And with a champion crowned, for the trophy.
+    {
+      setup(2);
+      nextTie();
+      startMatch();
+      game.score = [3, 0];
+      finishMatch(0, false);
+      beginRound();
+      let drew = true, err = "";
+      try { drawBracket(); } catch (e) { drew = false; err = e.message; }
+      ok("the bracket renders once a champion exists", drew, err);
+    }
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+    game.bracket = saved.bracket;
+    game.cpu = saved.cpu;
+    game.particles = [];
+  }
+
+  // 19ag0. Remappable controls and gamepad support.
+  {
+    const savedScheme = SCHEME.map((x) => ({ ...x }));
+    const saved = { scene: game.scene, ctrlSeat: game.ctrlSeat, ctrlRow: game.ctrlRow,
+                    ctrlBinding: game.ctrlBinding, cpu: [...game.cpu] };
+
+    ok("every action is listed for rebinding", ACTIONS.length === 6, `${ACTIONS.length}`);
+    ok("both seats have a default for every action",
+       SCHEME_DEFAULTS.every((sc) => ACTIONS.every((a) => sc[a.key])));
+    ok("the two seats do not share a default key",
+       ACTIONS.every((a) => SCHEME_DEFAULTS[0][a.key] !== SCHEME_DEFAULTS[1][a.key]));
+
+    // Key labels must be readable, never blank.
+    {
+      let bad = null;
+      for (const code of ["KeyA", "ArrowLeft", "Space", "Enter", "ShiftRight",
+                          "Numpad0", "Digit3", "Semicolon", "", null]) {
+        const l = keyLabel(code);
+        if (!l || !l.length) { bad = `${code} produced no label`; break; }
+      }
+      ok("every key has a readable label", !bad, bad || "");
+      ok("an unbound action shows a dash", keyLabel("") === "—");
+    }
+
+    // Rebinding, and the reserved keys that must be refused.
+    {
+      resetScheme();
+      ok("reset restores the defaults",
+         SCHEME[0].kick === SCHEME_DEFAULTS[0].kick, SCHEME[0].kick);
+
+      SCHEME[0].kick = "KeyP";
+      saveScheme();
+      rebuildWatched();
+      ok("a rebound key is watched", WATCHED.has("KeyP"));
+      ok("the old key is no longer watched by that seat",
+         SCHEME[0].kick === "KeyP", SCHEME[0].kick);
+
+      ok("ESC can never be bound", RESERVED_KEYS.has("Escape"));
+      ok("reload keys can never be bound",
+         RESERVED_KEYS.has("F5") && RESERVED_KEYS.has("F12"));
+
+      resetScheme();
+      ok("reset restores every action",
+         ACTIONS.every((a) => SCHEME[0][a.key] === SCHEME_DEFAULTS[0][a.key]));
+    }
+
+    // The watch list must always cover the UI keys plus every binding.
+    {
+      rebuildWatched();
+      let bad = null;
+      for (const seat of SCHEME) {
+        for (const a of ACTIONS) {
+          if (seat[a.key] && !WATCHED.has(seat[a.key])) { bad = seat[a.key]; break; }
+        }
+      }
+      ok("every binding is in the watch list", !bad, bad || "");
+      ok("the UI keys are watched",
+         WATCHED.has("Enter") && WATCHED.has("Escape") && WATCHED.has("Space"));
+    }
+
+    // Gamepad polling must be safe when there is no API and no pad.
+    {
+      let threw = false;
+      try { pollPads(true); } catch (e) { threw = true; }
+      ok("polling pads is safe with no gamepad API", !threw);
+      ok("no pad is reported active", !pads.active[0] && !pads.active[1]);
+
+      // With a fake pad present, a seat must be driven and the keyboard skipped.
+      const fakePad = {
+        connected: true, id: "Test Pad",
+        axes: [-1, 0],
+        buttons: Array.from({ length: 16 }, (_, i) => ({ pressed: i === 0 })),
+      };
+      const realSource = padSource;
+      setPadSource(() => [fakePad, null]);
+      game.opt.gamepad = true;
+      game.cpu = [false, false];
+      for (const a of intent) {
+        a.left = a.right = a.up = a.down = a.kick = a.kickEdge = a.wallEdge = false;
+      }
+      pads.prev[0] = {};
+      const live = pollPads(true);
+      ok("a connected pad is detected", live === 1 && pads.active[0], `${live}`);
+      ok("the pad's stick drives movement", intent[0].left === true);
+      ok("the pad's button presses kick", intent[0].kick === true);
+      ok("a pad button edge-triggers once", intent[0].kickEdge === true);
+      // Held, the edge must not fire again.
+      pollPads(true);
+      ok("a held pad button does not re-trigger", intent[0].kickEdge === false);
+      ok("seat 1 is untouched with only one pad", !pads.active[1]);
+
+      setPadSource(realSource);
+      for (const a of intent) {
+        a.left = a.right = a.up = a.down = a.kick = a.kickEdge = a.wallEdge = false;
+      }
+    }
+
+    // The screen renders in every state.
+    {
+      let drew = true, err = "";
+      for (const from of [SCENE.MENU, SCENE.PAUSE]) {
+        game.ctrlFrom = from;
+        for (let seat = 0; seat < 2; seat++) {
+          game.ctrlSeat = seat;
+          for (let r = 0; r < ACTIONS.length + 2; r++) {
+            game.ctrlRow = r;
+            game.ctrlBinding = null;
+            try { drawControls(); } catch (e) { drew = false; err = e.message; }
+            game.ctrlBinding = { seat, action: ACTIONS[Math.min(r, ACTIONS.length - 1)].key };
+            try { drawControls(); } catch (e) { drew = false; err = `binding: ${e.message}`; }
+          }
+        }
+      }
+      game.ctrlBinding = null;
+      // And with an action left unbound.
+      SCHEME[0].wall = "";
+      try { drawControls(); } catch (e) { drew = false; err = `unbound: ${e.message}`; }
+      ok("the controls screen renders in every state", drew, err);
+    }
+
+    for (let i = 0; i < 2; i++) Object.assign(SCHEME[i], savedScheme[i]);
+    rebuildWatched();
+    Object.assign(game, saved);
+  }
+
+  // 19ag1. Sponsors and the credits screen.
+  {
+    const savedList = sponsors.list.slice();
+
+    ok("the sponsor folder is inside the project", SPONSOR_DIR === "img/sponsors/");
+    ok("there are billing tiers", Object.keys(SPONSOR_TIERS).length >= 3);
+
+    // Manifest entries are sanitised, and path escapes refused.
+    {
+      ok("a valid entry is accepted",
+         !!cleanSponsor({ name: "ACME", file: "acme.png", tier: "gold" }));
+      ok("a nameless entry is refused", cleanSponsor({ file: "x.png" }) === null);
+      ok("a parent-directory path is refused",
+         cleanSponsor({ name: "X", file: "../../secret.png" }) === null);
+      ok("an absolute path is refused",
+         cleanSponsor({ name: "X", file: "/etc/passwd" }) === null);
+      ok("a remote URL is refused",
+         cleanSponsor({ name: "X", file: "https://evil.test/x.png" }) === null);
+      ok("markup in a sponsor name is stripped",
+         !/[<>]/.test(cleanSponsor({ name: "<b>X</b>", file: "a.png" }).name));
+      ok("an unknown tier falls back",
+         cleanSponsor({ name: "X", file: "a.png", tier: "platinum" }).tier === "silver");
+      ok("junk is refused outright",
+         cleanSponsor(null) === null && cleanSponsor("nope") === null);
+    }
+
+    // Drawing must work with no sponsors, some, and broken ones.
+    {
+      let drew = true, err = "";
+      const cases = [
+        [],
+        [{ name: "A", file: "a.png", tier: "gold", img: null, ready: false }],
+        [{ name: "A", file: "a.png", tier: "gold",
+           img: { width: 200, height: 80 }, ready: true },
+         { name: "B", file: "b.png", tier: "bronze",
+           img: { width: 400, height: 100 }, ready: true }],
+      ];
+      for (const list of cases) {
+        sponsors.list = list;
+        try {
+          drawSponsorStrip(100, 400, 600, 40, { dark: true });
+          drawSponsorStrip(0, 0, 20, 6);            // absurdly small
+          drawCredits();
+        } catch (e) { drew = false; err = e.message; }
+      }
+      ok("sponsor boards render with none, unloaded and loaded logos", drew, err);
+
+      sponsors.list = [{ name: "A", file: "a.png", tier: "gold",
+                         img: { width: 200, height: 80 }, ready: true }];
+      ok("only ready sponsors are drawable", readySponsors().length === 1);
+      sponsors.list[0].ready = false;
+      ok("an unloaded sponsor is skipped", readySponsors().length === 0);
+    }
+
+    // The credits screen renders from both entry points.
+    {
+      let drew = true, err = "";
+      for (const from of [SCENE.MENU, SCENE.PAUSE]) {
+        game.creditsFrom = from;
+        try { drawCredits(); } catch (e) { drew = false; err = e.message; }
+      }
+      ok("the credits screen renders", drew, err);
+
+      /*
+        The credits name real people. Assert they are actually on screen, so a
+        future layout edit cannot quietly drop someone.
+      */
+      game.creditsFrom = SCENE.MENU;
+      creditProbe.lines = [];
+      drawCredits();
+      const all = creditProbe.lines.join(" | ");
+      ok("the credits name the author", /João Novo/.test(all), all.slice(0, 60));
+      ok("the credits thank the office", /Everyone at the office/.test(all));
+      ok("the credits thank the play tester", /Salvado/.test(all));
+      ok("the play tester is credited as such", /Salvado — an amazing play tester/.test(all),
+         creditProbe.lines.find((l) => l.startsWith("Salvado")) || "missing");
+      ok("accented characters survive", all.includes("ã"), "João encoding");
+      ok("the credits are not empty", creditProbe.lines.length >= 6,
+         `${creditProbe.lines.length} lines`);
+    }
+
+    sponsors.list = savedList;
+    game.particles = [];
+  }
+
   // 19ag. Kicks are a strike, not a touch.
   {
     const saved = { players: game.players, ball: game.ball, mode: game.mode };
@@ -11200,6 +14932,9 @@ game.names = loadNames();
 loadOpts(game.opt);
 game.board = loadBoard();
 loadRules(game.rules);
+rebuildWatched();
+loadScheme();
+loadSponsors();
 loadLooks(game.looks);
 fitCanvas();
 
