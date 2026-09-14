@@ -1709,7 +1709,7 @@ const TEAMS = [
   { name: "Teal Titans",     color: "#0d9488", accent: "#7fe6db", speed: 2, shot: 3, jump: 3, size: 5 },
   { name: "Amber Arrows",    color: "#f59e0b", accent: "#fde68a", speed: 5, shot: 4, jump: 2, size: 1 },
   { name: "Indigo Owls",     color: "#4f46e5", accent: "#c7d2fe", speed: 2, shot: 2, jump: 5, size: 4 },
-  { name: "Lime Livewires",  color: "#84cc16", accent: "#e3f7a8", speed: 4, shot: 1, jump: 4, size: 3 },
+  { name: "Lime Livewires",  color: "#84cc16", accent: "#e3f7a8", speed: 4, shot: 2, jump: 4, size: 3 },
   { name: "Crimson Bulls",   color: "#b91c1c", accent: "#fca5a5", speed: 1, shot: 5, jump: 2, size: 5 },
   { name: "Slate Sentinels", color: "#64748b", accent: "#cbd5e1", speed: 3, shot: 2, jump: 2, size: 5 },
   { name: "Violet Vipers",   color: "#a855f7", accent: "#e9d5ff", speed: 5, shot: 5, jump: 1, size: 2 },
@@ -1773,7 +1773,13 @@ const pressed = Object.create(null);   // edge-triggered, cleared each frame
   key must be swallowed too.
 */
 const WATCHED = new Set();
-const UI_KEYS = ["Enter", "Space", "Escape", "KeyH", "KeyJ", "Numpad0",
+/*
+  Keys the UI reads directly, outside the two players' rebindable schemes.
+  KeyR is here for the tournament bracket's draw re-roll ONLY: it is deliberately
+  not handled in PLAY, COUNTDOWN or CELEBRATE, so it can never restart a live
+  match the way the old R hotkey did.
+*/
+const UI_KEYS = ["Enter", "Space", "Escape", "KeyH", "KeyJ", "KeyR", "Numpad0",
                  "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"];
 
 function rebuildWatched() {
@@ -2825,6 +2831,8 @@ const game = {
   rosterNames: [],      // tournament entrant names, editable on the roster screen
   rosterCpu: [],        // per-entrant: is this seat played by the computer?
   drawOrder: [],        // randomised seeding, fixed once per tournament
+  drawRolls: 0,         // how many times this draw has been re-rolled
+  rerollDenied: 0,      // >0 while the "too late to re-roll" notice shows
   bracket: [],          // per round: [{ a, b, winner }] — the whole history
   rosterEdit: -1,       // which roster entry is being typed into, or -1
   rosterCursor: 0,      // roster screen selection
@@ -2833,6 +2841,15 @@ const game = {
   settingsRow: 0,
   settingsFrom: null,   // where to return when leaving settings
   looks: LOOK_DEFAULTS.map((l) => ({ ...l })),   // per-seat face and hat
+  /*
+    In a tournament an ENTRANT owns their look, not the seat. When a seated
+    entrant already has one it goes here, overriding game.looks for that seat
+    without touching the player's own saved cosmetics in localStorage.
+  */
+  lookOverride: [null, null],
+  // Seats whose team/character are already settled for the tournament and so
+  // cannot be changed on the select screen.
+  selFixed: [false, false],
   lookRow: [0, 0],               // 0 = team, 1 = face, 2 = hat (per seat)
   mapId: "classic",              // which arena is in play
   rules: { ...RULE_DEFAULTS },   // player-tunable spawn rates and toggles
@@ -2888,6 +2905,29 @@ function shuffled(list) {
 }
 
 /**
+ * Re-roll the draw. Only legal BEFORE the first tie of round one has been
+ * played: once results exist, reshuffling would rewrite history. Returns
+ * whether it actually happened, so the caller can say no.
+ */
+function rerollDraw() {
+  if (game.mode !== MODE.TOURNAMENT) return false;
+  if (netIsGuest()) return false;          // the host owns the bracket
+  if (game.round !== 1 || game.tieIndex !== 0) return false;
+  if (game.lastResult) return false;       // a tie has already been decided
+  game.drawOrder = makeDraw(game.entrants.map((e) => e.id));
+  // Rebuild round one from the new order. beginRound() would increment the
+  // round counter, so the pairing work is repeated here instead.
+  game.roundPairs = buildPairs(aliveInDrawOrder());
+  game.tieIndex = 0;
+  game.bracket[0] = game.roundPairs.map(([a, b]) => ({
+    a, b, winner: b === null ? a : null,
+  }));
+  game.drawRolls = (game.drawRolls || 0) + 1;
+  netSendBracket();
+  return true;
+}
+
+/**
  * The DRAW: a randomised seeding order fixed once at the start of a tournament.
  * Without this, entrant 1 always met entrant 2 and the bracket was identical
  * every time. Held in `game.drawOrder` so later rounds keep the same side of the
@@ -2895,6 +2935,15 @@ function shuffled(list) {
  */
 function makeDraw(ids) {
   return shuffled(ids);
+}
+
+/**
+ * Is this seat's team settled for the rest of the tournament? Gated on the mode
+ * so a leftover flag can never lock the select screen in any other mode — every
+ * screen that reaches select does NOT have to remember to clear it.
+ */
+function seatFixed(i) {
+  return game.mode === MODE.TOURNAMENT && !!game.selFixed[i];
 }
 
 /** Alive entrants, ordered by the tournament draw rather than by id. */
@@ -2936,7 +2985,8 @@ function startTournament() {
       id: i,
       name: isCpu ? `CPU ${i}`
                   : cleanName(preset || (i < 2 ? game.names[i] : ""), `PLAYER ${i + 1}`),
-      teamIdx: null,
+      teamIdx: null,          // chosen the first time this entrant plays
+      look: null,             // ditto: face + hat, kept for the whole tournament
       alive: true,
       owner,
     });
@@ -2944,6 +2994,8 @@ function startTournament() {
   game.round = 0;
   game.champion = null;
   game.lastResult = null;
+  game.lookOverride = [null, null];
+  game.selFixed = [false, false];
   // Randomise the draw once, so who meets whom is different every tournament.
   game.drawOrder = makeDraw(game.entrants.map((e) => e.id));
   game.bracket = [];
@@ -2985,12 +3037,27 @@ function nextTie() {
       continue;
     }
     game.seats = [a, b];
-    game.sel = [
-      entrantById(a).teamIdx ?? 0,
-      entrantById(b).teamIdx ?? 3,
-    ];
-    game.locked = [false, false];
+    const ea = entrantById(a), eb = entrantById(b);
+    game.sel = [ea.teamIdx ?? 0, eb.teamIdx ?? 3];
+    /*
+      A TEAM IS FOR THE WHOLE TOURNAMENT. Each entrant picks once, the first
+      time they play, and carries that team and character to the end. So a seat
+      whose entrant has already chosen is FIXED: it is pre-locked and the select
+      screen will not let it be changed. When both seats are fixed there is
+      nothing left to pick, so the select screen is skipped entirely and the tie
+      kicks off straight away.
+    */
+    const fixed = [ea.teamIdx !== null, eb.teamIdx !== null];
+    game.selFixed = fixed;
+    game.lookOverride = [ea.look ? { ...ea.look } : null,
+                         eb.look ? { ...eb.look } : null];
+    game.locked = [...fixed];
     applyTieControl();
+    if (fixed[0] && fixed[1]) {
+      netSendBracket();       // let the guest see the seats before play starts
+      startMatch();
+      return;
+    }
     game.scene = SCENE.SELECT;
     netSendBracket();
     return;
@@ -3051,6 +3118,23 @@ function startMatch() {
   game.mineTimer = mineInterval();
   game.matchSecs = TIME_OPTIONS[game.timeIdx];
   game.clock = game.matchSecs;
+
+  /*
+    Remember each tournament entrant's team and character as the match starts,
+    so every later round reuses them instead of asking again. Recorded here
+    rather than when the tie is resolved, because this is the moment the choice
+    takes effect.
+  */
+  if (game.mode === MODE.TOURNAMENT) {
+    for (let s = 0; s < 2; s++) {
+      const e = entrantById(game.seats[s]);
+      if (!e) continue;
+      if (e.teamIdx === null) e.teamIdx = game.sel[s];
+      if (!e.look) e.look = lookForSeat(s);
+      game.lookOverride[s] = { ...e.look };
+      game.selFixed[s] = true;
+    }
+  }
 
   // Remember the run's teams on the first match, so later stages can reuse them
   // without sending the player back to the select screen.
@@ -4031,8 +4115,13 @@ function netHandle(msg) {
   }
   if (msg.t === "br" && netIsGuest()) {
     game.entrantCount = msg.ec;
-    game.entrants = msg.en.map(([id, name, teamIdx, alive, owner]) => ({
+    game.entrants = msg.en.map(([id, name, teamIdx, alive, owner, look]) => ({
       id, name: cleanName(name, `PLAYER ${id + 1}`), teamIdx, alive: !!alive, owner,
+      // Never trust a look off the wire: faceById/hatById fall back to a known
+      // one, so a bogus id cannot reach the renderer.
+      look: Array.isArray(look)
+        ? { face: faceById(look[0]).id, hat: hatById(look[1]).id }
+        : null,
     }));
     game.roundPairs = msg.rp;
     game.tieIndex = msg.ti;
@@ -4041,6 +4130,12 @@ function netHandle(msg) {
     game.lastResult = msg.lr;
     game.champion = msg.ch >= 0 ? entrantById(msg.ch) : null;
     game.mode = MODE.TOURNAMENT;
+    // Mirror the host's seat locks so the select screen agrees on both machines.
+    for (let s = 0; s < 2; s++) {
+      const e = entrantById(game.seats[s]);
+      game.selFixed[s] = !!(e && e.teamIdx !== null);
+      game.lookOverride[s] = e && e.look ? { ...e.look } : null;
+    }
     // Follow the host between bracket screens; PLAY state arrives as snapshots.
     if (msg.sc === SCENE.BRACKET || msg.sc === SCENE.CHAMPION || msg.sc === SCENE.SELECT) {
       game.scene = msg.sc;
@@ -4095,7 +4190,8 @@ function netSendBracket() {
   if (!netIsHost()) return;
   netSend({
     t: "br",
-    en: game.entrants.map((e) => [e.id, e.name, e.teamIdx, e.alive ? 1 : 0, e.owner]),
+    en: game.entrants.map((e) => [e.id, e.name, e.teamIdx, e.alive ? 1 : 0, e.owner,
+                                  e.look ? [e.look.face, e.look.hat] : null]),
     rp: game.roundPairs,
     ti: game.tieIndex,
     rd: game.round,
@@ -4638,6 +4734,8 @@ function updateMenu(dt) {
     game.seats = [null, null];
     game.sel = [0, 3];
     game.locked = [false, false];
+    game.lookOverride = [null, null];
+    game.selFixed = [false, false];
     game.scene = SCENE.SELECT;
   }
 }
@@ -4976,6 +5074,12 @@ function updateSelect(dt) {
 
   for (let i = 0; i < 2; i++) {
     if (game.cpu[i]) continue;          // CPU seats are already locked
+    /*
+      A seat FIXED by the tournament has already had its team and character
+      chosen in an earlier round and keeps them to the end, so it ignores the
+      keyboard here entirely — it cannot be moved, and kick cannot un-ready it.
+    */
+    if (seatFixed(i)) { game.locked[i] = true; continue; }
     const S = SCHEME[i];
 
     // A locked player can change their mind: kick un-readies, and a direction
@@ -4999,14 +5103,16 @@ function updateSelect(dt) {
       if (game.lookRow[i] === 0) {
         game.sel[i] = (game.sel[i] + step + TEAMS.length) % TEAMS.length;
       } else if (game.lookRow[i] === 1) {
-        const k = FACES.findIndex((f) => f.id === game.looks[i].face);
+        const k = FACES.findIndex((f) => f.id === lookForSeat(i).face);
         game.looks[i].face = FACES[(k + step + FACES.length) % FACES.length].id;
         saveLooks(game.looks);
       } else {
-        const k = HATS.findIndex((h) => h.id === game.looks[i].hat);
+        const k = HATS.findIndex((h) => h.id === lookForSeat(i).hat);
         game.looks[i].hat = HATS[(k + step + HATS.length) % HATS.length].id;
         saveLooks(game.looks);
       }
+      // Editing a look drops any inherited override: this seat is choosing now.
+      if (game.lookRow[i] !== 0) game.lookOverride[i] = null;
     }
     if (kickHit(i)) game.locked[i] = true;
   }
@@ -5047,6 +5153,7 @@ function step(dt) {
   if (game.shake > 0) game.shake = Math.max(0, game.shake - dt);
   if (game.flash > 0) game.flash = Math.max(0, game.flash - dt);
   if (game.gravAnnounce > 0) game.gravAnnounce = Math.max(0, game.gravAnnounce - dt);
+  if (game.rerollDenied > 0) game.rerollDenied = Math.max(0, game.rerollDenied - dt);
   // Goals slide continuously, including during countdowns and celebrations so
   // their motion never visibly stutters.
   goalPhase += dt;
@@ -5244,6 +5351,8 @@ function step(dt) {
       break;
 
     case SCENE.BRACKET:
+      // R re-rolls the draw, but only before the first tie has been played.
+      if (hit("KeyR")) { if (!rerollDraw()) game.rerollDenied = 1.2; break; }
       if (kickHit(0) || kickHit(1) || hit("Space") || hit("Enter")) {
         if (aliveEntrants().length <= 1) beginRound();   // resolves to CHAMPION
         else nextTie();
@@ -5941,10 +6050,21 @@ function drawHoops() {
   }
 }
 
+/**
+ * The appearance in force at a seat: a tournament entrant's own look if they
+ * carry one, otherwise the seat's saved look. Ids are normalised here, so
+ * nothing downstream — including looks arriving off the wire — can pass an
+ * unknown face or hat through to the renderer.
+ */
+function lookForSeat(i) {
+  const ov = game.mode === MODE.TOURNAMENT ? game.lookOverride[i] : null;
+  const l = ov || game.looks[i] || LOOK_DEFAULTS[i] || LOOK_DEFAULTS[0];
+  return { face: faceById(l.face).id, hat: hatById(l.hat).id };
+}
+
 /** The appearance for a player's seat, falling back to the defaults. */
 function lookOf(pl) {
-  const l = game.looks[pl.index] || LOOK_DEFAULTS[pl.index] || LOOK_DEFAULTS[0];
-  return { face: faceById(l.face).id, hat: hatById(l.hat).id };
+  return lookForSeat(pl.index);
 }
 
 /**
@@ -7811,7 +7931,17 @@ function drawBracket() {
 
   const msg = alive.length <= 1 ? "press kick to crown the champion"
                                 : "press kick to play the next tie";
+  const canRoll = game.round === 1 && game.tieIndex === 0 && !game.lastResult &&
+                  !netIsGuest();
   text(msg, W / 2, H - 22, 11, "#9fb4d0", "center", 700);
+  if (game.rerollDenied > 0) {
+    text("too late to re-draw — the tournament is under way",
+         W / 2, H - 38, 10, "#fca5a5", "center", 800);
+  } else if (canRoll) {
+    text(game.drawRolls > 0 ? `R to re-draw  ·  redrawn ${game.drawRolls}×`
+                            : "R to re-draw the bracket",
+         W / 2, H - 38, 10, "#fbbf24", "center", 800);
+  }
 }
 
 function drawChampion() {
@@ -8052,7 +8182,8 @@ function drawSelect() {
          px + pw / 2, 136, 15,
          game.cpu[i] ? "#fbbf24" : (lockedNow ? "#4ade80" : "#cddcf2"), "center", 900);
     text(game.cpu[i] ? "computer controlled"
-                     : (i === 0 ? "W A S D  ·  F to lock" : "ARROWS  ·  ENTER to lock"),
+         : seatFixed(i) ? "team locked for the tournament"
+         : (i === 0 ? "W A S D  ·  F to lock" : "ARROWS  ·  ENTER to lock"),
          px + pw / 2, 156, 11, "#7f95b3", "center", 600);
 
     // Big preview head.
@@ -8074,7 +8205,7 @@ function drawSelect() {
     ctx.stroke();
 
     // Live preview: the chosen face and hat, winking so it reads as alive.
-    const look = game.looks[i] || LOOK_DEFAULTS[i];
+    const look = lookForSeat(i);
     const previewMood = game.locked[i] ? "happy"
       : Math.floor(performance.now() / 1400) % 5 === 0 ? "kick" : "idle";
     drawFace(cx, cy, headR, i === 0 ? 1 : -1, look.face, previewMood, team);
@@ -8084,7 +8215,7 @@ function drawSelect() {
     ctx.stroke();
 
     // Three picker rows. The active one is outlined so left/right is obvious.
-    const look2 = game.looks[i] || LOOK_DEFAULTS[i];
+    const look2 = lookForSeat(i);
     const rowsSel = [
       { label: "TEAM", value: team.name.toUpperCase() },
       { label: "FACE", value: faceById(look2.face).name },
@@ -8092,7 +8223,8 @@ function drawSelect() {
     ];
     rowsSel.forEach((rw, k) => {
       const ry = 288 + k * 28;
-      const on = !game.cpu[i] && !game.locked[i] && game.lookRow[i] === k;
+      const on = !game.cpu[i] && !seatFixed(i) && !game.locked[i] &&
+                 game.lookRow[i] === k;
       ctx.fillStyle = on ? "rgba(125,211,252,0.16)" : "rgba(255,255,255,0.05)";
       roundRect(px + 24, ry, pw - 48, 24, 6);
       ctx.fill();
@@ -8134,7 +8266,10 @@ function drawSelect() {
       }
     }
 
-    if (lockedNow) text("READY", px + pw / 2, 528, 14, "#4ade80", "center", 900);
+    if (lockedNow) {
+      text(seatFixed(i) && !game.cpu[i] ? "LOCKED IN" : "READY",
+           px + pw / 2, 528, 14, "#4ade80", "center", 900);
+    }
     else if (!game.cpu[i]) {
       text("up/down to switch row", px + pw / 2, 528, 10, "#6b819e", "center", 600);
     }
@@ -9153,9 +9288,16 @@ function runTests() {
           else nextTie();
           continue;
         }
-        if (game.scene === SCENE.SELECT) {
+        /*
+          A tie reaches the pitch by one of two routes now. If either entrant has
+          still to choose a team it stops at SELECT; once both are locked in for
+          the tournament, nextTie kicks off directly and lands in COUNTDOWN. The
+          driver accepts both and counts the tie where the match actually starts,
+          so neither route is counted twice.
+        */
+        if (game.scene === SCENE.SELECT) { startMatch(); continue; }
+        if (game.scene === SCENE.COUNTDOWN || game.scene === SCENE.PLAY) {
           // Seat the tie and play it: the lower entrant id always wins.
-          startMatch();
           const winSeat = game.seats[0] < game.seats[1] ? 0 : 1;
           game.score = winSeat === 0 ? [3, 0] : [0, 3];
           finishMatch(winSeat, false);
@@ -10919,8 +11061,10 @@ function runTests() {
             if (aliveEntrants().length <= 1) beginRound(); else nextTie();
             continue;
           }
-          if (game.scene === SCENE.SELECT) {
-            startMatch();
+          // Either route to the pitch: SELECT when a team is still to be picked,
+          // straight to COUNTDOWN once both entrants are locked in.
+          if (game.scene === SCENE.SELECT) { startMatch(); continue; }
+          if (game.scene === SCENE.COUNTDOWN || game.scene === SCENE.PLAY) {
             const w = game.seats[0] < game.seats[1] ? 0 : 1;
             game.score = w === 0 ? [3, 0] : [0, 3];
             finishMatch(w, false);
@@ -12059,7 +12203,13 @@ function runTests() {
     game.sel = [0, 3];
     startMatch();
 
-    ok("R is not a watched key", !WATCHED.has("KeyR"));
+    /*
+      R is watched again, but ONLY for the tournament bracket's draw re-roll.
+      The old "restart the match" hotkey is gone for good, so what matters is no
+      longer whether the key is watched — it is that R does nothing anywhere a
+      match is running. That is asserted by behaviour below.
+    */
+    ok("R is watched only for the bracket re-roll", WATCHED.has("KeyR"));
 
     // Pressing R in a live match must change nothing at all.
     const pressR = () => {
@@ -13885,9 +14035,11 @@ function runTests() {
             if (aliveEntrants().length <= 1) beginRound(); else nextTie();
             continue;
           }
-          if (game.scene === SCENE.SELECT) {
+          if (game.scene === SCENE.SELECT) { startMatch(); continue; }
+          if (game.scene === SCENE.COUNTDOWN || game.scene === SCENE.PLAY) {
+            // Counted here, not at SELECT: a CPU tie in a later round skips the
+            // select screen entirely now that its team is already locked in.
             if (game.cpu[0] && game.cpu[1]) cpuTies++;
-            startMatch();
             const w = game.seats[0] < game.seats[1] ? 0 : 1;
             game.score = w === 0 ? [3, 0] : [0, 3];
             finishMatch(w, false);
