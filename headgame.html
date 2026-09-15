@@ -78,7 +78,7 @@
   same simulation lockstep, so a mismatch is worth a visible warning rather than
   a desync nobody can explain.
 */
-const VERSION = "1.5";
+const VERSION = "1.6";
 
 const W = 1000;               // logical width  (canvas is letterboxed to fit)
 const H = 600;                // logical height
@@ -1885,7 +1885,7 @@ const WATCHED = new Set();
   not handled in PLAY, COUNTDOWN or CELEBRATE, so it can never restart a live
   match the way the old R hotkey did.
 */
-const UI_KEYS = ["Enter", "Space", "Escape", "KeyH", "KeyJ", "KeyR", "Numpad0",
+const UI_KEYS = ["Enter", "Space", "Escape", "KeyH", "KeyJ", "KeyL", "KeyR", "Numpad0",
                  "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"];
 
 function rebuildWatched() {
@@ -2201,9 +2201,17 @@ function gatherIntent(edge) {
   // pass over any seat a pad already owns.
   pollPads(edge);
 
+  const mySeat = netLocalSeat();
   for (let i = 0; i < 2; i++) {
     const a = intent[i];
     if (net.active && net.remoteSeat === i && i >= 0) continue;  // filled by the network
+    /*
+      Only ever fill the seat this machine actually owns. A spectator owns none,
+      and used to write seat 0 regardless — harmless with one peer because the
+      host ignored it, but with a hub every watching machine would have been
+      steering the match.
+    */
+    if (net.active && mySeat !== i) continue;
     if (game.cpu[i]) continue;                          // filled by updateCPU
     if (pads.active[i]) continue;                       // filled by pollPads
     const S = SCHEME[i];
@@ -3098,12 +3106,32 @@ function startTournament() {
       host and seed 2 to the guest, so their meeting is the online tie; the rest
       are local players on the host's keyboard (or CPUs if that was chosen).
     */
+    /*
+      OWNERSHIP. Entrant 0 is always this machine — the host plays too. Every
+      other entrant belongs to whichever joined peer claimed that slot, and
+      anything still unclaimed is a CPU.
+
+      This used to read `i === 1 ? "guest" : "host"`, which is why an online
+      bracket could only ever hold two humans: seed 2 was the one remote player
+      and everybody else was played on the host's own keyboard.
+    */
     let owner = "host";
-    if (net.active) owner = i === 1 ? "guest" : "host";
+    if (netIsHub()) {
+      if (i === 0) owner = "host";
+      else owner = peerByEntrant(i) ? "guest" : "cpu";
+    } else if (net.active) {
+      // Original two-machine session: seed 2 is the one remote human.
+      owner = i === 1 ? "guest" : "host";
+    }
     // A seat marked CPU on the roster is played by the computer. Never seat 0 —
     // somebody has to be playing — and never a remote seat in an online bracket.
-    const isCpu = !!(game.rosterCpu && game.rosterCpu[i]) && i > 0 &&
-                  !(net.active && i === 1);
+    /*
+      A slot a real person occupies is never a CPU, whatever the roster says —
+      that is a joined peer in a hub session, or seed 2 in a two-machine one.
+    */
+    const claimed = netIsHub() ? !!peerByEntrant(i) : (net.active && i === 1);
+    const isCpu = (!!(game.rosterCpu && game.rosterCpu[i]) && i > 0 && !claimed) ||
+                  owner === "cpu";
     if (isCpu) owner = "cpu";
     game.entrants.push({
       id: i,
@@ -4028,6 +4056,27 @@ const net = {
   spectating: false,     // guest watching a tie it is not playing
   peerVersion: "",       // the other machine's build, from its hello
   versionMismatch: false,// true once a differing peer version is seen
+
+  /*
+    THE HUB. A tournament can seat up to TOURN_MAX humans, each on their own
+    machine, so the HOST holds one connection per joined player:
+
+      { id, pc, chan, name, entrantId, version, mismatch, lastRecv, state }
+
+    A guest still has exactly ONE connection — to the host — and leaves this
+    empty, so the guest path stays as simple as it was. All the hub-ness is
+    host-side.
+
+    `net.chan` is deliberately kept: with a single peer everything still flows
+    through it, which is what lets every existing caller and test keep working
+    unchanged while the peer table is introduced.
+  */
+  peers: [],
+  pending: null,         // host: the slot currently awaiting an answer
+  nextPeerId: 1,         // host: ids handed to joiners, never reused
+  myEntrant: 0,          // which entrant THIS machine plays (host is always 0)
+  joinNote: "",          // transient lobby message (someone joined or dropped)
+  joinNoteT: 0,
 };
 
 const netIsHost = () => net.active && net.role === "host";
@@ -4037,6 +4086,19 @@ const netIsGuest = () => net.active && net.role === "guest";
 function netReset() {
   try { if (net.chan) net.chan.close(); } catch (e) { /* already gone */ }
   try { if (net.pc) net.pc.close(); } catch (e) { /* already gone */ }
+  // Every hub connection goes too, or a stale peer keeps receiving snapshots.
+  for (const p of net.peers) {
+    try { if (p.chan) p.chan.close(); } catch (e) { /* already gone */ }
+    try { if (p.pc) p.pc.close(); } catch (e) { /* already gone */ }
+  }
+  try { if (net.pending && net.pending.pc) net.pending.pc.close(); }
+  catch (e) { /* already gone */ }
+  net.pending = null;
+  net.peers = [];
+  net.nextPeerId = 1;
+  net.myEntrant = 0;
+  net.joinNote = "";
+  net.joinNoteT = 0;
   net.active = false;
   net.role = null;
   net.peerVersion = "";
@@ -4087,8 +4149,10 @@ function waitForIce(pc) {
   });
 }
 
-function netAttachChannel(chan) {
-  net.chan = chan;
+function netAttachChannel(chan, peer) {
+  // A hub peer keeps its own channel; a lone connection is still `net.chan`.
+  if (peer) peer.chan = chan;
+  else net.chan = chan;
   chan.binaryType = "arraybuffer";
   chan.onopen = () => {
     net.state = "live";
@@ -4098,12 +4162,14 @@ function netAttachChannel(chan) {
     netSendHello();          // exchange names immediately
   };
   chan.onclose = () => {
+    if (peer) { netDropPeer(peer); return; }
     if (net.state === "live") net.state = "closed";
   };
   chan.onerror = () => { net.error = "connection error"; };
   chan.onmessage = (e) => {
     net.lastRecv = 0;
-    try { netHandle(JSON.parse(e.data)); }
+    if (peer) peer.lastRecv = 0;
+    try { netHandle(JSON.parse(e.data), peer); }
     catch (err) { /* ignore a malformed frame rather than dying */ }
   };
 }
@@ -4128,6 +4194,81 @@ async function netHost() {
   } catch (e) {
     net.error = "could not start hosting: " + e.message;
     net.state = "failed";
+  }
+}
+
+/**
+ * HOST: open a slot for the NEXT player and mint the code they paste.
+ *
+ * WebRTC ties one offer to one connection, so a lobby cannot publish a single
+ * code that everybody answers — a bundle of eight offers would be ~21KB of
+ * base64 to copy by hand. Instead the host always has exactly one slot open, and
+ * rolling to the next one is what "the code for the next player" means. Each
+ * joiner's flow is unchanged: paste the code, send the answer back.
+ */
+async function netOpenSlot() {
+  if (!netIsHost()) return null;
+  if (net.peers.length >= TOURN_MAX - 1) {
+    net.error = `the bracket is full (${TOURN_MAX} players)`;
+    return null;
+  }
+  net.pending = null;
+  net.copied = false;              // a fresh code has not been copied yet
+  net.error = "";
+  net.state = "creating";
+  try {
+    const peer = {
+      id: net.nextPeerId++,
+      pc: new RTCPeerConnection({ iceServers: ICE_SERVERS }),
+      chan: null,
+      name: "",
+      entrantId: null,             // assigned when the lobby seats them
+      version: "",
+      mismatch: false,
+      lastRecv: 0,
+      state: "offering",
+    };
+    netAttachChannel(peer.pc.createDataChannel("hg", {
+      ordered: false, maxRetransmits: 0,     // stale snapshots are worthless
+    }), peer);
+    const offer = await peer.pc.createOffer();
+    await peer.pc.setLocalDescription(offer);
+    await waitForIce(peer.pc);
+    net.offerText = encodeSignal({ t: "o", sdp: peer.pc.localDescription.sdp });
+    net.pending = peer;            // awaiting this joiner's answer
+    net.state = "lobby";
+    return peer;
+  } catch (e) {
+    net.error = "could not open a slot: " + e.message;
+    net.state = "failed";
+    return null;
+  }
+}
+
+/**
+ * HOST: take the answer from whoever is joining, seat them, and immediately open
+ * the next slot so the lobby is always ready for one more player.
+ */
+async function netAcceptJoiner(answerCode) {
+  const peer = net.pending;
+  if (!peer) { net.error = "no slot is open"; return false; }
+  try {
+    const sig = decodeSignal(answerCode);
+    if (sig.t !== "a") throw new Error("that is not a join code");
+    await peer.pc.setRemoteDescription({ type: "answer", sdp: sig.sdp });
+    peer.state = "connecting";
+    // Seat them in the lowest free slot; entrant 0 is always the host.
+    let slot = 1;
+    while (peerByEntrant(slot)) slot++;
+    peer.entrantId = slot;
+    net.peers.push(peer);
+    net.pending = null;
+    net.error = "";
+    netOpenSlot();                 // roll the code on for the next player
+    return true;
+  } catch (e) {
+    net.error = "bad code: " + e.message;
+    return false;
   }
 }
 
@@ -4167,11 +4308,112 @@ async function netAcceptAnswer(answerCode) {
   }
 }
 
+/**
+ * Every open channel this machine can write to.
+ *
+ * The host with a peer table writes to all of them; anything else — a guest, or
+ * a host before anyone has joined — falls back to the single `net.chan`. That
+ * fallback is what keeps the pre-hub callers and the whole existing test suite
+ * working untouched.
+ */
+function netChannels() {
+  if (net.peers.length) {
+    const out = [];
+    for (const p of net.peers) {
+      if (p.chan && p.chan.readyState === "open") out.push(p.chan);
+    }
+    return out;
+  }
+  return net.chan && net.chan.readyState === "open" ? [net.chan] : [];
+}
+
+/** Broadcast to every connected peer. */
 const netSend = (obj) => {
-  if (net.chan && net.chan.readyState === "open") {
-    try { net.chan.send(JSON.stringify(obj)); } catch (e) { /* dropped */ }
+  const chans = netChannels();
+  if (!chans.length) return;
+  const txt = JSON.stringify(obj);          // serialise once, not per peer
+  for (const c of chans) {
+    try { c.send(txt); } catch (e) { /* that peer dropped; the rest still get it */ }
   }
 };
+
+/** Send to ONE peer — used for anything peer-specific, like its assigned seat. */
+function netSendTo(peer, obj) {
+  if (!peer || !peer.chan || peer.chan.readyState !== "open") return;
+  try { peer.chan.send(JSON.stringify(obj)); } catch (e) { /* dropped */ }
+}
+
+/**
+ * Is this a HUB session (a peer table), as opposed to the original
+ * single-connection host/guest pair?
+ *
+ * The two are genuinely different shapes and the distinction is needed in
+ * several places, so it lives here rather than being re-inferred from
+ * `net.peers.length` at each call site.
+ */
+const netIsHub = () => net.active && net.peers.length > 0;
+
+/** The peer that owns a given entrant, or null. */
+function peerByEntrant(id) {
+  for (const p of net.peers) if (p.entrantId === id) return p;
+  return null;
+}
+
+/**
+ * Which seat is this peer allowed to drive right now? -1 for none.
+ *
+ * With no peer (the pre-hub single-connection case) this is the old
+ * `net.remoteSeat`. With a peer it is wherever that peer's entrant is seated in
+ * the current tie, so a machine can only ever move its own player.
+ */
+/**
+ * A peer has gone. Hand its entrant to the computer and carry on.
+ *
+ * With eight machines a dropped connection must never stall the bracket, so the
+ * tournament continues with a CPU in that seat rather than waiting for somebody
+ * who is not coming back. Everyone is told, and the notice names them.
+ */
+function netDropPeer(peer) {
+  const i = net.peers.indexOf(peer);
+  if (i < 0) return;
+  net.peers.splice(i, 1);
+  try { if (peer.chan) peer.chan.close(); } catch (e) { /* already gone */ }
+  try { if (peer.pc) peer.pc.close(); } catch (e) { /* already gone */ }
+
+  const e = peer.entrantId != null ? entrantById(peer.entrantId) : null;
+  const who = cleanName(peer.name || "", e ? e.name : "A PLAYER");
+  if (e) {
+    e.owner = "cpu";                        // the computer takes over the seat
+    // If they are in the tie being played, that seat must switch over now.
+    const seat = game.seats.indexOf(e.id);
+    if (seat >= 0 && netIsHost()) game.cpu[seat] = true;
+  }
+  net.joinNote = `${who} disconnected — the computer takes over`;
+  net.joinNoteT = 6;
+  if (netIsHost()) netSendBracket();        // everyone learns the new owner
+}
+
+function netSeatFor(peer) {
+  if (!peer) return net.remoteSeat;
+  if (peer.entrantId == null) return -1;
+  const seat = game.seats.indexOf(peer.entrantId);
+  return seat;                              // -1 when that entrant is not playing
+}
+
+/** Which seat does THIS machine drive? -1 while spectating. */
+function netLocalSeat() {
+  if (!net.active) return net.localSeat;
+  // In a hub tournament the local seat follows this machine's own entrant.
+  if (game.mode === MODE.TOURNAMENT && net.myEntrant != null) {
+    const seat = game.seats.indexOf(net.myEntrant);
+    if (seat >= 0) return seat;
+    // Not in this tie: only a lone host still drives seat 0 for a local tie.
+    if (netIsHost() && !peerByEntrant(game.seats[0]) &&
+        !peerByEntrant(game.seats[1])) return net.localSeat;
+    return -1;
+  }
+  return net.localSeat;
+}
 
 /** Compact snapshot of everything the guest needs in order to draw. */
 function netSnapshot() {
@@ -4416,10 +4658,26 @@ function netInterpolate(dt) {
   }
 }
 
-function netHandle(msg) {
+/**
+ * Handle one decoded message.
+ *
+ * `peer` is the hub connection it arrived on, when there is one. It is optional:
+ * without it the old single-peer routing applies, which is what keeps the
+ * pre-hub callers and the existing tests working.
+ */
+function netHandle(msg, peer) {
   if (msg.t === "i" && netIsHost()) {
-    // Guest input byte -> the remote seat's intent.
-    unpackIntent(msg.b, intent[net.remoteSeat]);
+    /*
+      Route the byte by SENDER, not by a single remote seat.
+
+      `game.seats` holds entrant ids, so the seat this peer is entitled to drive
+      is wherever its entrant sits in the current tie. A peer whose entrant is
+      not playing right now is a spectator, and its input is DISCARDED — without
+      this, any connected machine could steer a match it is not in.
+    */
+    const seat = netSeatFor(peer);
+    if (seat < 0) return;
+    unpackIntent(msg.b, intent[seat]);
     return;
   }
   if (msg.t === "s" && netIsGuest()) { netApplySnapshot(msg); return; }
@@ -4466,6 +4724,13 @@ function netHandle(msg) {
   if (msg.t === "hi") {
     // Never trust a name off the wire: strip it to printable characters.
     game.remoteName = cleanName(msg.n, "OPPONENT");
+    if (peer) {
+      peer.name = cleanName(msg.n, `PLAYER ${(peer.entrantId ?? 0) + 1}`);
+      peer.version = typeof msg.v === "string"
+        ? msg.v.replace(/[^0-9A-Za-z.\-]/g, "").slice(0, 12) : "";
+      peer.mismatch = peer.version !== VERSION;
+      if (!net.joinNote) { net.joinNote = `${peer.name} joined`; net.joinNoteT = 4; }
+    }
     /*
       Version check. Both machines must run the same simulation for host
       authority to make sense, so a mismatch is surfaced plainly instead of
@@ -4490,8 +4755,28 @@ function netHandle(msg) {
 function netPump() {
   if (!net.active) return;
 
+  if (net.joinNoteT > 0) net.joinNoteT = Math.max(0, net.joinNoteT - DT);
+
+  /*
+    HUB: every connection is timed out on its own. One silent machine must not
+    stall the other seven, so its entrant is handed to a CPU and play continues.
+  */
+  if (netIsHub()) {
+    for (let i = net.peers.length - 1; i >= 0; i--) {
+      const p = net.peers[i];
+      p.lastRecv = (p.lastRecv || 0) + DT;
+      if (p.lastRecv > NET_TIMEOUT ||
+          (p.chan && p.chan.readyState === "closed")) netDropPeer(p);
+    }
+  }
+
   net.lastRecv += DT;
-  if (net.lastRecv > NET_TIMEOUT && net.state === "live") {
+  /*
+    A hub host has no single peer to lose, so its own silence means nothing — the
+    per-peer timeouts above are what matter. Without this exemption a lobby would
+    declare itself closed six seconds in, because nothing writes to `net.chan`.
+  */
+  if (!netIsHub() && net.lastRecv > NET_TIMEOUT && net.state === "live") {
     net.state = "closed";
     net.error = "peer stopped responding";
   }
@@ -4564,11 +4849,21 @@ function netSendConfig() {
 */
 
 /** Which seat, if any, a remote peer drives for the current tie. */
+/**
+ * Does this tie involve a remote human?
+ *
+ * With a hub that means EITHER seat belongs to a joined peer — two remote
+ * players can meet each other without the host being in the tie at all, which
+ * the old host-versus-guest test could not express.
+ */
 function tieIsOnline() {
   if (!net.active || game.mode !== MODE.TOURNAMENT) return false;
   const a = entrantById(game.seats[0]);
   const b = entrantById(game.seats[1]);
   if (!a || !b) return false;
+  if (netIsHub()) {
+    return !!(peerByEntrant(a.id) || peerByEntrant(b.id));
+  }
   return (a.owner === "host" && b.owner === "guest") ||
          (a.owner === "guest" && b.owner === "host");
 }
@@ -4594,6 +4889,37 @@ function applyTieControl() {
     net.localSeat = 0;
     net.remoteSeat = -1;
     net.spectating = false;
+    return;
+  }
+
+  /*
+    HUB SEATING. Each machine asks one question: is MY entrant in this tie?
+    If so it drives that seat and everything else is remote; if not it spectates.
+    Input from other machines is routed per-peer in netHandle, so `remoteSeat`
+    only matters for the single-peer fallback below.
+  */
+  if (netIsHub()) {
+    const mine = game.seats.indexOf(net.myEntrant);
+    if (mine >= 0) {
+      net.localSeat = mine;
+      net.remoteSeat = 1 - mine;
+      net.spectating = false;
+    } else {
+      net.localSeat = -1;
+      net.remoteSeat = -1;
+      net.spectating = true;           // this machine is not in this tie
+    }
+    // A seat nobody is connected for is played by the computer, so a bracket
+    // with empty slots still runs.
+    for (let s = 0; s < 2; s++) {
+      const e = entrantById(game.seats[s]);
+      if (!e) continue;
+      const remote = !!peerByEntrant(e.id);
+      const isMine = e.id === net.myEntrant;
+      if (!remote && !isMine) game.cpu[s] = true;
+    }
+    // Only the host simulates, so only the host runs those CPUs.
+    if (netIsGuest()) game.cpu = [false, false];
     return;
   }
 
@@ -5100,6 +5426,34 @@ function updateOnline(dt) {
   if (net.state === "idle" || net.state === "failed") {
     if (hit("KeyH")) { netHost(); return; }
     if (hit("KeyJ")) { net.state = "await-offer"; net.paste = ""; return; }
+    // A lobby hosts a whole tournament rather than a single opponent.
+    if (hit("KeyL")) {
+      net.role = "host";
+      net.active = true;
+      net.localSeat = 0;
+      net.remoteSeat = 1;
+      net.myEntrant = 0;
+      game.mode = MODE.TOURNAMENT;
+      netOpenSlot();
+      return;
+    }
+  }
+
+  /*
+    LOBBY. The host pastes each joiner's answer as it arrives; every accepted
+    answer seats that player and rolls the code on for the next one. START is
+    host-only — a joiner pressing it would build a rival bracket of its own.
+  */
+  if (net.state === "lobby" && netIsHost()) {
+    if (net.paste && hit("Enter")) { netAcceptJoiner(net.paste); net.paste = ""; return; }
+    if (kickHit(0) || hit("Space")) {
+      if (net.peers.length === 0) {
+        net.error = "nobody has joined yet";
+        return;
+      }
+      startLobbyTournament();
+      return;
+    }
   }
 
   // Waiting for the user to paste the other side's code.
@@ -5136,6 +5490,33 @@ function updateOnline(dt) {
     netSendConfig();
     return;
   }
+}
+
+/**
+ * HOST: begin the tournament with whoever is in the lobby.
+ *
+ * The bracket is sized to the people present, rounded up to leave room for the
+ * CPUs that fill any unclaimed slot, so a half-full lobby still plays.
+ */
+function startLobbyTournament() {
+  if (!netIsHost()) return;                 // host-authoritative, always
+  game.mode = MODE.TOURNAMENT;
+  game.entrantCount = clamp(net.peers.length + 1, TOURN_MIN, TOURN_MAX);
+  game.rosterNames = [];
+  game.rosterCpu = [];
+  for (let i = 0; i < game.entrantCount; i++) {
+    if (i === 0) {
+      game.rosterNames.push(cleanName(game.names[0], "PLAYER 1"));
+      game.rosterCpu.push(false);
+    } else {
+      const peer = peerByEntrant(i);
+      game.rosterNames.push(peer ? cleanName(peer.name, `PLAYER ${i + 1}`)
+                                 : `CPU ${i}`);
+      game.rosterCpu.push(!peer);
+    }
+  }
+  netSendConfig();
+  startTournament();
 }
 
 /** Roster screen: name every tournament entrant before the bracket begins. */
@@ -7336,7 +7717,7 @@ function drawOnline() {
 
   // ---- role picker ------------------------------------------------------
   if (net.state === "idle" || net.state === "failed") {
-    card(104, 240, "#7dd3fc");
+    card(104, 270, "#7dd3fc");
     text("Who are you?", W / 2, 134, 18, "#e8f1ff", "center", 800);
 
     const opt = (y, key, title, blurb, colour) => {
@@ -7353,13 +7734,15 @@ function drawOnline() {
       text(title, bx + 84, y + 24, 15, "#e8f1ff", "left", 800);
       text(blurb, bx + 84, y + 44, 11, "#8fa3c0", "left", 600);
     };
-    opt(154, "H", "HOST the match", "you run the game — best on the faster connection", "#4ade80");
-    opt(226, "J", "JOIN a match", "paste the code your friend sends you", "#fbbf24");
+    opt(150, "H", "HOST a match", "one opponent — you run the game", "#4ade80");
+    opt(218, "L", "HOST a TOURNAMENT",
+        `up to ${TOURN_MAX} players, each on their own computer`, "#a78bfa");
+    opt(286, "J", "JOIN", "paste the code the host sends you", "#fbbf24");
 
     text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
-         W / 2, 372, 12, "#7dd3fc", "center", 700);
-    text("change it on the setup screen · both players need this file open",
-         W / 2, 392, 11, "#6b819e", "center", 600);
+         W / 2, 386, 12, "#7dd3fc", "center", 700);
+    text("change it on the setup screen · everyone needs this file open",
+         W / 2, 406, 11, "#6b819e", "center", 600);
   }
 
   if (net.state === "creating") {
@@ -7442,6 +7825,51 @@ function drawOnline() {
     } else {
       text("waiting for the host to start…", W / 2, 300, 15, "#7dd3fc", "center", 800);
       text("you play with the ARROW keys and ENTER", W / 2, 324, 11, "#8fa3c0", "center", 600);
+    }
+  }
+
+  /*
+    LOBBY: the join code plus everyone who has arrived. Drawn in the band below
+    the card, which is unused in every other state.
+  */
+  if (net.state === "lobby") {
+    card(112, 250, "#a78bfa");
+    text("TOURNAMENT LOBBY", W / 2, 136, 18, "#a78bfa", "center", 900);
+    const used = codePanel(156, net.offerText,
+                           "CODE FOR THE NEXT PLAYER",
+                           "PRESS C TO COPY, THEN SEND IT");
+    pastePanel(156 + used, "PASTE THEIR REPLY AND PRESS ENTER");
+
+    // Who is in.
+    const seats = clamp(net.peers.length + 1, TOURN_MIN, TOURN_MAX);
+    text(`${net.peers.length + 1} of ${TOURN_MAX} PLAYERS`, W / 2, 384, 10,
+         "#7dd3fc", "center", 900);
+    const rowH = 20, listTop = 400;
+    for (let i = 0; i < seats; i++) {
+      const peer = i === 0 ? null : peerByEntrant(i);
+      const mine = i === 0;
+      const label = mine ? cleanName(game.names[0], "PLAYER 1")
+                         : peer ? cleanName(peer.name || "", `PLAYER ${i + 1}`)
+                                : `CPU ${i}`;
+      const tag = mine ? "you (host)" : peer ? "connected" : "computer";
+      const col = mine ? "#4ade80" : peer ? "#ffffff" : "#6b819e";
+      const y = listTop + i * rowH;
+      if (y > H - 60) break;                 // never spill off the screen
+      text(`${i + 1}.`, W / 2 - 150, y, 10, "#5f7391", "left", 800);
+      text(label, W / 2 - 126, y, 11, col, "left", 800);
+      text(tag, W / 2 + 150, y, 9, col, "right", 600);
+    }
+    /*
+      Keep the footer clear of the last row. A full eight-player list ends at
+      y=540 and the naive `+6` put this line at 548 — overlapping it.
+    */
+    const bottom = Math.min(listTop + seats * rowH + 14, H - 46);
+    text(net.peers.length
+           ? "press F to start the tournament  ·  the host must stay connected"
+           : "waiting for the first player to join",
+         W / 2, bottom, 10, net.peers.length ? "#fbbf24" : "#6b819e", "center", 700);
+    if (net.joinNoteT > 0 && net.joinNote) {
+      text(net.joinNote, W / 2, 370, 10, "#4ade80", "center", 800);
     }
   }
 
@@ -8373,6 +8801,12 @@ function drawBracket() {
     if (champ) text(champ.name, cx, ty + 18, 10, "#fde047", "center", 900);
   }
 
+  // Carry the join/drop notice onto the bracket too, so a player who leaves
+  // between ties is not silently replaced by a CPU.
+  if (net.joinNoteT > 0 && net.joinNote) {
+    text(net.joinNote, W / 2, 108, 10, "#fbbf24", "center", 800);
+  }
+
   const msg = alive.length <= 1 ? "press kick to crown the champion"
                                 : "press kick to play the next tie";
   const canRoll = game.round === 1 && game.tieIndex === 0 && !game.lastResult &&
@@ -8721,6 +9155,25 @@ function drawSelect() {
 }
 
 function drawOverlays() {
+  /*
+    Someone joined or dropped. Shown HERE, over live play, because a drop used to
+    surface only on the ONLINE screen — which nobody is looking at mid-match, so
+    a player vanishing was completely silent.
+  */
+  if (net.joinNoteT > 0 && net.joinNote) {
+    const a = clamp(net.joinNoteT / 0.6, 0, 1);
+    ctx.globalAlpha = a;
+    const bw = 420, bh = 30, bx = (W - bw) / 2, by = 66;
+    ctx.fillStyle = "rgba(6,12,22,0.88)";
+    roundRect(bx, by, bw, bh, 8);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(251,191,36,0.55)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    text(net.joinNote, W / 2, by + 15, 11, "#fbbf24", "center", 800);
+    ctx.globalAlpha = 1;
+  }
+
   // New-gravity banner, shown over the countdown after a goal.
   if (game.gravAnnounce > 0 && game.gravMul !== 1) {
     const band = gravBand(game.gravMul);
