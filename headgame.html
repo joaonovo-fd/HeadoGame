@@ -1492,6 +1492,7 @@ const music = {
   step: 0,            // eighth-note counter
   nextTime: 0,
   failed: false,      // audio unavailable; stop trying
+  live: 0,            // notes scheduled but not yet released, for the tests
 };
 
 const midiToHz = (n) => 440 * Math.pow(2, (n - 69) / 12);
@@ -1532,7 +1533,28 @@ function musicNote(midi, when, dur, level, type) {
     osc.connect(g);
     g.connect(music.master);
     osc.start(when);
-    osc.stop(when + dur + 0.02);
+    const endsAt = when + dur + 0.02;
+    osc.stop(endsAt);
+
+    /*
+      RELEASE THE NODES when the note finishes.
+
+      osc.stop() silences an oscillator but does not detach it: the gain node
+      stays wired to the master for the life of the page. At ~230 notes a minute
+      that left roughly 470 dead nodes per minute connected to a graph the audio
+      thread walks every render quantum, so the page grew steadily more stuttery
+      the longer it was open and only a reload cleared it.
+
+      onended fires after stop(), which is the moment it is safe to unwire. The
+      handler is also the only strong reference left, so both nodes become
+      collectable as soon as it runs.
+    */
+    osc.onended = () => {
+      try { osc.disconnect(); } catch (e) { /* already gone */ }
+      try { g.disconnect(); } catch (e) { /* already gone */ }
+      music.live = Math.max(0, music.live - 1);
+    };
+    music.live++;
   } catch (e) {
     // A scheduling failure must not take the game with it.
   }
@@ -1611,6 +1633,11 @@ function musicStop() {
   } catch (e) { /* ignore */ }
   music.started = false;
   music.track = null;
+  /*
+    Notes already scheduled release themselves through their own onended, so
+    nothing is force-disconnected here — cutting them off early would clip the
+    fade. The counter is left alone for the same reason.
+  */
 }
 
 /** Which track suits the current scene? */
@@ -3953,6 +3980,25 @@ function releaseCPUKeys() {
 */
 
 const NET_SNAP_HZ = 30;        // host snapshot rate
+/*
+  A jump larger than this between two snapshots is a TELEPORT, not movement, so
+  it is applied outright instead of being smoothed. Without this, a kickoff reset
+  or a goal would slide everything across the pitch over a third of a second.
+  Set above the furthest anything travels in one snapshot interval at full pace.
+*/
+const NET_SNAP_CUT = 220;
+/*
+  How far BEHIND the newest snapshot the guest renders, as a multiple of the send
+  interval. This is the interpolation buffer: the guest draws a moment that is
+  already bracketed by two received snapshots, so there is always real data on
+  both sides and never a gap to guess at.
+
+  A little over one interval absorbs ordinary jitter. Larger is smoother but
+  adds input latency, which matters because the guest also plays.
+*/
+const NET_LERP_DELAY = 1.6;
+/* Snapshots kept for interpolation. Enough to cover the delay plus jitter. */
+const NET_SNAP_BUF = 12;
 const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
@@ -3972,7 +4018,11 @@ const net = {
   sendAcc: 0,             // snapshot rate limiter
   snapPrev: null,         // guest: previous snapshot (for interpolation)
   snapNext: null,         // guest: latest snapshot
-  snapT: 0,               // guest: interpolation progress
+  snapBuf: [],            // guest: recent snapshots, each stamped with .at
+  renderT: 0,             // guest: local render clock, trails the newest snapshot
+  snapT: 0,               // guest: unused by the buffer, kept for the tests
+  snapGap: 1 / NET_SNAP_HZ,
+  snapAt: 0,
   pingMs: 0,
   copied: false,
   spectating: false,     // guest watching a tie it is not playing
@@ -3999,7 +4049,11 @@ function netReset() {
   net.paste = "";
   net.error = "";
   net.snapPrev = net.snapNext = null;
+  net.snapBuf = [];
+  net.renderT = 0;
   net.snapT = 0;
+  net.snapGap = 1 / NET_SNAP_HZ;
+  net.snapAt = 0;
   net.copied = false;
 }
 
@@ -4147,14 +4201,46 @@ function netSnapshot() {
     gf: game.goalFx,
     ch: game.chaos ? Math.ceil(game.chaosT) : -1,
     sd: game.suddenDeath,
+    /*
+      Walls and built platforms. These were missing from the snapshot entirely,
+      so on the guest's screen they simply did not exist: invisible, and the ball
+      appeared to bounce off nothing. Sent as plain geometry plus the fields the
+      renderer needs — the guest runs no physics, so hp/cooldowns stay host-side.
+    */
+    wl: game.walls.map((w) => [
+      Math.round(w.x), Math.round(w.y), Math.round(w.w), Math.round(w.h),
+      w.owner, w.platform ? 1 : 0, round(w.life), w.hp,
+      round(w.born), w.grounded ? 1 : 0,
+    ]),
   };
 }
 
-/** GUEST: adopt a snapshot for rendering. Never runs physics. */
+/**
+ * GUEST: adopt a snapshot. Never runs physics.
+ *
+ * Scalar state (score, clock, scene) is applied immediately; POSITIONS are not.
+ * Snapshots arrive at NET_SNAP_HZ, well under the display rate, so writing
+ * positions straight in left the guest's world frozen on roughly half of all
+ * rendered frames and then jumping twice as far — the reported lag. Instead the
+ * last two snapshots are kept and netInterpolate() walks between them every
+ * frame, so motion is continuous at whatever rate the screen runs.
+ */
 function netApplySnapshot(s) {
-  net.snapPrev = net.snapNext;
+  /*
+    Stamp the snapshot with its arrival time and keep it in a short buffer. The
+    renderer then asks for "the world as it was at time X" for an X that trails
+    the newest arrival, so position is a continuous function of the clock.
+
+    An earlier version restarted a 0..1 blend on every packet. That structurally
+    could not work: at 60fps against a 30Hz stream the blend only ever reached
+    0.74 before the next packet reset it, so a quarter of every window's travel
+    was discarded and reappeared as a jump.
+  */
+  s.at = netClock();
+  net.snapBuf.push(s);
+  while (net.snapBuf.length > NET_SNAP_BUF) net.snapBuf.shift();
+  net.snapPrev = net.snapBuf[net.snapBuf.length - 2] || null;
   net.snapNext = s;
-  net.snapT = 0;
 
   game.scene = s.sc;
   game.score = s.sr;
@@ -4171,11 +4257,12 @@ function netApplySnapshot(s) {
   game.chaos = s.ch >= 0;
   if (s.ch >= 0) game.chaosT = s.ch;
 
-  game.ball.x = s.b[0];
-  game.ball.y = s.b[1];
-  game.ball.r = s.b[2];
-
-  // Players exist locally only as render shells; the host owns their state.
+  /*
+    Make sure the render shells exist and carry the right team, then place
+    everything from THIS snapshot. On the first snapshot there is nothing to
+    interpolate from, so the world is simply seeded; afterwards netInterpolate
+    overwrites these positions every frame with a blend.
+  */
   for (let i = 0; i < 2; i++) {
     const d = s.p[i];
     if (!d) continue;
@@ -4183,9 +4270,10 @@ function netApplySnapshot(s) {
       game.players[i] = new Player(i, TEAMS[d[7]] || TEAMS[0]);
     }
     const pl = game.players[i];
-    pl.x = d[0]; pl.y = d[1]; pl.r = d[2]; pl.facing = d[3];
+    pl.facing = d[3];
     pl.kickT = d[4] / 100; pl.stun = d[5] / 100; pl.ammo = d[6];
   }
+  netPlaceFrom(s);
 
   game.powerups = s.pu.map(([x, y, type]) => ({ x, y, type, life: 9, bob: 0 }));
   game.mines = s.mn.map(([x, y, arm]) => ({ x, y, arm, life: 9, pulse: 0 }));
@@ -4195,6 +4283,137 @@ function netApplySnapshot(s) {
   game.bullets = s.bl.map(([x, y, dir, owner]) => ({
     x, y, vx: dir * BULLET_SPD, vy: 0, r: BULLET_R, life: 1, owner,
   }));
+  /*
+    Walls, rebuilt from the host's geometry. Older hosts send no `wl` field, so
+    an absent one leaves the guest's walls untouched rather than clearing them.
+  */
+  if (Array.isArray(s.wl)) {
+    game.walls = s.wl.map(([x, y, w, h, owner, platform, life, hp, born, grounded]) => ({
+      x, y, w, h, owner,
+      platform: !!platform,
+      grounded: !!grounded,
+      kind: "solid",
+      life, hp, born,
+      hitCD: 0, kickFlash: 0,
+    }));
+  }
+}
+
+/** Seconds on a monotonic clock, for measuring snapshot arrival gaps. */
+function netClock() {
+  try { return performance.now() / 1000; } catch (e) { return 0; }
+}
+
+/** GUEST: place ball, players and walls exactly as one snapshot describes. */
+function netPlaceFrom(s) {
+  game.ball.x = s.b[0];
+  game.ball.y = s.b[1];
+  game.ball.r = s.b[2];
+  for (let i = 0; i < 2; i++) {
+    const d = s.p[i];
+    if (!d || !game.players[i]) continue;
+    game.players[i].x = d[0];
+    game.players[i].y = d[1];
+    game.players[i].r = d[2];
+  }
+}
+
+/**
+ * GUEST: render the world as it was a fixed moment ago.
+ *
+ * Called once per frame. The target time trails the newest snapshot by
+ * NET_LERP_DELAY intervals, so it almost always falls BETWEEN two snapshots that
+ * have already arrived — real data on both sides, nothing extrapolated. That
+ * makes the drawn position a continuous function of the wall clock rather than a
+ * series of per-packet blends, which is what removes the stutter.
+ */
+function netInterpolate(dt) {
+  const buf = net.snapBuf;
+  if (buf.length === 0) return;
+  if (buf.length === 1) { netPlaceFrom(buf[0]); return; }
+
+  const newest = buf[buf.length - 1];
+  /*
+    The render target advances with the LOCAL clock, not with snapshot arrivals.
+
+    Deriving it from the newest arrival was the bug: the target then only changed
+    when a packet landed, so between packets it was frozen and the guest redrew
+    the identical position — motion in 30Hz steps, which is the stutter itself.
+
+    net.renderT is a local clock kept a fixed delay behind the newest snapshot. It
+    ticks every frame by dt, and is nudged back toward the ideal offset whenever
+    it drifts, so a slow or bursty stream corrects itself without a visible jump.
+  */
+  const ideal = newest.at - (1 / NET_SNAP_HZ) * NET_LERP_DELAY;
+  if (!net.renderT) {
+    net.renderT = ideal;
+  } else {
+    net.renderT += dt;
+    /*
+      Drift correction. Falling behind the ideal point means the buffer is growing
+      and latency is climbing; running ahead means the guest is about to starve.
+      Either way, ease toward the ideal rather than snapping to it.
+    */
+    const drift = ideal - net.renderT;
+    if (Math.abs(drift) > 1 / NET_SNAP_HZ * 3) {
+      net.renderT = ideal;                 // way out: resynchronise outright
+    } else {
+      net.renderT += drift * clamp(dt * 4, 0, 1);
+    }
+  }
+  const target = net.renderT;
+
+  // Find the pair that brackets the target time.
+  let a = null, b = null;
+  for (let i = buf.length - 1; i > 0; i--) {
+    if (buf[i - 1].at <= target && target <= buf[i].at) {
+      a = buf[i - 1]; b = buf[i];
+      break;
+    }
+  }
+  if (!a) {
+    /*
+      The target is outside the buffer. Older than everything held means the
+      guest has fallen behind (a long stall), so show the oldest frame it has;
+      newer than everything means the buffer is still filling, so hold the
+      newest. Either way, never extrapolate — a guessed position overshoots and
+      snaps back, which reads worse than being slightly behind.
+    */
+    netPlaceFrom(target < buf[0].at ? buf[0] : newest);
+    return;
+  }
+
+  const span = b.at - a.at;
+  const t = span > 1e-6 ? clamp((target - a.at) / span, 0, 1) : 1;
+  const mix = (u, v) => u + (v - u) * t;
+  const jumped = (dx, dy) => Math.hypot(dx, dy) > NET_SNAP_CUT;
+
+  /*
+    A teleport — a kickoff reset, a goal, a scene change — must not be smeared
+    across the interpolation window. Past NET_SNAP_CUT the move is a cut and is
+    applied outright.
+  */
+  if (jumped(b.b[0] - a.b[0], b.b[1] - a.b[1])) {
+    game.ball.x = b.b[0];
+    game.ball.y = b.b[1];
+    game.ball.r = b.b[2];
+  } else {
+    game.ball.x = mix(a.b[0], b.b[0]);
+    game.ball.y = mix(a.b[1], b.b[1]);
+    game.ball.r = mix(a.b[2], b.b[2]);
+  }
+
+  for (let i = 0; i < 2; i++) {
+    const pa = a.p[i], pb = b.p[i], pl = game.players[i];
+    if (!pa || !pb || !pl) continue;
+    if (jumped(pb[0] - pa[0], pb[1] - pa[1])) {
+      pl.x = pb[0]; pl.y = pb[1]; pl.r = pb[2];
+    } else {
+      pl.x = mix(pa[0], pb[0]);
+      pl.y = mix(pa[1], pb[1]);
+      pl.r = mix(pa[2], pb[2]);
+    }
+  }
 }
 
 function netHandle(msg) {
@@ -5301,6 +5520,18 @@ function step(dt) {
     if (game.gravAnnounce > 0) game.gravAnnounce = Math.max(0, game.gravAnnounce - dt);
     if (game.chaosAnnounce > 0) game.chaosAnnounce = Math.max(0, game.chaosAnnounce - dt);
     updateParticles(dt);
+    /*
+      Walk between the last two snapshots so the world moves every frame instead
+      of only when a packet lands. Goals and built walls also animate locally —
+      their motion is cosmetic and driven by a clock, so running it here costs
+      nothing and stops them stuttering at the snapshot rate.
+    */
+    netInterpolate(dt);
+    goalPhase += dt;
+    for (const w of game.walls) {
+      w.born = Math.min(1, w.born + dt * 6);
+      if (w.life > 0) w.life -= dt;      // host still owns removal
+    }
     for (const k in pressed) { /* consumed by gatherIntent */ }
     return;
   }
@@ -10987,14 +11218,59 @@ function runTests() {
     {
       net.active = true; net.role = "guest"; net.localSeat = 1; net.remoteSeat = 0;
       game.scene = SCENE.PLAY;
+
+      /*
+        The rule is that a guest never SIMULATES — not that its ball never moves.
+        Since the guest interpolates between snapshots it does move every frame,
+        which is the point; what must never happen is the guest integrating
+        physics of its own.
+
+        With no snapshots buffered there is nothing to interpolate toward, so a
+        ball given a velocity must stay exactly where it is. An earlier version of
+        this asserted "the ball did not move" while snapshots from the previous
+        block were still loaded, so it began failing the moment interpolation
+        started working — the assertion, not the code, was wrong.
+      */
+      net.snapBuf = [];
+      net.snapPrev = net.snapNext = null;
+      net.renderT = 0;
       game.ball.x = 500; game.ball.y = 100;
       game.ball.vx = 400; game.ball.vy = 0;
       const x0 = game.ball.x, y0 = game.ball.y;
       for (let i = 0; i < 120; i++) step(DT);
-      ok("a guest does not simulate the ball",
+      ok("a guest runs no physics of its own",
          game.ball.x === x0 && game.ball.y === y0,
          `moved to ${game.ball.x},${game.ball.y}`);
+      ok("and gravity never touches the guest's ball", game.ball.vy === 0,
+         `vy ${game.ball.vy}`);
       ok("a guest does not score on its own", game.scene === SCENE.PLAY);
+
+      /*
+        With snapshots buffered the guest MUST move, every frame — that is the
+        smoothness fix. Two snapshots a known distance apart, then step and check
+        the ball travels between them without ever passing the newer one.
+      */
+      {
+        const mk = (bx, at) => {
+          const snap = netSnapshot();
+          snap.b = [bx, 200, BALL_R];
+          snap.at = at;
+          return snap;
+        };
+        net.snapBuf = [mk(300, 0), mk(400, 1 / NET_SNAP_HZ)];
+        net.renderT = 0;
+        game.ball.vx = 0; game.ball.vy = 0;
+        const seen = [];
+        for (let i = 0; i < 6; i++) { step(DT); seen.push(game.ball.x); }
+        const moved = seen.some((x, i) => i > 0 && x !== seen[i - 1]);
+        ok("a guest with buffered snapshots moves every frame", moved,
+           seen.map((x) => x.toFixed(1)).join(","));
+        ok("and stays within the two snapshots it is blending",
+           seen.every((x) => x >= 300 - 1 && x <= 400 + 1),
+           seen.map((x) => x.toFixed(1)).join(","));
+        net.snapBuf = [];
+        net.renderT = 0;
+      }
     }
 
     // ---- the host maps a remote input byte onto the remote seat ----
@@ -16331,6 +16607,175 @@ function runTests() {
     }
 
     Object.assign(game, saved);
+  }
+
+  // 19aq. Multiplayer smoothness, wall sync, and the audio-node leak.
+  {
+    const saved = { mode: game.mode, scene: game.scene, players: game.players,
+                    ball: game.ball, walls: game.walls, cpu: [...game.cpu] };
+    const savedNet = { ...net };
+
+    // ---- walls must travel to the guest ----------------------------------
+    {
+      net.active = false; net.role = null;
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, false];
+      game.sel = [0, 3];
+      startMatch();
+
+      const pl = game.players[0];
+      game.walls = [];
+      pl.wallCharges = 5; pl.wallCD = 0;
+      pl.x = W * 0.35; pl.y = GROUND_Y - pl.r; pl.facing = 1;
+      const built = buildWall(pl);
+      ok("a wall exists to send", !!built);
+
+      const snap = netSnapshot();
+      ok("the snapshot carries walls", Array.isArray(snap.wl) && snap.wl.length === 1,
+         JSON.stringify(snap.wl));
+
+      // Apply it as a guest and confirm the wall arrives intact.
+      net.active = true; net.role = "guest"; net.localSeat = 1; net.remoteSeat = 0;
+      game.walls = [];
+      netApplySnapshot(snap);
+      ok("the guest receives the wall", game.walls.length === 1,
+         `${game.walls.length}`);
+      if (game.walls.length === 1) {
+        const w = game.walls[0];
+        ok("the guest's wall has the host's geometry",
+           Math.abs(w.x - built.x) <= 1 && Math.abs(w.y - built.y) <= 1 &&
+           w.w === built.w && w.h === built.h,
+           `${w.x},${w.y} ${w.w}x${w.h} vs ${built.x},${built.y} ${built.w}x${built.h}`);
+        ok("the guest knows whose wall it is", w.owner === built.owner);
+        ok("the guest knows if it is a platform", w.platform === built.platform);
+        ok("the guest knows if it is grounded", w.grounded === built.grounded);
+        // It must be renderable, or it is invisible on the client.
+        drawProbe.walls = 0;
+        drawWalls();
+        ok("the guest actually paints the wall", drawProbe.walls === 1,
+           `${drawProbe.walls}`);
+      }
+
+      // A host that sends no wall field must not wipe the guest's walls.
+      {
+        const older = netSnapshot();
+        delete older.wl;
+        const before = game.walls.length;
+        netApplySnapshot(older);
+        ok("a snapshot with no wall field leaves walls alone",
+           game.walls.length === before, `${before} -> ${game.walls.length}`);
+      }
+      game.walls = [];
+    }
+
+    // ---- the guest interpolates, so it moves every frame -----------------
+    {
+      net.active = true; net.role = "guest"; net.localSeat = 1; net.remoteSeat = 0;
+      game.scene = SCENE.PLAY;
+
+      const mk = (bx, by, at) => {
+        const snap = netSnapshot();
+        snap.b = [bx, by, BALL_R];
+        snap.at = at;
+        return snap;
+      };
+      const gap = 1 / NET_SNAP_HZ;
+      /*
+        A CONTINUOUS stream on a straight line, fed as the clock advances — the
+        way a real host sends. A fixed handful of snapshots is not enough: the
+        guest renders a delay behind, so a short buffer runs dry mid-test and the
+        starved tail looks exactly like the stutter being tested for.
+      */
+      const SPEED = 1800;                  // px per second along the line
+      let sent = 0, world = 0;
+      net.snapBuf = [];
+      net.renderT = 0;
+      game.ball.vx = 0; game.ball.vy = 0;
+      // Prime the buffer so the first frame already has data on both sides.
+      for (let k = 0; k < 4; k++) {
+        net.snapBuf.push(mk(200 + SPEED * world, 300, world));
+        world += gap;
+        sent++;
+      }
+
+      const xs = [];
+      let localT = 0;
+      for (let i = 0; i < 40; i++) {
+        step(DT);
+        localT += DT;
+        // Keep the stream running: send whenever the clock passes the next slot.
+        while (world <= localT + gap * 2) {
+          net.snapBuf.push(mk(200 + SPEED * world, 300, world));
+          while (net.snapBuf.length > NET_SNAP_BUF) net.snapBuf.shift();
+          world += gap;
+          sent++;
+        }
+        xs.push(game.ball.x);
+      }
+      ok("the test fed a continuous stream", sent >= 10, `${sent} snapshots`);
+
+      // Every frame must move: that is the whole fix.
+      let still = 0;
+      for (let i = 1; i < xs.length; i++) if (Math.abs(xs[i] - xs[i - 1]) < 1e-9) still++;
+      ok("the guest's world moves on every frame", still === 0,
+         `${still} of ${xs.length - 1} frames frozen`);
+
+      // Monotonic along the line, never past the newest snapshot.
+      let backwards = 0;
+      for (let i = 1; i < xs.length; i++) if (xs[i] < xs[i - 1] - 1e-6) backwards++;
+      ok("and never jerks backwards", backwards === 0, `${backwards} reversals`);
+      ok("and never overshoots the newest snapshot",
+         xs.every((x) => x <= 200 + SPEED * world + 1),
+         `max ${Math.max(...xs).toFixed(1)}`);
+
+      /*
+        Per-frame steps must be EVEN. This is what stutter actually is: the old
+        code wrote each snapshot straight in, so the guest sat still then jumped a
+        whole interval's travel at once.
+      */
+      const steps = [];
+      for (let i = 1; i < xs.length; i++) steps.push(xs[i] - xs[i - 1]);
+      const mean = steps.reduce((a, b) => a + b, 0) / steps.length;
+      const worst = Math.max(...steps.map((d) => Math.abs(d - mean)));
+      ok("the guest moves in even steps, not bursts", worst < mean * 1.5 + 0.5,
+         `mean ${mean.toFixed(2)}px, worst deviation ${worst.toFixed(2)}px`);
+
+      // A teleport must be applied as a cut, not smeared across the window.
+      {
+        net.snapBuf = [mk(200, 300, 0), mk(900, 300, gap)];
+        net.renderT = 0;
+        for (let i = 0; i < 4; i++) step(DT);
+        const onLine = game.ball.x > 250 && game.ball.x < 850;
+        ok("a teleport is cut, never interpolated", !onLine,
+           `ball at ${game.ball.x.toFixed(0)}`);
+      }
+      net.snapBuf = [];
+      net.renderT = 0;
+    }
+
+    // ---- the music must not leak audio nodes -----------------------------
+    {
+      /*
+        Every note used to leave its oscillator and gain connected to the master
+        for the life of the page — roughly 470 dead nodes a minute on a graph the
+        audio thread walks constantly, so the whole page grew steadily more
+        stuttery and only a reload cleared it. Notes must release themselves.
+      */
+      ok("a finished note releases its nodes",
+         /osc\.onended/.test(String(musicNote)), "no onended handler on a note");
+      ok("both nodes are disconnected, not just the oscillator",
+         /g\.disconnect\(\)/.test(String(musicNote)));
+
+      // And the release must be wired to note END, not to scheduling time.
+      const body = String(musicNote);
+      ok("the release is tied to the note ending",
+         body.indexOf("onended") > body.indexOf("osc.stop"),
+         "release is scheduled before the note stops");
+    }
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+    game.particles = [];
   }
 
   // 23. Determinism: identical initial conditions give identical results.
