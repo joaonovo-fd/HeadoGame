@@ -4028,6 +4028,12 @@ const NET_LERP_DELAY = 1.6;
 /* Snapshots kept for interpolation. Enough to cover the delay plus jitter. */
 const NET_SNAP_BUF = 12;
 const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
+/*
+  How often a machine with no seat to drive says "still here". Well inside
+  NET_TIMEOUT, and cheap: a spectator used to send nothing at all and was dropped
+  mid-tournament for the crime of watching.
+*/
+const NET_BEAT_HZ = 4;
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 const net = {
@@ -4047,6 +4053,8 @@ const net = {
   snapPrev: null,         // guest: previous snapshot (for interpolation)
   snapNext: null,         // guest: latest snapshot
   snapBuf: [],            // guest: recent snapshots, each stamped with .at
+  goalPhaseTarget: 0,     // guest: the host's goal clock, eased toward
+  goalPhaseHave: false,   // guest: has a goal clock arrived yet?
   renderT: 0,             // guest: local render clock, trails the newest snapshot
   snapT: 0,               // guest: unused by the buffer, kept for the tests
   snapGap: 1 / NET_SNAP_HZ,
@@ -4113,6 +4121,9 @@ function netReset() {
   net.snapPrev = net.snapNext = null;
   net.snapBuf = [];
   net.renderT = 0;
+  net.goalPhaseTarget = 0;
+  net.goalPhaseHave = false;
+  net.beatAcc = 0;
   net.snapT = 0;
   net.snapGap = 1 / NET_SNAP_HZ;
   net.snapAt = 0;
@@ -4155,6 +4166,24 @@ function netAttachChannel(chan, peer) {
   else net.chan = chan;
   chan.binaryType = "arraybuffer";
   chan.onopen = () => {
+    /*
+      A PEER connecting must not change the HOST's screen. `net.state` is this
+      machine's own connection state, and blindly setting it to "live" tore the
+      host out of its lobby the moment anybody joined: the join code and the
+      player list vanished, replaced by the two-player CONNECTED card — so no
+      further players could be added and START ran a 1v1 instead of the
+      tournament. The peer's own liveness is tracked on the peer.
+    */
+    if (peer) {
+      peer.state = "live";
+      peer.lastRecv = 0;
+      net.active = true;
+      net.error = "";
+      netSendHello();
+      // Tell this machine which entrant it plays, now that it can hear us.
+      if (peer.entrantId != null) netSendTo(peer, { t: "me", e: peer.entrantId });
+      return;
+    }
     net.state = "live";
     net.active = true;
     net.lastRecv = 0;
@@ -4165,7 +4194,11 @@ function netAttachChannel(chan, peer) {
     if (peer) { netDropPeer(peer); return; }
     if (net.state === "live") net.state = "closed";
   };
-  chan.onerror = () => { net.error = "connection error"; };
+  chan.onerror = () => {
+    // One peer erroring is that peer's problem, not the whole lobby's.
+    if (peer) { peer.state = "error"; return; }
+    net.error = "connection error";
+  };
   chan.onmessage = (e) => {
     net.lastRecv = 0;
     if (peer) peer.lastRecv = 0;
@@ -4262,6 +4295,17 @@ async function netAcceptJoiner(answerCode) {
     while (peerByEntrant(slot)) slot++;
     peer.entrantId = slot;
     net.peers.push(peer);
+    /*
+      Tell this machine which entrant it plays. The bracket message is a
+      broadcast, so it cannot carry a per-recipient answer; without this the
+      guest kept the default of 0 — the HOST's entrant — so it published input
+      for a seat it did not own, sent the host nothing it recognised, and was
+      timed out and replaced by a CPU six seconds into the first tie.
+
+      Sent on a short repeat as well as here, because this single packet landing
+      before the channel is fully open would otherwise be lost silently.
+    */
+    netSendTo(peer, { t: "me", e: slot });
     net.pending = null;
     net.error = "";
     netOpenSlot();                 // roll the code on for the next player
@@ -4418,6 +4462,14 @@ function netLocalSeat() {
 /** Compact snapshot of everything the guest needs in order to draw. */
 function netSnapshot() {
   const round = (v) => Math.round(v * 10) / 10;
+  /*
+    Rates need finer precision than positions. `round` keeps one decimal, which
+    is right for pixels but destroys a value like a goal speed of 0.55 — it
+    became 0.6, a 9% error in how fast the goal slides, compounding into ~20px of
+    disagreement about where the goal mouth was. Enough for a shot to score on
+    one screen and miss on the other.
+  */
+  const rate = (v) => Math.round(v * 10000) / 10000;
   return {
     t: "s",
     sc: game.scene,
@@ -4429,7 +4481,7 @@ function netSnapshot() {
       round(pl.kickT * 100), Math.round(pl.stun * 100), pl.ammo,
       TEAMS.indexOf(pl.team),
     ]),
-    gp: round(goalPhase),
+    gp: rate(goalPhase),
     gs: round(goalScale),
     tm: Math.round(game.clock * 10) / 10,
     cd: Math.round(game.timer * 10) / 10,
@@ -4443,6 +4495,21 @@ function netSnapshot() {
     gf: game.goalFx,
     ch: game.chaos ? Math.ceil(game.chaosT) : -1,
     sd: game.suddenDeath,
+    /*
+      WORLD GEOMETRY. The guest used to derive all of this locally, so it drew and
+      collided against a different arena from the one the host was simulating:
+      the map was never sent at all, and chaos re-rolls gravity and the goal
+      motion on the host only.
+
+      Sent every snapshot rather than once in `cfg`, so a guest that joins late
+      or drops a packet is corrected on the very next frame instead of playing a
+      whole match in the wrong arena.
+    */
+    mp: game.mapId,
+    gv: Math.round(gravity),
+    gt: rate(goalTravel),
+    gl: rate(goalSpeedL),
+    gr: rate(goalSpeedR),
     /*
       Walls and built platforms. These were missing from the snapshot entirely,
       so on the guest's screen they simply did not exist: invisible, and the ball
@@ -4469,6 +4536,18 @@ function netSnapshot() {
  */
 function netApplySnapshot(s) {
   /*
+    Adopt a number only if it is finite AND inside a sane range, otherwise keep
+    what is already in force.
+
+    `typeof NaN` is "number", so a plain type guard let NaN through and it STUCK:
+    goalTop() then returned NaN and the goal vanished from the guest's screen for
+    the rest of the match with no way to recover. A missing field is handled the
+    same way, so a snapshot from an older build still applies cleanly.
+  */
+  const numOr = (v, cur, lo, hi) =>
+    (typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi) ? v : cur;
+
+  /*
     Stamp the snapshot with its arrival time and keep it in a short buffer. The
     renderer then asks for "the world as it was at time X" for an X that trails
     the newest arrival, so position is a continuous function of the clock.
@@ -4494,10 +4573,43 @@ function netApplySnapshot(s) {
   game.winner = s.wn;
   game.goalFx = s.gf;
   game.suddenDeath = s.sd;
-  goalPhase = s.gp;
-  goalScale = s.gs;
+  /*
+    The host's goal clock. It is NOT written straight into `goalPhase`: the guest
+    ticks that locally every frame so the goals slide smoothly between snapshots,
+    and overwriting it 30 times a second dragged the phase backwards and forwards
+    — measured at up to 20px of disagreement on where the goal mouth actually
+    was, enough for a shot to score on one screen and not the other.
+
+    Instead the arriving value is remembered and `netSyncGoalPhase` eases the
+    local clock onto it. A large gap is snapped (a kickoff or a scene change);
+    ordinary drift is corrected gradually and invisibly.
+  */
+  net.goalPhaseTarget = numOr(s.gp, net.goalPhaseTarget, -1e7, 1e7);
+  if (net.goalPhaseHave !== true &&
+      typeof s.gp === "number" && Number.isFinite(s.gp)) {
+    net.goalPhaseHave = true;
+    goalPhase = s.gp;                    // first snapshot: adopt outright
+  }
+  // A bad scale would shrink the goal mouth to nothing, so bound it too.
+  goalScale = numOr(s.gs, goalScale, 0.05, 20);
   game.chaos = s.ch >= 0;
   if (s.ch >= 0) game.chaosT = s.ch;
+
+  /*
+    Adopt the host's world geometry.
+
+    Every value is bounds-checked, not merely type-checked: `typeof NaN` is
+    "number", so a plain type guard let NaN through and it STUCK — goalTop() then
+    returned NaN and the goal vanished from the guest's screen for the rest of the
+    match with no way to recover. `numOr` keeps the value already in force
+    whenever the arriving one is not a finite number inside a sane range, which
+    also covers a missing field from an older build.
+  */
+  if (typeof s.mp === "string" && mapById(s.mp)) game.mapId = s.mp;
+  gravity    = numOr(s.gv, gravity, 1, 20000);
+  goalTravel = numOr(s.gt, goalTravel, 0, GROUND_Y);
+  goalSpeedL = numOr(s.gl, goalSpeedL, -8, 8);
+  goalSpeedR = numOr(s.gr, goalSpeedR, -8, 8);
 
   /*
     Make sure the render shells exist and carry the right team, then place
@@ -4539,6 +4651,26 @@ function netApplySnapshot(s) {
       hitCD: 0, kickFlash: 0,
     }));
   }
+}
+
+/**
+ * GUEST: ease the local goal clock onto the host's.
+ *
+ * The goals must slide smoothly, so the guest runs its own clock; but it must
+ * also end up where the host says, or the goal mouth is drawn in the wrong
+ * place. Called once per frame after the local tick.
+ */
+function netSyncGoalPhase(dt) {
+  if (net.goalPhaseHave !== true) return;
+  const drift = net.goalPhaseTarget - goalPhase;
+  if (Math.abs(drift) > 0.5) {
+    goalPhase = net.goalPhaseTarget;     // a cut, not drift: adopt at once
+    return;
+  }
+  // Ease across, fast enough to stay within a pixel but slow enough to be
+  // invisible. The target also advances with the host, so this converges.
+  goalPhase += drift * clamp(dt * 8, 0, 1);
+  net.goalPhaseTarget += dt;             // the host's clock keeps running too
 }
 
 /** Seconds on a monotonic clock, for measuring snapshot arrival gaps. */
@@ -4689,6 +4821,14 @@ function netHandle(msg, peer) {
     game.chaos = msg.ch;
     game.sel = msg.sel;
     game.cpu = [false, false];
+    if (typeof msg.mp === "string" && mapById(msg.mp)) game.mapId = msg.mp;
+    if (msg.rl && typeof msg.rl === "object") {
+      // Only adopt keys the local build knows, so a newer host cannot inject
+      // unknown tunables into the rules object.
+      for (const k in game.rules) {
+        if (typeof msg.rl[k] === typeof game.rules[k]) game.rules[k] = msg.rl[k];
+      }
+    }
     return;
   }
   if (msg.t === "br" && netIsGuest()) {
@@ -4745,6 +4885,18 @@ function netHandle(msg, peer) {
     net.versionMismatch = net.peerVersion !== VERSION;
     return;
   }
+  if (msg.t === "me" && netIsGuest()) {
+    // Which entrant this machine plays. Bounded, because it indexes the bracket.
+    if (typeof msg.e === "number" && Number.isFinite(msg.e) &&
+        msg.e >= 0 && msg.e < TOURN_MAX) {
+      net.myEntrant = msg.e;
+      applyTieControl();               // re-seat now that we know who we are
+    }
+    return;
+  }
+  // A spectator's "still here". The clocks are already reset by the channel
+  // handler, so there is nothing more to do than not mistake it for rubbish.
+  if (msg.t === "ka") return;
   if (msg.t === "bye") { net.state = "closed"; return; }
 }
 
@@ -4782,8 +4934,24 @@ function netPump() {
   }
 
   if (netIsGuest()) {
-    // A spectator has no seat to drive, so it sends nothing at all.
-    if (net.spectating || net.localSeat < 0) return;
+    /*
+      A spectator has no seat to drive, but it must still SPEAK. Sending nothing
+      at all meant the host heard silence for the whole of any tie this machine
+      was not in — a CPU-vs-CPU tie, or two other people playing — and timed the
+      connection out after six seconds, dropping a player who was sitting there
+      perfectly happily. Watching is not the same as being gone.
+
+      So a spectator sends a heartbeat instead of input: cheap, and it carries no
+      seat, so it can never move anybody.
+    */
+    if (net.spectating || net.localSeat < 0) {
+      net.beatAcc = (net.beatAcc || 0) + DT;
+      if (net.beatAcc >= 1 / NET_BEAT_HZ) {
+        net.beatAcc = 0;
+        netSend({ t: "ka" });
+      }
+      return;
+    }
     netSend({ t: "i", b: packIntent(intent[net.localSeat]) });
     return;
   }
@@ -4806,6 +4974,11 @@ function netSendHello() {
 /** Host: push the whole bracket so the guest's screen follows along. */
 function netSendBracket() {
   if (!netIsHost()) return;
+  // Re-state each machine's own entrant: this is per-recipient, so it cannot
+  // ride in the broadcast below, and repeating it heals a lost "me" packet.
+  for (const p of net.peers) {
+    if (p.entrantId != null) netSendTo(p, { t: "me", e: p.entrantId });
+  }
   netSend({
     t: "br",
     en: game.entrants.map((e) => [e.id, e.name, e.teamIdx, e.alive ? 1 : 0, e.owner,
@@ -4827,6 +5000,11 @@ function netSendConfig() {
   netSend({
     t: "cfg", md: game.mode, g: game.goalsToWin,
     ts: game.matchSecs, ch: game.chaos, sel: game.sel,
+    // The arena, so the guest has it before the first snapshot lands.
+    mp: game.mapId,
+    // Spawn rates and world toggles: the host owns them, and a guest drawing
+    // power-ups it will never receive looks like a bug.
+    rl: game.rules ? { ...game.rules } : null,
   });
 }
 
@@ -4898,7 +5076,19 @@ function applyTieControl() {
     Input from other machines is routed per-peer in netHandle, so `remoteSeat`
     only matters for the single-peer fallback below.
   */
-  if (netIsHub()) {
+  /*
+    This branch is for a MULTIPLAYER TOURNAMENT on either machine — not just the
+    hub host. `netIsHub()` is false on a guest, because a guest has no peer table
+    of its own, so gating on it sent guests down the legacy owner-string path:
+    a guest playing its own tie was assigned seat 0 instead of its real seat,
+    which made `netPump` publish input for a seat it did not own and never send
+    anything the host recognised. The host then timed the guest out after six
+    seconds and replaced it with a CPU — the reported "it gets disconnected".
+
+    The right question is the same on every machine: is MY entrant in this tie?
+  */
+  const inTournament = game.mode === MODE.TOURNAMENT && net.myEntrant != null;
+  if (netIsHub() || inTournament) {
     const mine = game.seats.indexOf(net.myEntrant);
     if (mine >= 0) {
       net.localSeat = mine;
@@ -5501,7 +5691,18 @@ function updateOnline(dt) {
 function startLobbyTournament() {
   if (!netIsHost()) return;                 // host-authoritative, always
   game.mode = MODE.TOURNAMENT;
-  game.entrantCount = clamp(net.peers.length + 1, TOURN_MIN, TOURN_MAX);
+  /*
+    BRACKET SIZE. Two real people are enough to start; the rest of the bracket is
+    filled with CPUs so a small turnout still plays a proper tournament instead of
+    a single tie.
+
+    The player's chosen BRACKET SIZE from the setup menu is honoured whenever it
+    is large enough to seat everyone who actually turned up — so a host who asked
+    for eight gets eight, with computers making up the numbers.
+  */
+  const human = net.peers.length + 1;
+  game.entrantCount = clamp(Math.max(game.entrantCount, human, TOURN_MIN),
+                            TOURN_MIN, TOURN_MAX);
   game.rosterNames = [];
   game.rosterCpu = [];
   for (let i = 0; i < game.entrantCount; i++) {
@@ -5909,6 +6110,7 @@ function step(dt) {
     */
     netInterpolate(dt);
     goalPhase += dt;
+    netSyncGoalPhase(dt);
     for (const w of game.walls) {
       w.born = Math.min(1, w.born + dt * 6);
       if (w.life > 0) w.life -= dt;      // host still owns removal
@@ -17228,6 +17430,174 @@ function runTests() {
 
     Object.assign(net, savedNet);
     Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 19ar. The guest must inhabit the HOST's world, not one of its own.
+  {
+    const saved = { mode: game.mode, scene: game.scene, players: game.players,
+                    ball: game.ball, mapId: game.mapId, cpu: [...game.cpu],
+                    chaos: game.chaos, rules: { ...game.rules } };
+    const savedNet = { ...net };
+    const savedTun = getTunablesSnapshot ? getTunablesSnapshot() : null;
+
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, false];
+    game.sel = [0, 3];
+    startMatch();
+
+    /*
+      THE ARENA. The map was never sent at all, so a guest drew and collided
+      against different platforms from the ones the host was simulating — the
+      reported map desync. It rides in the snapshot rather than only in `cfg`, so
+      a guest that joins late or drops a packet is corrected on the next frame
+      instead of playing a whole match in the wrong arena.
+    */
+    {
+      game.mapId = "towers";
+      const snap = netSnapshot();
+      ok("the snapshot names the arena", snap.mp === "towers", `${snap.mp}`);
+      ok("the config names the arena too", (() => {
+        const sent = [];
+        const real = net.chan;
+        net.active = true; net.role = "host";
+        net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+        netSendConfig();
+        net.chan = real;
+        return sent.some((m) => m.t === "cfg" && m.mp === "towers");
+      })());
+
+      // A guest adopts it.
+      net.active = true; net.role = "guest";
+      net.localSeat = 1; net.remoteSeat = 0;
+      game.mapId = "classic";
+      netApplySnapshot(snap);
+      ok("a guest adopts the host's arena", game.mapId === "towers", game.mapId);
+      ok("and therefore the same platforms",
+         activePlatforms().length === mapById("towers").platforms.length,
+         `${activePlatforms().length}`);
+    }
+
+    /*
+      GOAL GEOMETRY. Chaos re-rolls gravity and the goal motion on the host only,
+      and the guest derived all of it locally. Worse, the rates were rounded to
+      one decimal — a goal speed of 0.55 arrived as 0.6, a 9% error that compounded
+      into ~20px of disagreement about where the goal mouth was. Enough for a shot
+      to score on one screen and miss on the other.
+    */
+    {
+      net.active = true; net.role = "host";
+      goalSpeedL = 0.55; goalSpeedR = 0.62; goalTravel = 67.25; gravity = 1487;
+      const snap = netSnapshot();
+      ok("goal rates survive the wire intact",
+         Math.abs(snap.gl - 0.55) < 1e-3 && Math.abs(snap.gr - 0.62) < 1e-3,
+         `${snap.gl}, ${snap.gr}`);
+      ok("goal travel survives the wire",
+         Math.abs(snap.gt - 67.25) < 0.01, `${snap.gt}`);
+      ok("gravity is sent", Math.abs(snap.gv - 1487) <= 1, `${snap.gv}`);
+
+      // A guest with different values adopts the host's.
+      net.role = "guest";
+      goalSpeedL = 0.2; goalSpeedR = 0.2; goalTravel = 10; gravity = 900;
+      netApplySnapshot(snap);
+      ok("a guest adopts the host's goal rates",
+         Math.abs(goalSpeedL - 0.55) < 1e-3 && Math.abs(goalSpeedR - 0.62) < 1e-3,
+         `${goalSpeedL}, ${goalSpeedR}`);
+      ok("a guest adopts the host's gravity", Math.abs(gravity - 1487) <= 1,
+         `${gravity}`);
+      ok("a guest adopts the host's goal travel",
+         Math.abs(goalTravel - 67.25) < 0.01, `${goalTravel}`);
+    }
+
+    /*
+      A snapshot must never poison the guest with a value it cannot recover from.
+      `typeof NaN` is "number", so a type-only guard let NaN through and it STUCK:
+      goalTop() returned NaN and the goal vanished for the rest of the match.
+    */
+    {
+      net.active = true; net.role = "guest";
+      goalSpeedL = 0.5; goalTravel = 70; gravity = 1500; goalScale = 1;
+      const good = { travel: goalTravel, spd: goalSpeedL, grav: gravity };
+      const base = netSnapshot();
+      const poison = { ...base, gv: NaN, gt: NaN, gl: NaN, gr: NaN,
+                       gp: NaN, gs: NaN };
+      let threw = null;
+      try { netApplySnapshot(poison); } catch (e) { threw = e.message; }
+      ok("a NaN-laden snapshot does not throw", !threw, threw || "");
+      ok("and NaN never reaches the goal tunables",
+         Number.isFinite(goalTravel) && Number.isFinite(goalSpeedL) &&
+         Number.isFinite(gravity) && Number.isFinite(goalScale),
+         `${goalTravel},${goalSpeedL},${gravity},${goalScale}`);
+      ok("the last good values are kept",
+         goalTravel === good.travel && goalSpeedL === good.spd &&
+         gravity === good.grav,
+         `${goalTravel},${goalSpeedL},${gravity}`);
+      ok("goalTop stays a real number", Number.isFinite(goalTop(0)),
+         `${goalTop(0)}`);
+
+      // Absurd-but-finite values are refused just as firmly.
+      netApplySnapshot({ ...base, gv: 1e12, gt: -500, gl: 99, gs: 0 });
+      ok("out-of-range geometry is refused",
+         gravity === good.grav && goalTravel === good.travel &&
+         goalSpeedL === good.spd && goalScale === 1,
+         `${gravity},${goalTravel},${goalSpeedL},${goalScale}`);
+
+      // A hostile map id must not stick either.
+      netApplySnapshot({ ...base, mp: "../../etc/passwd" });
+      ok("a bogus arena id is refused", !!mapById(game.mapId), game.mapId);
+    }
+
+    /*
+      A valid snapshot must actually APPLY. A reference used before its
+      declaration threw on every single snapshot while the whole suite stayed
+      green, because nothing asserted that applying one succeeds.
+    */
+    {
+      net.active = true; net.role = "host";
+      game.mapId = "terraces";
+      const snap = netSnapshot();
+      net.role = "guest";
+      game.mapId = "classic";
+      let threw = null;
+      try { netApplySnapshot(snap); } catch (e) { threw = e.message; }
+      ok("applying a normal snapshot never throws", !threw, threw || "");
+      ok("and it took effect", game.mapId === "terraces", game.mapId);
+    }
+
+    // Spawn rates are the host's to set, so a guest must adopt them.
+    {
+      net.active = true; net.role = "host";
+      const key = Object.keys(game.rules)[0];
+      const was = game.rules[key];
+      const sent = [];
+      const real = net.chan;
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      netSendConfig();
+      net.chan = real;
+      const cfg = sent.find((m) => m.t === "cfg");
+      ok("the config carries the world rules", !!(cfg && cfg.rl), JSON.stringify(cfg && cfg.rl));
+
+      net.role = "guest";
+      game.rules[key] = typeof was === "boolean" ? !was : was + 1;
+      netHandle(cfg);
+      ok("a guest adopts the host's rules", game.rules[key] === was,
+         `${game.rules[key]} vs ${was}`);
+
+      // But only keys it recognises, so a peer cannot inject tunables.
+      netHandle({ ...cfg, rl: { ...cfg.rl, evilKey: 999 } });
+      ok("unknown rule keys are ignored", game.rules.evilKey === undefined);
+    }
+
+    if (savedTun) {
+      gravity = savedTun.gravity ?? gravity;
+      goalTravel = savedTun.goalTravel ?? goalTravel;
+      goalSpeedL = savedTun.goalSpeedL ?? goalSpeedL;
+      goalSpeedR = savedTun.goalSpeedR ?? goalSpeedR;
+      goalScale = savedTun.goalScale ?? goalScale;
+    }
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
+    game.rules = saved.rules;
     game.particles = [];
   }
 
