@@ -653,6 +653,12 @@ const RULE_DEFS = [
     hint: "each team's signature ability" },
   { key: "superRate",  label: "SUPER CHARGE",   type: "mul",  min: 0.25, max: 3, step: 0.25,
     hint: "how fast a superpower meter fills" },
+  { key: "jetpack",    label: "3D JETPACK",     type: "flag",
+    hint: "hold jump in the air to fly, in 3D" },
+  { key: "walls3d",    label: "3D WALLS",       type: "flag",
+    hint: "build walls in the 3D arena" },
+  { key: "grab",       label: "3D GRAB",        type: "flag",
+    hint: "pick the ball up and throw it, in 3D" },
 ];
 
 /** Authored defaults, cloned into game.rules at boot. */
@@ -663,6 +669,8 @@ const RULE_DEFAULTS = {
   // Both new abilities default ON: they are meant to be part of the game rather
   // than an option to discover, and the rules screen can switch them off.
   dash: true, supers: true, superRate: 1,
+  // The 3D abilities, all on by default: they are part of how the mode plays.
+  jetpack: true, walls3d: true, grab: true,
 };
 
 const ruleDef = (key) => RULE_DEFS.find((r) => r.key === key);
@@ -2539,12 +2547,12 @@ const SCHEME_DEFAULTS = [
       player who prefers keys can simply bind them.
     */
     aimUp: "", aimDown: "", aimLeft: "", aimRight: "",
-    dash: "ShiftLeft", super: "KeyQ" },
+    dash: "ShiftLeft", super: "KeyQ", grab: "KeyE" },
   { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown",
     kick: "Enter", wall: "ShiftRight",
     // P2 has no mouse, so aim gets a key cluster beside the arrow keys.
     aimUp: "KeyI", aimDown: "KeyK", aimLeft: "KeyJ", aimRight: "KeyL",
-    dash: "ControlRight", super: "Slash" },
+    dash: "ControlRight", super: "Slash", grab: "Period" },
 ];
 const SCHEME = SCHEME_DEFAULTS.map((s) => ({ ...s }));
 
@@ -2559,6 +2567,7 @@ const ACTIONS = [
   // Dash and superpower work in every mode, so they sit with the 2D bindings.
   { key: "dash",  label: "DASH" },
   { key: "super", label: "SUPERPOWER" },
+  { key: "grab",  label: "3D GRAB / THROW" },
   /*
     3D-only actions. They sit at the end so the bindings players already know
     keep their row order, and they are labelled "3D" so nobody hunts for their
@@ -2717,6 +2726,10 @@ function pollPads(edge) {
       a.aimX = dz(rx) * STICK_SENS * DT;
       a.aimY = -dz(ry) * STICK_SENS * DT;      // stick down is aim down
       a.jump = anyOf(PAD_BTN.jump);
+      // Grab/throw on a face button, edge-detected like the rest.
+      const padGrab = btn(2) || btn(3);
+      a.grabEdge = edge && padGrab && !pads.prev[seat].grab;
+      if (edge) pads.prev[seat].grab = padGrab;
       /*
         In the arena the left stick must steer four-way movement, and jump has
         its own button — so `up` must NOT double as jump the way it does in the
@@ -2745,12 +2758,12 @@ const intent = [
     wallEdge: false,
     // Every mode: dash and superpower, both edge-triggered so one press is one use.
     dashEdge: false, superEdge: false,
-    // 3D arena only: aim deltas in radians for this step, plus its jump button.
-    aimX: 0, aimY: 0, jump: false },
+    // 3D arena only: aim deltas in radians, the jump button, and grab/throw.
+    aimX: 0, aimY: 0, jump: false, grabEdge: false },
   { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
     wallEdge: false,
     dashEdge: false, superEdge: false,
-    aimX: 0, aimY: 0, jump: false },
+    aimX: 0, aimY: 0, jump: false, grabEdge: false },
 ];
 
 /** Pack a seat's intent into one byte, for the network. */
@@ -2837,10 +2850,16 @@ function gatherIntent(edge) {
         a.aimX += d.dx * MOUSE_SENS;
         a.aimY -= d.dy * MOUSE_SENS;      // screen down is aim down
       }
-      // Jump reuses the wall key, which builds nothing in this mode.
-      a.jump = !!keys[S.wall];
+      /*
+        Jump gets its own key here rather than reusing the wall binding: walls are
+        buildable in this mode too, so the two cannot share. SPACE is the jump,
+        matching every other third-person game.
+      */
+      a.jump = !!keys.Space;
+      a.grabEdge = edge && hit(S.grab);
     } else {
       a.jump = false;
+      a.grabEdge = false;
     }
   }
 }
@@ -7238,6 +7257,51 @@ const A_KICK_UP = 0.34;       // fraction of a kick directed upward
 const A_KICK_REACH = 62;      // how far in front of the player a kick connects
 const A_KICK_CD = 0.32;
 const A_BALL_SPIN = 0.86;     // how much of the kicker's motion the ball carries
+
+/*
+  GRAB. Holding the ball rather than kicking it: it locks to a point ahead of the
+  chest and travels with you until you throw it, are knocked down, or the hold
+  timer runs out.
+
+  Deliberately time-limited. An unlimited carry turns 3D soccer into rugby and
+  removes any reason to pass, so a hold expires and the ball drops. The cooldown
+  after a throw stops grab-throw-grab being a faster dribble than dribbling.
+*/
+const A_GRAB_T = 3.2;         // seconds you may hold the ball
+const A_GRAB_CD = 1.1;        // before you may grab again
+const A_GRAB_REACH = 46;      // how close the ball must be to take hold
+const A_GRAB_FWD = 40;        // how far ahead of the chest it is carried
+const A_THROW_V = 1150;       // a thrown ball is faster than a kicked one
+const A_THROW_UP = 0.3;
+
+/*
+  JETPACK. Held thrust while fuel lasts, refilling on the ground. Its purpose in
+  a soccer mode is vertical reach — heading a high ball, or defending a lofted
+  shot — rather than flight, which is why fuel is short and thrust barely beats
+  gravity.
+*/
+const A_JET_MAX = 2.4;        // seconds of fuel
+const A_JET_THRUST = 2350;    // upward acceleration while held
+const A_JET_REFILL = 0.85;    // fuel per second, on the ground
+const A_JET_VMAX = 470;       // upward speed cap, so it cannot be ridden to orbit
+
+/*
+  WALLS. The 2D build mechanic, brought across: a slab raised in front of you that
+  blocks the ball and the opponent, decays on a timer and can be broken by a hard
+  shot. Charges recharge, so it is a rationed defensive tool rather than a way to
+  brick up your own goal — see arenaCanBuild for the goalmouth rule.
+*/
+const A_WALL_W = 190;         // across
+const A_WALL_H = 130;         // tall
+const A_WALL_D = 22;          // thick
+const A_WALL_LIFE = 9;        // seconds before it fades
+const A_WALL_HP = 3;          // hard hits it survives
+const A_WALL_CHARGES = 2;     // walls you may have standing at once
+const A_WALL_CD = 0.7;        // between builds
+const A_WALL_RECHARGE = 6;    // seconds to earn a charge back
+const A_WALL_AHEAD = 105;     // how far in front of the builder it stands
+const A_WALL_REST = 0.7;      // how bouncy it is
+const A_WALL_GOAL_GAP = 210;  // no wall closer than this to a goal line
 const FIGHTER_R = 26;         // collision radius
 const FIGHTER_H = 74;         // standing height, feet at y=0
 const EYE_H = 58;             // eye/muzzle height above the feet
@@ -7401,6 +7465,7 @@ function stepArenaBall(dt) {
   }
 
   ballVsArenaCover(b);
+  ballVsArenaWalls(b);
 }
 
 /** Bounce the ball off cover boxes, along the axis of least penetration. */
@@ -7506,6 +7571,226 @@ function kickArenaBall(f) {
   return true;
 }
 
+/* ---- grab and throw --------------------------------------------------- */
+
+/** Where a carried ball rides: ahead of the chest, along the look direction. */
+function carryPoint(f) {
+  const dir = aimRay(f);
+  return v3(f.x + dir.x * A_GRAB_FWD,
+            f.y + FIGHTER_H * 0.55 + dir.y * A_GRAB_FWD * 0.5,
+            f.z + dir.z * A_GRAB_FWD);
+}
+
+/** Is this fighter holding the ball? */
+const isCarrying = (f) => !!f && !!game.arena && game.arena.carriedBy === f.seat;
+
+/**
+ * Take hold of the ball if it is close enough. Returns true on success.
+ *
+ * Refused while the ball is already held — including by yourself — so grab is
+ * never a way to re-seat the ball into a better position for free.
+ */
+function grabBall(f) {
+  const A = game.arena;
+  if (!A || !A.ball || f.dead || f.grabCD > 0) return false;
+  if (!game.rules.grab) return false;
+  if (A.carriedBy >= 0) return false;
+  const b = A.ball;
+  const p = carryPoint(f);
+  // Measured from the carry point, so the ball you can see in front of you is the
+  // ball you can pick up.
+  if (Math.hypot(b.x - p.x, b.y - p.y, b.z - p.z) > A_GRAB_REACH + b.r) return false;
+
+  A.carriedBy = f.seat;
+  f.grabT = A_GRAB_T;
+  b.vx = b.vy = b.vz = 0;
+  b.lastTouch = f.seat;
+  superGain(f, SUPER_GAIN_TOUCH * (game.rules.superRate || 1));
+  A.hitFx.push({ x: b.x, y: b.y, z: b.z, life: 0.2 });
+  return true;
+}
+
+/**
+ * Release the ball. `thrown` sends it along the look direction; otherwise it is
+ * simply dropped, which is what a knockdown or an expired hold does.
+ */
+function releaseBall(f, thrown) {
+  const A = game.arena;
+  if (!A || !isCarrying(f)) return false;
+  const b = A.ball;
+  A.carriedBy = -1;
+  f.grabT = 0;
+  f.grabCD = A_GRAB_CD;
+
+  if (!thrown) {
+    // Dropped at the carry point with the carrier's momentum, so it falls
+    // naturally rather than stopping dead in the air.
+    b.vx = f.vx * 0.5;
+    b.vz = f.vz * 0.5;
+    b.vy = Math.min(0, f.vy);
+    return true;
+  }
+  const dir = aimRay(f);
+  const power = A_THROW_V * superKickMul(f);
+  b.vx = dir.x * power + f.vx * A_BALL_SPIN;
+  b.vz = dir.z * power + f.vz * A_BALL_SPIN;
+  b.vy = Math.max(dir.y * power, 0) + power * A_THROW_UP;
+  limitArenaBall(b);
+  b.lastTouch = f.seat;
+  superGain(f, SUPER_GAIN_KICK * (game.rules.superRate || 1));
+  game.shake = Math.max(game.shake, 0.14);
+  A.hitFx.push({ x: b.x, y: b.y, z: b.z, life: 0.2 });
+  return true;
+}
+
+/** Keep a held ball glued to its carrier, and expire the hold. */
+function stepCarry(dt) {
+  const A = game.arena;
+  if (!A || A.carriedBy < 0) return;
+  const f = A.fighters[A.carriedBy];
+  const b = A.ball;
+  if (!f || !b) { A.carriedBy = -1; return; }
+  // A knocked-down carrier loses the ball, which is what makes shooting useful.
+  if (f.dead) { releaseBall(f, false); return; }
+
+  f.grabT -= dt;
+  if (f.grabT <= 0) { releaseBall(f, false); return; }
+
+  const p = carryPoint(f);
+  b.x = p.x;
+  b.y = Math.max(b.r, p.y);
+  b.z = p.z;
+  b.vx = f.vx;
+  b.vy = f.vy;
+  b.vz = f.vz;
+}
+
+/* ---- jetpack ---------------------------------------------------------- */
+
+/**
+ * Burn fuel for upward thrust, or refill on the ground.
+ *
+ * Thrust is capped rather than accumulated, so holding it produces a steady climb
+ * to a ceiling speed instead of an ever-faster ascent — a jetpack you can ride
+ * out of the arena is not a jetpack, it is an exit.
+ */
+function stepJetpack(f, held, dt) {
+  if (f.dead) return;
+  if (held && f.jet > 0 && game.rules.jetpack) {
+    f.jet = Math.max(0, f.jet - dt);
+    f.vy = Math.min(f.vy + A_JET_THRUST * dt, A_JET_VMAX);
+    f.onGround = false;
+    f.jetFx = 0.12;
+  } else if (f.onGround) {
+    f.jet = Math.min(A_JET_MAX, f.jet + A_JET_REFILL * dt);
+  }
+  if (f.jetFx > 0) f.jetFx -= dt;
+}
+
+/* ---- walls ------------------------------------------------------------ */
+
+/**
+ * May this fighter raise a wall?
+ *
+ * The goalmouth rule matters: a wall planted on a goal line would make that goal
+ * unscoreable, so builds near either line are refused outright rather than
+ * nudged — a wall that silently appears somewhere else is more confusing than one
+ * that does not appear.
+ */
+function arenaCanBuild(f) {
+  if (!game.arena || !game.rules.walls3d) return false;
+  if (f.dead || f.wallCD > 0 || f.wallCharges <= 0) return false;
+  const mine = game.arena.walls.filter((w) => w.owner === f.seat).length;
+  if (mine >= A_WALL_CHARGES) return false;
+  const dir = aimRay(f);
+  const wz = f.z + dir.z * A_WALL_AHEAD;
+  // Too close to either goal line, whichever end.
+  return Math.abs(Math.abs(wz) - ARENA_HD) > A_WALL_GOAL_GAP;
+}
+
+/** Raise a wall in front of `f`. Returns it, or null if refused. */
+function arenaBuildWall(f) {
+  if (!arenaCanBuild(f)) return null;
+  const dir = aimRay(f);
+  /*
+    Axis-aligned, oriented by whichever way the builder is mostly facing: a
+    freely-rotated slab would need a rotated collider, and every collider in this
+    mode is axis-aligned by design.
+  */
+  const alongZ = Math.abs(dir.z) >= Math.abs(dir.x);
+  const wx = clamp(f.x + dir.x * A_WALL_AHEAD,
+                   -ARENA_HW + A_WALL_W / 2, ARENA_HW - A_WALL_W / 2);
+  const wz = clamp(f.z + dir.z * A_WALL_AHEAD,
+                   -ARENA_HD + A_WALL_W / 2, ARENA_HD - A_WALL_W / 2);
+  const wall = {
+    owner: f.seat,
+    x: wx, y: A_WALL_H / 2, z: wz,
+    hw: alongZ ? A_WALL_W / 2 : A_WALL_D / 2,
+    hh: A_WALL_H / 2,
+    hd: alongZ ? A_WALL_D / 2 : A_WALL_W / 2,
+    life: A_WALL_LIFE,
+    hp: A_WALL_HP,
+    born: 0,                  // grows from 0 to 1, for the rise animation
+    hitCD: 0,
+  };
+  game.arena.walls.push(wall);
+  f.wallCharges--;
+  f.wallCD = A_WALL_CD;
+  game.shake = Math.max(game.shake, 0.14);
+  return wall;
+}
+
+/** Age walls, recharge builders, and drop what has expired. */
+function stepArenaWalls(dt) {
+  const A = game.arena;
+  for (let i = A.walls.length - 1; i >= 0; i--) {
+    const w = A.walls[i];
+    w.born = Math.min(1, w.born + dt * 5);
+    w.life -= dt;
+    if (w.hitCD > 0) w.hitCD -= dt;
+    if (w.life <= 0 || w.hp <= 0) A.walls.splice(i, 1);
+  }
+  for (const f of A.fighters) {
+    if (f.wallCD > 0) f.wallCD -= dt;
+    if (f.wallCharges < A_WALL_CHARGES) {
+      f.wallRecharge -= dt;
+      if (f.wallRecharge <= 0) { f.wallCharges++; f.wallRecharge = A_WALL_RECHARGE; }
+    }
+  }
+}
+
+/** A wall as a box, for the shared collision helpers. */
+const wallBox = (w) => ({ x: w.x, y: w.y, z: w.z, hw: w.hw, hh: w.hh, hd: w.hd });
+
+/** Bounce the ball off standing walls, damaging them on a hard hit. */
+function ballVsArenaWalls(b) {
+  for (const w of game.arena.walls) {
+    const dx = b.x - w.x, dy = b.y - w.y, dz = b.z - w.z;
+    const ox = w.hw + b.r - Math.abs(dx);
+    const oy = w.hh + b.r - Math.abs(dy);
+    const oz = w.hd + b.r - Math.abs(dz);
+    if (ox <= 0 || oy <= 0 || oz <= 0) continue;
+
+    const speed = Math.hypot(b.vx, b.vy, b.vz);
+    if (oy <= ox && oy <= oz) {
+      b.y += dy >= 0 ? oy : -oy;
+      b.vy = (dy >= 0 ? 1 : -1) * Math.abs(b.vy) * A_WALL_REST;
+    } else if (ox <= oz) {
+      b.x += dx >= 0 ? ox : -ox;
+      b.vx = (dx >= 0 ? 1 : -1) * Math.abs(b.vx) * A_WALL_REST;
+    } else {
+      b.z += dz >= 0 ? oz : -oz;
+      b.vz = (dz >= 0 ? 1 : -1) * Math.abs(b.vz) * A_WALL_REST;
+    }
+    // A hard shot damages it, on a cooldown so one contact is one hit.
+    if (speed > 700 && w.hitCD <= 0) {
+      w.hp--;
+      w.hitCD = 0.2;
+      game.arena.hitFx.push({ x: b.x, y: b.y, z: b.z, life: 0.25 });
+    }
+  }
+}
+
 /**
  * A goal was scored. `conceded` is the side whose net it went into.
  *
@@ -7549,7 +7834,17 @@ function arenaKickoff(lastScorer) {
     f.hp = HP_MAX;
     f.dead = false;
     f.respawn = 0;
+    // Abilities are restored at a kickoff: a fresh restart should not punish
+    // whoever happened to spend a wall charge just before the goal.
+    f.grabT = 0;
+    f.grabCD = 0;
+    f.jet = A_JET_MAX;
+    f.wallCharges = A_WALL_CHARGES;
+    f.wallCD = 0;
+    f.wallRecharge = A_WALL_RECHARGE;
   }
+  A.walls.length = 0;
+  A.carriedBy = -1;
   void lastScorer;
   updateArenaCameras();
 }
@@ -7598,6 +7893,14 @@ function makeFighter(seat, team) {
     hurt: 0,             // >0 briefly after taking a hit, for the HUD flash
     kickCD: 0,           // between kicks
     kickT: 0,            // >0 while the leg is swinging, for the animation
+    // Grab, jetpack and wall building, all shared with the 2D game in spirit.
+    grabT: 0,            // >0 while holding the ball; counts the hold down
+    grabCD: 0,           // before another grab is allowed
+    jet: A_JET_MAX,      // jetpack fuel, in seconds
+    jetFx: 0,            // >0 briefly after thrusting, for the flame
+    wallCharges: A_WALL_CHARGES,
+    wallCD: 0,
+    wallRecharge: A_WALL_RECHARGE,
     /*
       Superpower state, sharing the meter, table and charge rules with the 2D
       game — so a team's identity is the same in both halves. What each power
@@ -7768,6 +8071,8 @@ function startArena3D() {
     frags: [0, 0],
     celebrate: 0,           // >0 briefly after a goal, for the banner
     cover: arenaCover(),
+    walls: [],              // player-built walls, as in the 2D game
+    carriedBy: -1,          // seat holding the ball, or -1
     hitFx: [],
     // Two humans share the screen; one human plus a bot does not.
     split: !game.cpu[0] && !game.cpu[1],
@@ -7804,7 +8109,11 @@ function segmentHitsCover(a, b, pad = 0) {
   */
   if (!game.arena) return false;
   const d = v3sub(b, a);
-  for (const c of game.arena.cover) {
+  // Built walls block sight, shots and the camera just as fixed cover does.
+  const boxes = game.arena.walls && game.arena.walls.length
+    ? game.arena.cover.concat(game.arena.walls.map(wallBox))
+    : game.arena.cover;
+  for (const c of boxes) {
     const lo = [c.x - c.hw - pad, c.y - c.hh - pad, c.z - c.hd - pad];
     const hi = [c.x + c.hw + pad, c.y + c.hh + pad, c.z + c.hd + pad];
     const o = [a.x, a.y, a.z], dir = [d.x, d.y, d.z];
@@ -7996,7 +8305,15 @@ function arenaBounds(f) {
  * fighter, which is what makes crates climbable and worth using as cover.
  */
 function fighterVsCover(f) {
-  for (const c of game.arena.cover) {
+  /*
+    Built walls are solid to players exactly as cover is, so they share this
+    resolver rather than having a near-identical copy — a wall you can walk
+    through would be decoration, not a defensive tool.
+  */
+  const boxes = game.arena.walls && game.arena.walls.length
+    ? game.arena.cover.concat(game.arena.walls.map(wallBox))
+    : game.arena.cover;
+  for (const c of boxes) {
     // The fighter is a box for this test: a capsule would be more accurate but
     // reads no differently at this speed, and this is exact and cheap.
     const dx = f.x - c.x;
@@ -8442,6 +8759,39 @@ function updateArenaCPU(f, dt) {
   // a power sitting unused is worse than one spent early.
   if (superReady(f) && Math.random() < lvl.aggr * dt * 1.5) fireArenaSuper(f);
 
+  /*
+    THE BOT USES THE NEW ABILITIES, but sparingly and only where they help:
+      - it throws immediately if it somehow ends up holding the ball, so a carry
+        never stalls the match;
+      - it grabs only when it has a clear run at goal, since carrying into
+        pressure just gives the ball away;
+      - it walls up when the ball is behind it, near its own goal;
+      - it jets for a ball genuinely above its head.
+  */
+  if (isCarrying(f)) {
+    // Facing goal? Throw. Otherwise turn first — the aim above is already doing
+    // that, so simply waiting a beat is the right move.
+    if (Math.abs(dYaw) < 0.35) releaseBall(f, true);
+    return;
+  }
+  if (b && !f.dead) {
+    const ballHigh = b.y > FIGHTER_H * 1.15;
+    if (ballHigh && ballD < 200 && f.jet > 0.5 && Math.random() < lvl.aggr) {
+      a.jump = true;                        // stepJetpack turns a held jump into thrust
+    }
+    // Grab when close, clear and pointed the right way.
+    if (game.rules.grab && striking && f.grabCD <= 0 &&
+        Math.abs(dYaw) < 0.3 && Math.random() < lvl.aggr * dt * 3) {
+      if (grabBall(f)) return;
+    }
+    // Wall up defensively: the ball is between the bot and its own goal.
+    const threatened = Math.abs(b.z - ownGoalZ) < Math.abs(f.z - ownGoalZ);
+    if (game.rules.walls3d && threatened && ballD > 200 &&
+        arenaCanBuild(f) && Math.random() < lvl.aggr * dt * 1.2) {
+      arenaBuildWall(f);
+    }
+  }
+
   // KICK when the ball is in range and the bot is roughly facing its target.
   if (striking && f.kickCD <= 0 && Math.abs(dYaw) < 0.4 + (1 - lvl.aggr) * 0.3) {
     kickArenaBall(f);
@@ -8501,24 +8851,63 @@ function stepArena3D(dt) {
     if (game.cpu[i]) continue;
     const a = intent[i];
     const f = A.fighters[i];
+
+    /*
+      GRAB / THROW share the wall key's neighbour: the dedicated GRAB action. It
+      is one button for both halves of the move — press to take the ball, press
+      again to throw it — because a separate throw key would be a key you only
+      need while already holding something.
+    */
+    if (a.grabEdge) {
+      if (isCarrying(f)) releaseBall(f, true);
+      else grabBall(f);
+    }
+
+    // BUILD, on the same binding the 2D game uses for walls.
+    if (a.wallEdge) arenaBuildWall(f);
+
+    /*
+      KICK. Throwing takes precedence while carrying, so the kick button never
+      punts a ball out of your own hands; otherwise kick the ball if it is in
+      reach, and fall through to a shot when it is not.
+    */
     const pressed = a.kickEdge || (mouse.fireHeld && i === arenaMouseSeat() &&
                                    f.kickCD <= 0);
     if (!pressed) continue;
+    if (isCarrying(f)) { releaseBall(f, true); continue; }
     if (!kickArenaBall(f)) fireShot(f);
   }
 
   for (let i = 0; i < 2; i++) {
-    stepFighter(A.fighters[i], intent[i], dt);
-    if (A.fighters[i].kickT > 0) A.fighters[i].kickT -= dt;
-    if (A.fighters[i].kickCD > 0) A.fighters[i].kickCD -= dt;
+    const f = A.fighters[i];
+    const a = intent[i];
+    /*
+      JETPACK on the jump key HELD. Tapping still jumps — stepFighter owns that —
+      so the thrust only takes over once the fighter is already airborne, which
+      keeps a single key doing the obvious thing at both ends.
+    */
+    stepJetpack(f, !!a.jump && !f.onGround, dt);
+    stepFighter(f, a, dt);
+    if (f.kickT > 0) f.kickT -= dt;
+    if (f.kickCD > 0) f.kickCD -= dt;
+    if (f.grabCD > 0) f.grabCD -= dt;
   }
+  stepArenaWalls(dt);
 
   // Fighters must not stand inside each other, or two players can occupy the
   // same spot and neither can tell who is where.
   separateFighters(A.fighters[0], A.fighters[1]);
 
-  stepArenaBall(dt);
-  for (const f of A.fighters) fighterVsArenaBall(f);
+  /*
+    A CARRIED ball is not simulated: it is held. Body contact is skipped too, or
+    the carrier would be shoving the ball they are holding.
+  */
+  if (A.carriedBy >= 0) {
+    stepCarry(dt);
+  } else {
+    stepArenaBall(dt);
+    for (const f of A.fighters) fighterVsArenaBall(f);
+  }
 
   stepShots(dt);
   /*
@@ -8792,6 +9181,19 @@ function step(dt) {
 
     case SCENE.CELEBRATE:
       releaseCPUKeys();
+      /*
+        Superpower timers keep running through a celebration. Nothing else here
+        touches the players, so a power fired just before a goal used to FREEZE
+        for the whole 1.8s celebration and then resume — visibly longer than its
+        stated duration, and long enough to still be live at the next kickoff.
+        Ticked directly rather than through update(), because the players must not
+        move or accept input while the goal is being celebrated.
+      */
+      for (const pl of game.players) {
+        if (!pl || pl.superT <= 0) continue;
+        pl.superT = Math.max(0, pl.superT - dt);
+        if (pl.superT === 0) endSuper(pl);
+      }
       game.timer -= dt;
       if (game.timer <= 0) kickoff(game.lastScorer === 0 ? -1 : 1);
       break;
@@ -10363,6 +10765,21 @@ function drawArenaWorld(cam, view, theme) {
   for (const c of game.arena.cover) {
     boxFaces(batch, c.x, c.y, c.z, c.hw, c.hh, c.hd, shiftHex(theme.ground, 26), "cover");
   }
+  /*
+    Built walls, in their owner's colour so you can tell your own from theirs at a
+    glance. They RISE from the floor as `born` grows, DARKEN as they take damage,
+    and BLINK in their last second — the batch fills opaque polygons, so a blink
+    is how a wall warns you it is about to vanish rather than a fade.
+  */
+  for (const w of game.arena.walls) {
+    const f = game.arena.fighters[w.owner];
+    const base = f ? f.team.color : "#94a3b8";
+    const dying = w.life < 1 && Math.sin(performance.now() / 70) > 0;
+    const col = dying ? "#1b2436"
+                      : shiftHex(base, Math.round(-34 + 34 * (w.hp / A_WALL_HP)));
+    const h = w.hh * w.born;
+    boxFaces(batch, w.x, h, w.z, w.hw, Math.max(1, h), w.hd, col, "wall");
+  }
   const painted = batch.flush(cam, view, basis);
 
   /*
@@ -10484,6 +10901,22 @@ function drawFighterBillboard(f, cam, view, basis, self) {
   ctx.ellipse(feet.x, feet.y, shR, shR * 0.38, 0, 0, Math.PI * 2);
   ctx.fill();
 
+  // Jetpack exhaust, under the feet. Drawn before the body so the flame appears
+  // to come out from beneath it.
+  if (f.jetFx > 0) {
+    const fl = Math.max(3, shR * 0.8);
+    for (let i = 0; i < 3; i++) {
+      const t = i / 3;
+      ctx.globalAlpha = (1 - t) * 0.85;
+      ctx.fillStyle = i === 0 ? "#fff7ed" : i === 1 ? "#fbbf24" : "#ef4444";
+      ctx.beginPath();
+      ctx.ellipse(feet.x, feet.y + fl * (0.5 + t * 1.4),
+                  fl * (0.55 - t * 0.15), fl * (0.8 - t * 0.2), 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
   const hpx = Math.abs(feet.y - head.y);
   const bodyW = Math.max(3, FIGHTER_R * 1.35 * feet.s);
   const headR = Math.max(3, hpx * 0.26);
@@ -10577,6 +11010,46 @@ function drawArenaHUD(seat, view) {
                     "#ffffff", "left", 900);
     else if (running) text(def.label, bx, my - 8, 9, def.color, "left", 900);
   }
+  /*
+    JETPACK fuel and WALL charges, stacked above the super meter. Both are
+    spend-and-wait resources, so the player needs to see them at a glance or the
+    abilities become guesswork.
+  */
+  if (game.rules.jetpack) {
+    const jy = by - 26, jh = 4;
+    ctx.fillStyle = "rgba(6,12,22,0.8)";
+    ctx.fillRect(bx, jy, bw, jh);
+    const frac = clamp(f.jet / A_JET_MAX, 0, 1);
+    ctx.fillStyle = frac > 0.3 ? "#fbbf24" : "#ef4444";
+    ctx.fillRect(bx, jy, bw * frac, jh);
+    text("JET", bx - 6, jy + jh / 2, 8, "#fbbf24", "right", 800);
+  }
+  if (game.rules.walls3d) {
+    // One pip per charge, filled if available — countable at a glance, which a
+    // bar of two segments would not be.
+    const wy = by - 40;
+    for (let i = 0; i < A_WALL_CHARGES; i++) {
+      const px = bx + i * 16;
+      ctx.fillStyle = i < f.wallCharges ? "#a78bfa" : "rgba(167,139,250,0.22)";
+      roundRect(px, wy, 12, 8, 2);
+      ctx.fill();
+    }
+    text("WALL", bx - 6, wy + 4, 8, "#a78bfa", "right", 800);
+  }
+  // Carrying the ball, and how long is left before it slips.
+  if (isCarrying(f)) {
+    const frac = clamp(f.grabT / A_GRAB_T, 0, 1);
+    text("HOLDING THE BALL", cx, cy + 62, 12, "#4ade80", "center", 900);
+    const hw = 120;
+    ctx.fillStyle = "rgba(6,12,22,0.75)";
+    ctx.fillRect(cx - hw / 2, cy + 72, hw, 4);
+    ctx.fillStyle = frac > 0.3 ? "#4ade80" : "#ef4444";
+    ctx.fillRect(cx - hw / 2, cy + 72, hw * frac, 4);
+    text("throw with KICK or GRAB", cx, cy + 88, 9, "#9fb4d0", "center", 700);
+  } else if (game.arena.carriedBy >= 0) {
+    text("opponent has the ball", cx, cy + 62, 10, "#fbbf24", "center", 800);
+  }
+
   // Dash cooldown, as a small pip beside the health bar.
   if (game.rules.dash) {
     const px = bx + bw + 10, py = by + bh / 2;
@@ -13022,6 +13495,14 @@ const PHYS = {
   makeArenaBall, stepArenaBall, arenaGoalScored, arenaGoal, arenaKickoff,
   fighterVsArenaBall, kickArenaBall, ballVsArenaCover, limitArenaBall,
   arenaGoalFaces, aGoalLineZ,
+  // 3D grab, jetpack and wall building.
+  grabBall, releaseBall, stepCarry, carryPoint, isCarrying,
+  stepJetpack, arenaCanBuild, arenaBuildWall, stepArenaWalls, ballVsArenaWalls,
+  wallBox,
+  A_GRAB_T, A_GRAB_CD, A_GRAB_REACH, A_GRAB_FWD, A_THROW_V,
+  A_JET_MAX, A_JET_THRUST, A_JET_VMAX, A_JET_REFILL,
+  A_WALL_W, A_WALL_H, A_WALL_D, A_WALL_LIFE, A_WALL_HP, A_WALL_CHARGES,
+  A_WALL_CD, A_WALL_RECHARGE, A_WALL_AHEAD, A_WALL_GOAL_GAP,
   A_GOAL_W, A_GOAL_H, A_GOAL_D, A_POST_R, A_BALL_R, A_KICK_V, A_KICK_REACH,
   A_BALL_MAX_V, A_BALL_GRAV,
   // Dash and superpowers, shared by both simulations.
@@ -23296,6 +23777,611 @@ function runTests() {
       Object.assign(net, savedNet);
       net.relayAddr = "";
     }
+  }
+
+  // 26a. 3D GRAB and THROW.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, score: [...game.score], timeIdx: game.timeIdx,
+                    goalsToWin: game.goalsToWin };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    game.timeIdx = 0;
+
+    /** A fighter facing +z with the ball right in front of them. */
+    const setup = () => {
+      startMatch();
+      const f = game.arena.fighters[0];
+      const b = game.arena.ball;
+      Object.assign(f, { x: 0, y: 0, z: -60, yaw: 0, pitch: 0,
+                         vx: 0, vy: 0, vz: 0, grabCD: 0, grabT: 0 });
+      const p = carryPoint(f);
+      Object.assign(b, { x: p.x, y: p.y, z: p.z, vx: 0, vy: 0, vz: 0 });
+      return [f, b];
+    };
+
+    {
+      const [f, b] = setup();
+      ok("a ball in front of the player can be grabbed", grabBall(f));
+      ok("and the arena records who holds it", game.arena.carriedBy === f.seat);
+      ok("and isCarrying agrees", isCarrying(f));
+      ok("and the hold timer starts", near(f.grabT, A_GRAB_T, 1e-9));
+      ok("and the ball stops moving", b.vx === 0 && b.vy === 0 && b.vz === 0);
+      ok("a second grab while holding is refused", !grabBall(f));
+      ok("and the opponent cannot grab it either",
+         !grabBall(game.arena.fighters[1]));
+    }
+
+    // A held ball travels with the carrier rather than obeying gravity.
+    {
+      const [f, b] = setup();
+      grabBall(f);
+      f.x = 300; f.z = 200; f.yaw = 1.1;
+      stepCarry(DT);
+      const p = carryPoint(f);
+      ok("a held ball follows the carrier",
+         near(b.x, p.x, 1e-6) && near(b.z, p.z, 1e-6),
+         `${b.x.toFixed(1)},${b.z.toFixed(1)} vs ${p.x.toFixed(1)},${p.z.toFixed(1)}`);
+      ok("and does not fall while held",
+         (() => { const y0 = b.y;
+                  for (let i = 0; i < 60; i++) stepCarry(DT);
+                  return Math.abs(b.y - y0) < 1e-6; })());
+      ok("and never sinks below its own radius",
+         (() => { f.y = 0; f.pitch = -PITCH_MAX;
+                  stepCarry(DT); return b.y >= b.r - 1e-9; })());
+    }
+
+    // Throwing sends it along the look direction, and starts a cooldown.
+    {
+      const [f, b] = setup();
+      grabBall(f);
+      f.yaw = 0; f.pitch = 0;
+      ok("throwing releases the ball", releaseBall(f, true));
+      ok("and nobody holds it any more", game.arena.carriedBy === -1);
+      ok("and it leaves downfield at speed",
+         b.vz > A_THROW_V * 0.7, `vz=${b.vz.toFixed(0)}`);
+      ok("with some lift", b.vy > 0);
+      ok("and a grab cooldown starts", near(f.grabCD, A_GRAB_CD, 1e-9));
+      ok("so an immediate re-grab is refused", !grabBall(f));
+      ok("and a throw with nothing held does nothing", !releaseBall(f, true));
+    }
+    // Aim decides the throw, exactly as it decides a kick.
+    {
+      const [f, b] = setup();
+      grabBall(f);
+      f.pitch = PITCH_MAX * 0.8;
+      releaseBall(f, true);
+      const high = b.vy;
+      const [f2, b2] = setup();
+      grabBall(f2);
+      f2.pitch = 0;
+      releaseBall(f2, true);
+      ok("throwing while aiming up lofts it higher",
+         high > b2.vy, `${high.toFixed(0)} vs ${b2.vy.toFixed(0)}`);
+    }
+
+    // The hold expires, and a knockdown drops the ball.
+    {
+      const [f] = setup();
+      grabBall(f);
+      for (let i = 0; i < Math.round((A_GRAB_T + 0.1) / DT); i++) stepCarry(DT);
+      ok("a hold expires on its own", game.arena.carriedBy === -1);
+      ok("and the ball is dropped, not thrown",
+         Math.hypot(game.arena.ball.vx, game.arena.ball.vz) < 200);
+    }
+    {
+      const [f] = setup();
+      grabBall(f);
+      f.dead = true;
+      stepCarry(DT);
+      ok("a knocked-down carrier loses the ball", game.arena.carriedBy === -1);
+    }
+    // Being shot while carrying must also lose it, through the same path.
+    {
+      const [f] = setup();
+      grabBall(f);
+      for (let i = 0; i < 4; i++) applyDamage(f, SHOT_DMG, 1);
+      stepCarry(DT);
+      ok("shooting a carrier makes them drop the ball",
+         game.arena.carriedBy === -1);
+    }
+    // A goal can be scored from a throw.
+    {
+      const [f, b] = setup();
+      grabBall(f);
+      f.z = ARENA_HD - 300;
+      f.yaw = 0; f.pitch = 0;
+      releaseBall(f, true);
+      let scored = -1;
+      for (let i = 0; i < Math.round(2 / DT) && scored < 0; i++) {
+        stepArenaBall(DT);
+        scored = arenaGoalScored(b);
+      }
+      ok("a thrown ball can score", scored === 1, `${scored}`);
+    }
+    // The rule toggle switches it off entirely.
+    {
+      const [f] = setup();
+      game.rules.grab = false;
+      ok("grab can be switched off in the rules", !grabBall(f));
+      game.rules.grab = true;
+    }
+
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 26b. 3D JETPACK.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, timeIdx: game.timeIdx };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    game.timeIdx = 0;
+    startMatch();
+
+    {
+      const f = game.arena.fighters[0];
+      Object.assign(f, { x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0,
+                         onGround: false, jet: A_JET_MAX });
+      stepJetpack(f, true, DT);
+      ok("thrusting pushes the fighter upward", f.vy > 0, `${f.vy.toFixed(1)}`);
+      ok("and burns fuel", f.jet < A_JET_MAX);
+      ok("and counts as airborne", !f.onGround);
+
+      // Held indefinitely, the climb is CAPPED — a jetpack you can ride out of
+      // the arena is an exit, not an ability.
+      for (let i = 0; i < 400; i++) stepJetpack(f, true, DT);
+      ok("upward speed is capped", f.vy <= A_JET_VMAX + 1e-6, `${f.vy.toFixed(1)}`);
+      ok("and the fuel runs out", f.jet === 0);
+      const vy0 = f.vy;
+      stepJetpack(f, true, DT);
+      ok("an empty jetpack gives no thrust", f.vy <= vy0 + 1e-9);
+    }
+    // Fuel refills on the ground, and only on the ground.
+    {
+      const f = game.arena.fighters[0];
+      Object.assign(f, { y: 0, vy: 0, onGround: true, jet: 0 });
+      for (let i = 0; i < Math.round(1 / DT); i++) stepJetpack(f, false, DT);
+      ok("fuel refills on the ground", f.jet > 0, `${f.jet.toFixed(2)}`);
+      ok("and never past full",
+         (() => { for (let i = 0; i < 2000; i++) stepJetpack(f, false, DT);
+                  return near(f.jet, A_JET_MAX, 1e-9); })());
+      Object.assign(f, { y: 200, onGround: false, jet: 0.5 });
+      const j0 = f.jet;
+      for (let i = 0; i < 60; i++) stepJetpack(f, false, DT);
+      ok("but not in mid-air", near(f.jet, j0, 1e-9), `${f.jet}`);
+    }
+    // A jetpack cannot lift a fighter out of the room: arenaBounds still holds.
+    {
+      const f = game.arena.fighters[0];
+      Object.assign(f, { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, jet: 999 });
+      const a = { left: false, right: false, up: false, down: false,
+                  aimX: 0, aimY: 0, jump: true, dashEdge: false, superEdge: false };
+      for (let i = 0; i < 1200; i++) { stepJetpack(f, true, DT); stepFighter(f, a, DT); }
+      ok("a jetpack cannot fly out through the ceiling",
+         f.y <= ARENA_WALL_H - FIGHTER_H + 1e-6, `y=${f.y.toFixed(1)}`);
+    }
+    // And the rule toggle disables it.
+    {
+      const f = game.arena.fighters[0];
+      Object.assign(f, { y: 100, vy: 0, onGround: false, jet: A_JET_MAX });
+      game.rules.jetpack = false;
+      stepJetpack(f, true, DT);
+      ok("the jetpack can be switched off in the rules", f.vy === 0);
+      game.rules.jetpack = true;
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 26c. 3D WALL BUILDING.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, timeIdx: game.timeIdx };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    game.timeIdx = 0;
+
+    const midfielder = () => {
+      startMatch();
+      const f = game.arena.fighters[0];
+      Object.assign(f, { x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
+                         vx: 0, vy: 0, vz: 0, wallCD: 0,
+                         wallCharges: A_WALL_CHARGES });
+      return f;
+    };
+
+    {
+      const f = midfielder();
+      ok("a player in midfield may build", arenaCanBuild(f));
+      const w = arenaBuildWall(f);
+      ok("building raises a wall", !!w && game.arena.walls.length === 1);
+      ok("in front of the builder", w.z > f.z, `${w.z} vs ${f.z}`);
+      ok("owned by them", w.owner === f.seat);
+      ok("and it costs a charge", f.wallCharges === A_WALL_CHARGES - 1);
+      ok("and starts a build cooldown", f.wallCD > 0);
+      ok("so an immediate second build is refused", !arenaBuildWall(f));
+      f.wallCD = 0;
+      ok("but allowed once the cooldown clears", !!arenaBuildWall(f));
+      f.wallCD = 0;
+      ok("up to the charge limit, and no further",
+         !arenaBuildWall(f) && game.arena.walls.length === A_WALL_CHARGES,
+         `${game.arena.walls.length}`);
+    }
+
+    /*
+      THE GOALMOUTH RULE. A wall on a goal line would make that goal unscoreable,
+      so building near either line is refused outright.
+    */
+    {
+      const f = midfielder();
+      f.z = ARENA_HD - 60;                 // right on top of the far goal
+      f.yaw = 0;
+      ok("building into a goalmouth is refused", !arenaCanBuild(f));
+      ok("and no wall appears", arenaBuildWall(f) === null);
+      f.z = -ARENA_HD + 60;                // and the near one
+      f.yaw = Math.PI;
+      ok("the same holds at the other end", !arenaCanBuild(f));
+    }
+
+    // Walls are solid to the ball, and to players.
+    {
+      const f = midfielder();
+      const w = arenaBuildWall(f);
+      w.born = 1;
+      const b = game.arena.ball;
+      Object.assign(b, { x: w.x, y: w.hh, z: w.z - 220, vx: 0, vy: 0, vz: 900 });
+      for (let i = 0; i < Math.round(0.6 / DT); i++) stepArenaBall(DT);
+      ok("a wall bounces the ball back", b.vz < 0, `vz=${b.vz.toFixed(0)}`);
+      ok("and the ball never ends up inside it",
+         !(Math.abs(b.x - w.x) < w.hw && Math.abs(b.z - w.z) < w.hd &&
+           Math.abs(b.y - w.y) < w.hh));
+    }
+    {
+      const f = midfielder();
+      const w = arenaBuildWall(f);
+      w.born = 1;
+      const other = game.arena.fighters[1];
+      Object.assign(other, { x: w.x, y: 0, z: w.z - 200, yaw: 0, vx: 0, vy: 0, vz: 0 });
+      const a = { left: false, right: false, up: true, down: false,
+                  aimX: 0, aimY: 0, jump: false, dashEdge: false, superEdge: false };
+      for (let i = 0; i < Math.round(2 / DT); i++) stepFighter(other, a, DT);
+      const inside = Math.abs(other.x - w.x) < w.hw + FIGHTER_R - 1 &&
+                     Math.abs(other.z - w.z) < w.hd + FIGHTER_R - 1 &&
+                     other.y < w.y + w.hh - 1;
+      ok("a wall blocks a player from walking through it", !inside,
+         `${other.x.toFixed(0)},${other.z.toFixed(0)},${other.y.toFixed(0)}`);
+    }
+    // And they block sight, so they are real cover.
+    {
+      const f = midfielder();
+      const w = arenaBuildWall(f);
+      w.born = 1;
+      ok("a wall blocks a sight line",
+         segmentHitsCover(v3(w.x, w.hh, w.z - 200), v3(w.x, w.hh, w.z + 200)));
+    }
+
+    // Walls expire, break under fire, and recharge their builder.
+    {
+      const f = midfielder();
+      arenaBuildWall(f);
+      for (let i = 0; i < Math.round((A_WALL_LIFE + 0.2) / DT); i++) stepArenaWalls(DT);
+      ok("a wall expires on its own", game.arena.walls.length === 0);
+      ok("and its charge comes back", f.wallCharges === A_WALL_CHARGES,
+         `${f.wallCharges}`);
+    }
+    {
+      const f = midfielder();
+      const w = arenaBuildWall(f);
+      w.born = 1;
+      const b = game.arena.ball;
+      for (let n = 0; n < A_WALL_HP; n++) {
+        w.hitCD = 0;
+        Object.assign(b, { x: w.x, y: w.hh, z: w.z - 120, vx: 0, vy: 0, vz: 1500 });
+        for (let i = 0; i < 20; i++) stepArenaBall(DT);
+      }
+      stepArenaWalls(DT);
+      ok("enough hard shots break a wall", game.arena.walls.length === 0,
+         `${game.arena.walls.length} left`);
+    }
+    // The rule toggle disables building.
+    {
+      const f = midfielder();
+      game.rules.walls3d = false;
+      ok("walls can be switched off in the rules",
+         !arenaCanBuild(f) && arenaBuildWall(f) === null);
+      game.rules.walls3d = true;
+    }
+    // A kickoff clears the pitch, so a goal is a clean restart.
+    {
+      const f = midfielder();
+      arenaBuildWall(f);
+      grabBall(game.arena.fighters[1]);
+      arenaKickoff(0);
+      ok("a kickoff clears built walls", game.arena.walls.length === 0);
+      ok("and nobody is holding the ball", game.arena.carriedBy === -1);
+      ok("and wall charges are restored",
+         game.arena.fighters.every((x) => x.wallCharges === A_WALL_CHARGES));
+      ok("and jetpacks are refuelled",
+         game.arena.fighters.every((x) => near(x.jet, A_JET_MAX, 1e-9)));
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  /* ---------------------------------------------------------------------
+     2D SUPERPOWERS
+
+     One signature ability per team, charged by playing. These had almost no
+     coverage: only the charge-on-conceding path was ever asserted, so the table,
+     the pairing and every multiplier were untested.
+     ------------------------------------------------------------------- */
+  // 27a. The table and the pairing.
+  {
+    ok("every team has a superpower", TEAM_SUPER.length === TEAMS.length,
+       `${TEAM_SUPER.length} powers for ${TEAMS.length} teams`);
+    ok("and every one of them names a real power",
+       TEAM_SUPER.every((id) => !!SUPERS[id]),
+       TEAM_SUPER.filter((id) => !SUPERS[id]).join());
+    ok("no two teams share a power",
+       new Set(TEAM_SUPER).size === TEAM_SUPER.length,
+       `${new Set(TEAM_SUPER).size} distinct`);
+    ok("every declared power is actually used by a team",
+       SUPER_KEYS.every((k) => TEAM_SUPER.includes(k)),
+       SUPER_KEYS.filter((k) => !TEAM_SUPER.includes(k)).join());
+    {
+      let bad = null;
+      for (const k of SUPER_KEYS) {
+        const d = SUPERS[k];
+        if (!d.label || !d.color || typeof d.dur !== "number" || !d.hint) {
+          bad = `${k} is incompletely declared`; break;
+        }
+        if (d.dur < 0) { bad = `${k} has a negative duration`; break; }
+        if (!/^#[0-9a-f]{6}$/i.test(d.color)) { bad = `${k} has a bad colour`; break; }
+      }
+      ok("every power declares a label, colour, duration and hint", !bad, bad || "");
+    }
+    ok("superForTeam maps each roster slot to its declared power",
+       TEAMS.every((t, i) => superForTeam(t) === TEAM_SUPER[i]));
+    ok("and falls back for a team not on the roster",
+       !!SUPERS[superForTeam({ name: "Nobody" })]);
+  }
+
+  // 27b. Charging and firing.
+  {
+    const saved = { mode: game.mode, scene: game.scene, players: game.players,
+                    ball: game.ball, cpu: [...game.cpu], sel: [...game.sel],
+                    score: [...game.score], superFx: game.superFx };
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    startMatch();
+    game.scene = SCENE.PLAY;
+
+    const p0 = game.players[0];
+    ok("a player starts with an empty meter", p0.superCharge === 0);
+    ok("and carries their team's power", p0.superId === TEAM_SUPER[0]);
+    ok("an empty meter is not ready", !superReady(p0));
+
+    superGain(p0, 40);
+    ok("charge accumulates", near(p0.superCharge, 40, 1e-9));
+    ok("and reports a fraction for the HUD", near(superFrac(p0), 0.4, 1e-9));
+    superGain(p0, 1000);
+    ok("and is capped at full", p0.superCharge === SUPER_MAX);
+    ok("a full meter is ready", superReady(p0));
+
+    ok("firing spends the whole meter",
+       (() => { fireSuper(p0); return p0.superCharge === 0; })());
+    ok("and announces itself so both players see it",
+       !!game.superFx && game.superFx.seat === 0);
+    ok("a spent power is no longer ready", !superReady(p0));
+    /*
+      Charge gained DURING a power is discarded, or a long ability would roll
+      straight into the next one.
+    */
+    superGain(p0, SUPER_MAX);
+    ok("charge gained mid-power is refused", p0.superCharge === 0);
+
+    // The rule toggle switches the whole system off.
+    {
+      p0.superT = 0;
+      game.rules.supers = false;
+      superGain(p0, SUPER_MAX);
+      ok("supers can be switched off in the rules",
+         p0.superCharge === 0 && !superReady(p0));
+      game.rules.supers = true;
+    }
+
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 27c. Every power must fire, run and end without breaking the match.
+  {
+    const saved = { mode: game.mode, scene: game.scene, players: game.players,
+                    ball: game.ball, cpu: [...game.cpu], sel: [...game.sel],
+                    score: [...game.score], superFx: game.superFx,
+                    helpers: game.helpers, bullets: game.bullets };
+    game.mode = MODE.SINGLE;
+    game.cpu = [false, true];
+
+    let bad = null;
+    for (let i = 0; i < TEAMS.length && !bad; i++) {
+      game.sel = [i, (i + 1) % TEAMS.length];
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      const id = pl.superId;
+      const def = SUPERS[id];
+      const r0 = pl.r;
+
+      try {
+        pl.superCharge = SUPER_MAX;
+        if (!fireSuper(pl)) { bad = `${id} refused to fire`; break; }
+        /*
+          Run it out, driving the whole match so the power meets real physics —
+          the ball, the walls, the opponent. A goal during the power calls
+          kickoff, which resets both players, so the timer is read back off
+          `game.players[0]` each pass rather than through a captured reference
+          that a reset may have superseded.
+        */
+        const steps = Math.round((def.dur + 0.6) / DT) || 60;
+        let live = true;
+        for (let s = 0; s < steps && live; s++) {
+          step(DT);
+          if (game.scene !== SCENE.PLAY && game.scene !== SCENE.CELEBRATE &&
+              game.scene !== SCENE.COUNTDOWN) live = false;
+        }
+        const now = game.players[0] || pl;
+        if (now.superT > 0) {
+          bad = `${id} never expired (${now.superT.toFixed(2)}s left, scene ${game.scene})`;
+          break;
+        }
+        // Nothing may be left permanently changed.
+        if (Math.abs(pl.r - r0) > 1e-6) {
+          bad = `${id} left the player resized (${r0} -> ${pl.r})`; break;
+        }
+        for (const v of [pl.x, pl.y, pl.vx, pl.vy, game.ball.x, game.ball.y,
+                         game.ball.vx, game.ball.vy]) {
+          if (!isFinite(v)) { bad = `${id} produced a non-finite world`; break; }
+        }
+        if (bad) break;
+        if (superSizeMul(pl) !== 1 || superKickMul(pl) !== 1 ||
+            superSpeedMul(pl) !== 1 || superImmovable(pl)) {
+          bad = `${id} left a multiplier applied after expiring`; break;
+        }
+      } catch (e) {
+        bad = `${id} threw: ${e.message}`;
+        break;
+      }
+    }
+    ok("every superpower fires, runs its course and cleans up after itself",
+       !bad, bad || "");
+
+    /*
+      A power fired just before a goal must keep expiring through the
+      celebration. Nothing in CELEBRATE touched the players, so the timer froze
+      for its whole 1.8 seconds and the power ran visibly longer than advertised —
+      long enough to still be live at the next kickoff.
+    */
+    {
+      game.sel = [15, 0];                  // Violet Vipers — VENOM SHOT
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      const t0 = pl.superT;
+      game.scene = SCENE.CELEBRATE;
+      game.timer = CELEBRATE_T;
+      for (let i = 0; i < Math.round(1 / DT); i++) step(DT);
+      const now = game.players[0];
+      ok("a superpower keeps expiring during a goal celebration",
+         now.superT < t0 - 0.9, `${t0.toFixed(2)} -> ${now.superT.toFixed(2)}`);
+    }
+
+    // The instantaneous ones do their work immediately.
+    {
+      game.sel = [6, 0];                   // Cyan Sprinters — QUAKE
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      ok("the quake team carries the quake", pl.superId === "quake");
+      pl.onGround = true;
+      game.ball.x = pl.x + 40;
+      game.ball.y = GROUND_Y - 20;
+      game.ball.vy = 0;
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("a grounded quake launches a nearby ball", game.ball.vy < 0,
+         `${game.ball.vy.toFixed(0)}`);
+    }
+    {
+      game.sel = [1, 0];                   // Blue Bolts — BLINK
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      ok("the blink team carries the blink", pl.superId === "blink");
+      game.ball.x = W * 0.8;
+      game.ball.y = 200;
+      pl.x = 80;
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("blinking moves the player to the ball",
+         Math.abs(pl.x - game.ball.x) < pl.r + game.ball.r + 8,
+         `player ${pl.x.toFixed(0)} ball ${game.ball.x.toFixed(0)}`);
+      ok("and lands them inside the pitch",
+         pl.x >= WALL + pl.r - 1e-6 && pl.x <= W - WALL - pl.r + 1e-6);
+    }
+    {
+      game.sel = [10, 0];                  // Amber Arrows — ARROW STORM
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      game.bullets = [];
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("an arrow storm fires a volley at once", game.bullets.length >= 3,
+         `${game.bullets.length}`);
+      ok("all of it belongs to the firing player",
+         game.bullets.every((b) => b.owner === pl.index));
+    }
+    {
+      game.sel = [14, 0];                  // Slate Sentinels — LAST WALL
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      game.helpers = [];
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("the sentinel power summons two helpers", game.helpers.length === 2,
+         `${game.helpers.length}`);
+      ok("one keeper and one striker",
+         game.helpers.some((h) => h.kind === "keeper") &&
+         game.helpers.some((h) => h.kind === "striker"));
+    }
+    {
+      game.sel = [13, 0];                  // Crimson Bulls — DEEP FREEZE
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      const foe = game.players[1];
+      foe.stun = 0;
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("a freeze stuns the opponent", foe.stun > 0, `${foe.stun}`);
+    }
+    // The immovable powers must actually resist.
+    {
+      game.sel = [2, 0];                   // Green Giants — BULWARK
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const pl = game.players[0];
+      pl.superCharge = SUPER_MAX;
+      fireSuper(pl);
+      ok("a bulwark is immovable while it runs", superImmovable(pl));
+      ok("and larger", superSizeMul(pl) > 1);
+      const r1 = pl.r;
+      pl.superT = 0;
+      endSuper(pl);
+      ok("and returns to its own size afterwards", pl.r < r1, `${r1} -> ${pl.r}`);
+    }
+
+    Object.assign(game, saved);
+    game.particles = [];
+    game.bullets = [];
+    game.helpers = [];
   }
 
   // 23. Determinism: identical initial conditions give identical results.
