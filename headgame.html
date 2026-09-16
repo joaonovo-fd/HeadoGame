@@ -12460,7 +12460,15 @@ function drawOnline() {
   };
 
   // ---- role picker ------------------------------------------------------
-  if (net.state === "idle" || net.state === "failed") {
+  /*
+    The picker is hidden while a relay failure is on screen. A failed attempt is
+    still "failed" state, so the picker and the failure panel were both drawn and
+    collided. The keyboard shortcuts stay live throughout — updateOnline still
+    accepts A, S, Q, B, T, H and J — so the panel's "press A or S to try again" is
+    honest: the options are there, just not painted over the explanation.
+  */
+  const relayFailed = net.transport === "relay" && net.state === "failed" && !!net.error;
+  if ((net.state === "idle" || net.state === "failed") && !relayFailed) {
     const opt = (y, key, title, blurb, colour) => {
       ctx.fillStyle = "rgba(255,255,255,0.05)";
       roundRect(bx + 24, y, bw - 48, 46, 9);
@@ -12481,6 +12489,13 @@ function drawOnline() {
       it is: one player runs the relay and reads out an address, rather than both
       players copying long codes in opposite directions. The code-based WebRTC
       flow stays below it for anyone who wants a direct connection.
+    */
+    /*
+      The entry form and the failure panel are mutually exclusive. Both used to be
+      drawn whenever an attempt had failed with a field still open — `relayIntent`
+      is still set, and `state` is "failed" — so the two overlapped into an
+      unreadable pile of text. The failure panel wins: it is the thing the player
+      needs to read, and it says how to try again.
     */
     if (net.editing || net.relayIntent) {
       card(104, 250, "#4ade80");
@@ -12719,8 +12734,13 @@ function drawOnline() {
     text("gathering network candidates", W / 2, 220, 11, "#6b819e", "center", 600);
   }
 
-  // ---- host flow --------------------------------------------------------
-  if (net.role === "host" && (net.state === "offer" || net.state === "connecting")) {
+  /* ---- host flow, WEBRTC ONLY --------------------------------------------
+     A relay host is also role "host" in state "offer", so without the transport
+     check this invite-code panel drew straight through the relay's own hosting
+     card — two panels, one pile of text. The relay has no invite code to copy.
+  */
+  if (net.transport !== "relay" && net.role === "host" &&
+      (net.state === "offer" || net.state === "connecting")) {
     card(128, 330, "#4ade80");
     text("YOU ARE HOSTING", W / 2, 152, 14, "#4ade80", "center", 900);
     const used = codePanel(168, net.offerText, "YOUR INVITE CODE", "PRESS  C  TO COPY");
@@ -12847,7 +12867,14 @@ function drawOnline() {
     text("press ESC to go back and try again", W / 2, 222, 12, "#8fa3c0", "center", 600);
   }
 
-  if (net.error) text(net.error, W / 2, H - 62, 12, "#f87171", "center", 700);
+  /*
+    The footer error is skipped when the relay failure panel is already showing it
+    in full — the same sentence twice, once wrapped and once clipped, was just
+    noise.
+  */
+  if (net.error && !relayFailed) {
+    text(net.error, W / 2, H - 62, 12, "#f87171", "center", 700);
+  }
   text("ESC — back to setup", W / 2, H - 28, 11, "#6b819e", "center", 600);
 }
 
@@ -25340,6 +25367,107 @@ function runTests() {
       Object.assign(net, savedNet);
       game.scene = savedScene;
       game.names = loadNames();
+    }
+
+    /*
+      25d4. EVERY ONLINE STATE MUST DRAW ONE PANEL, not several stacked on top of
+      each other. This screen has grown a dozen states, and their conditions
+      overlapped: a failed relay attempt drew the entry form, the picker, the
+      failure panel AND a duplicate footer error all at once — an unreadable pile.
+
+      Checked by painting each state and looking for two strings on the same line
+      within 120px of each other, which is what stacked panels produce.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      game.scene = SCENE.ONLINE;
+
+      const states = [
+        ["the picker", { transport: "webrtc", state: "idle" }],
+        ["the host address form",
+         { transport: "relay", relayIntent: "host", editing: "addr", relayAddr: "a:1" }],
+        ["the join form",
+         { transport: "relay", relayIntent: "join", editing: "code",
+           relayAddr: "a:1", relayCode: "AB" }],
+        ["the browse form",
+         { transport: "relay", relayIntent: "browse", editing: "addr", relayAddr: "a:1" }],
+        ["the port field",
+         { transport: "relay", relayIntent: "host", editing: "port",
+           portText: "9000", relayAddr: "a:1" }],
+        ["a relay connecting",
+         { transport: "relay", state: "creating", role: "host",
+           relayAddr: "a:1", relayUrl: "ws://a:1" }],
+        ["a relay 1v1 host",
+         { transport: "relay", state: "offer", role: "host",
+           relayCode: "WXYZ", relayAddr: "a:1" }],
+        ["a relay tournament lobby",
+         { transport: "relay", state: "offer", role: "host", relayCode: "WXYZ",
+           relayLobby: true, relayAddr: "a:1" }],
+        ["a relay guest joining",
+         { transport: "relay", state: "connecting", role: "guest",
+           relayCode: "WXYZ", relayUrl: "ws://a:1" }],
+        ["a failed relay attempt",
+         { transport: "relay", state: "failed", role: "host", relayIntent: "host",
+           editing: "addr", relayAddr: "a:1", relayUrl: "ws://a:1",
+           error: "could not reach the relay." }],
+        ["a webrtc host", { transport: "webrtc", state: "offer", role: "host",
+                            offerText: "AAAA" }],
+        ["a webrtc guest", { transport: "webrtc", state: "await-offer", role: "guest" }],
+        ["a live connection", { transport: "relay", state: "live", role: "host",
+                               relayCode: "WXYZ", active: true }],
+        ["the lobby browser",
+         { transport: "relay", state: "browsing", relayAddr: "a:1",
+           lobbies: [{ code: "AAAA", name: "X", mode: "match",
+                       players: 1, max: 2, age: 2 }] }],
+        ["an empty lobby browser",
+         { transport: "relay", state: "browsing", relayAddr: "a:1", lobbies: [],
+           error: "no games are open — press H to host one" }],
+      ];
+
+      let stacked = null, offscreen = null;
+      for (const [label, st] of states) {
+        netReset();
+        Object.assign(net, st);
+        if (!net.lobbies) net.lobbies = [];
+        const painted = capturePaint(() => drawOnline());
+        const byY = Object.create(null);
+        for (const l of painted.lines) {
+          const y = Math.round(l.y);
+          (byY[y] = byY[y] || []).push(l);
+        }
+        for (const y in byY) {
+          const ls = byY[y];
+          for (let i = 0; i < ls.length && !stacked; i++) {
+            for (let j = i + 1; j < ls.length; j++) {
+              /*
+                Same line and nearly the same x: two panels drawn over one
+                another. 40px rather than something wider because the lobby
+                browser legitimately puts a player count and a room code on one
+                row about 60px apart — a table is not an overlap.
+              */
+              if (Math.abs(ls[i].x - ls[j].x) < 40) {
+                stacked = `${label}: "${ls[i].s.slice(0, 24)}" over ` +
+                          `"${ls[j].s.slice(0, 24)}" at y=${y}`;
+                break;
+              }
+            }
+          }
+        }
+        const off = painted.lines.find((l) => l.y < 0 || l.y > H);
+        if (off && !offscreen) {
+          offscreen = `${label}: "${off.s.slice(0, 24)}" at y=${Math.round(off.y)}`;
+        }
+        if (stacked && offscreen) break;
+      }
+      ok("no online state draws two panels on top of each other",
+         !stacked, stacked || "");
+      ok("and nothing on that screen lands off the canvas",
+         !offscreen, offscreen || "");
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
     }
 
     // 25e. Failure and teardown must leave nothing behind.
