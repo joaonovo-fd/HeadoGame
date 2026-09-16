@@ -1,5 +1,16 @@
 <meta charset="utf-8">
 <title>Head Game — 1v1 Soccer</title>
+<!--
+  MOBILE. `user-scalable=no` and the touch-action rules below matter as much as
+  the width: without them a tap becomes a scroll, a double-tap zooms, and every
+  press arrives 300ms late — which makes a game unplayable rather than merely
+  awkward. viewport-fit=cover lets the canvas reach under a notch.
+-->
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b1220">
 <style>
   :root {
     --bg: #0b1220;
@@ -14,6 +25,18 @@
     color: var(--ink);
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     overflow: hidden;
+    /*
+      Touch hardening. Each of these disables one browser gesture that would
+      otherwise fight the game: pull-to-refresh and rubber-band scrolling, the
+      long-press text selection that pops a menu mid-match, the tap highlight
+      flash, and iOS's automatic text inflation on rotate.
+    */
+    touch-action: none;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
   }
   #wrap {
     position: fixed;
@@ -27,6 +50,12 @@
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
     border-radius: 6px;
     image-rendering: auto;
+    touch-action: none;
+  }
+  /* On a phone the chrome and rounded corners waste scarce screen, so drop them. */
+  @media (max-width: 820px), (pointer: coarse) {
+    canvas { border-radius: 0; box-shadow: none; }
+    #hint { display: none; }
   }
   #hint {
     position: fixed;
@@ -2832,6 +2861,12 @@ function gatherIntent(edge) {
     a.dashEdge = edge && hit(S.dash);
     a.superEdge = edge && hit(S.super);
     /*
+      ON-SCREEN CONTROLS, folded in for seat 0 only — a phone has one screen and
+      one pair of thumbs. Applied on top of the keyboard reads above rather than
+      instead of them, so a tablet with a keyboard attached can use either.
+    */
+    if (i === 0 && touchPoints.size && touchControlsWanted()) touchIntent(a, edge);
+    /*
       3D arena input. Read here rather than in the arena's own step so every
       seat — keyboard, pad or CPU — reaches the simulation through the same
       `intent` channel the 2D game established.
@@ -3475,6 +3510,94 @@ const layoutProbe = { menu: null, pause: null, controls: null };
   which is how an unpainted arena shipped once already.
 */
 const drawProbe = { platforms: 0, faces: 0, walls: 0 };
+
+/* ------------------------------------------------------- POINTER INPUT
+
+   Mouse and touch. The game was keyboard-only, which is fine on a desktop and
+   impossible on a phone, so every interactive screen now registers CLICK REGIONS
+   as it draws and a tap is resolved against them.
+
+   Regions are collected during the draw pass rather than declared separately:
+   the rectangle you can click is by construction the rectangle that was painted,
+   so the two can never drift apart. The list is rebuilt every frame, so a screen
+   that stops drawing a button stops accepting clicks on it.
+*/
+
+/*
+  Scenes that accept a tap anywhere, because they already accept any key: the win
+  card, tournament standings, the champion, the credits and a finished run.
+*/
+const TAP_ANYWHERE = new Set(["win", "bracket", "champion", "credits",
+                              "runover", "runwin"]);
+
+/** Regions registered by the last draw pass: {x, y, w, h, act}. */
+let clickRegions = [];
+/** Regions being collected by the CURRENT draw pass. */
+let nextRegions = [];
+
+/**
+ * Register a clickable rectangle.
+ *
+ * `act` is a function run when it is tapped, or a string naming a key to
+ * synthesise — a string lets an existing keyboard handler serve the tap without
+ * being restructured, which is how most of these screens are wired.
+ */
+function clickable(x, y, w, h, act) {
+  nextRegions.push({ x, y, w, h, act });
+}
+
+/** Swap the collected regions in, at the end of a draw pass. */
+function commitRegions() {
+  clickRegions = nextRegions;
+  nextRegions = [];
+}
+
+/** The region under a point, topmost (last drawn) first. */
+function regionAt(x, y) {
+  for (let i = clickRegions.length - 1; i >= 0; i--) {
+    const r = clickRegions[i];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r;
+  }
+  return null;
+}
+
+/*
+  Pointer state, in LOGICAL canvas coordinates. The canvas is letterboxed and
+  scaled to fit the window, so a raw client position means nothing until it is
+  mapped back through that transform — see toLogical.
+*/
+const pointer = { x: -1, y: -1, down: false, inside: false, hover: null };
+
+/** Map a client (window) position into logical canvas coordinates. */
+function toLogical(clientX, clientY) {
+  const r = cv.getBoundingClientRect();
+  if (!r.width || !r.height) return { x: -1, y: -1 };
+  return { x: ((clientX - r.left) / r.width) * W,
+           y: ((clientY - r.top) / r.height) * H };
+}
+
+/**
+ * Act on a tap at a logical position. Returns true if something handled it.
+ *
+ * A string `act` is turned into a synthetic key press, which is then read by the
+ * ordinary `hit()` path on the next update — so a tap and a key press travel
+ * exactly the same route through the scene handlers and cannot diverge.
+ */
+/** Keys a tap synthesised this frame, released once the update has read them. */
+const tapKeys = [];
+
+function pointerActivate(x, y) {
+  const r = regionAt(x, y);
+  if (!r) return false;
+  if (typeof r.act === "function") { r.act(); return true; }
+  if (typeof r.act === "string") {
+    pressed[r.act] = true;
+    keys[r.act] = true;
+    tapKeys.push(r.act);
+    return true;
+  }
+  return false;
+}
 
 /** Captures the strings a draw pass paints; see capturePaint(). Off by default. */
 const textProbe = { on: false, lines: [] };
@@ -7150,6 +7273,19 @@ function updateCredits(dt) {
 }
 
 function updateSelect(dt) {
+  /*
+    ESC returns to the setup menu. This screen had no way out at all — a keyboard
+    player was stuck here until both seats locked in, and on a touch device there
+    is no ESC key to press, which is why the BACK button exists too.
+  */
+  if (hit("Escape")) {
+    escUsed = true;
+    game.locked = [false, false];
+    if (game.mode === MODE.TOURNAMENT) { game.scene = SCENE.BRACKET; return; }
+    game.scene = SCENE.MENU;
+    return;
+  }
+
   // A CPU seat picks a team for itself and locks in, so the human only chooses
   // once. Re-rolled each time the screen is entered for variety.
   for (let i = 0; i < 2; i++) {
@@ -9321,6 +9457,13 @@ function frame(now) {
   if (guard === 0) { gatherIntent(true); netPump(); step(0); }
 
   for (const k in pressed) delete pressed[k];
+  /*
+    Keys synthesised by a tap are released here, after the update that consumed
+    them. Without this a tapped key would stay logically held for ever, which
+    reads as the game having jammed.
+  */
+  for (const k of tapKeys) keys[k] = false;
+  tapKeys.length = 0;
   edgeFrame = true;
 
   // Music: pick the track for the current scene and keep the scheduler fed.
@@ -9337,8 +9480,15 @@ const cv = document.getElementById("cv");
 const ctx = cv.getContext("2d");
 
 function fitCanvas() {
-  const pad = 28;
-  const s = Math.min((innerWidth - pad) / W, (innerHeight - pad - 24) / H);
+  /*
+    On a phone every pixel counts, so the desktop padding and the room left for
+    the hint line below the canvas are both dropped — the hint is hidden by the
+    stylesheet at the same breakpoint.
+  */
+  const tight = innerWidth <= 820 || isTouchDevice();
+  const pad = tight ? 0 : 28;
+  const chrome = tight ? 0 : 24;
+  const s = Math.min((innerWidth - pad) / W, (innerHeight - pad - chrome) / H);
   cv.style.width = Math.floor(W * s) + "px";
   cv.style.height = Math.floor(H * s) + "px";
   const dpr = Math.min(devicePixelRatio || 1, 2);
@@ -9347,6 +9497,100 @@ function fitCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 addEventListener("resize", fitCanvas);
+/*
+  Rotating a phone fires orientationchange BEFORE the new dimensions are readable,
+  so the refit is deferred a frame — without the delay the canvas is laid out to
+  the old orientation and stays that way until something else resizes it.
+*/
+addEventListener("orientationchange", () => setTimeout(fitCanvas, 120));
+
+/* ---- mouse and touch -----------------------------------------------------
+
+   Registered once. A tap on a menu is resolved against the click regions the
+   last draw pass registered; a tap during 3D play is handled by the pointer-lock
+   listeners below instead.
+*/
+
+/** Live touches, by identifier, in logical canvas coordinates. */
+const touchPoints = new Map();
+
+/** Is this a touch device? Decides whether on-screen controls are drawn. */
+const isTouchDevice = () => {
+  try {
+    return (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) ||
+           (typeof window !== "undefined" && "ontouchstart" in window);
+  } catch (e) { return false; }
+};
+
+cv.addEventListener("pointermove", (e) => {
+  const p = toLogical(e.clientX, e.clientY);
+  pointer.x = p.x;
+  pointer.y = p.y;
+  pointer.inside = true;
+  // Remembered so the renderer can highlight what is under the cursor, which is
+  // the only affordance telling a mouse user that anything here is clickable.
+  const r = regionAt(p.x, p.y);
+  pointer.hover = r ? r.act : null;
+  try { cv.style.cursor = r ? "pointer" : "default"; } catch (err) { /* no style */ }
+});
+
+cv.addEventListener("pointerleave", () => {
+  pointer.inside = false;
+  pointer.hover = null;
+});
+
+cv.addEventListener("pointerdown", (e) => {
+  const p = toLogical(e.clientX, e.clientY);
+  pointer.x = p.x;
+  pointer.y = p.y;
+  pointer.down = true;
+  /*
+    The 3D arena owns its own pointer handling — a click there fires and captures
+    the mouse — so menu regions are only consulted outside it. The touch pads are
+    an exception: they are regions, and they must work during 3D play.
+  */
+  if (pointerActivate(p.x, p.y)) {
+    e.preventDefault();
+    return;
+  }
+});
+
+addEventListener("pointerup", () => { pointer.down = false; });
+
+/*
+  Touch. preventDefault on the canvas stops a tap being turned into a scroll, a
+  double-tap zoom or a 300ms-delayed click — all three make a game unplayable on
+  a phone. Registered non-passive precisely so preventDefault is allowed.
+*/
+cv.addEventListener("touchstart", (e) => {
+  if (!e.touches || !e.touches.length) return;
+  for (const t of e.touches) {
+    const p = toLogical(t.clientX, t.clientY);
+    touchPoints.set(t.identifier, { x: p.x, y: p.y, sx: p.x, sy: p.y });
+    pointerActivate(p.x, p.y);
+  }
+  e.preventDefault();
+}, { passive: false });
+
+cv.addEventListener("touchmove", (e) => {
+  for (const t of e.changedTouches) {
+    const rec = touchPoints.get(t.identifier);
+    if (!rec) continue;
+    const p = toLogical(t.clientX, t.clientY);
+    rec.x = p.x;
+    rec.y = p.y;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+const endTouch = (e) => {
+  for (const t of e.changedTouches) touchPoints.delete(t.identifier);
+  // A lifted finger must release whatever it was holding, or a held control
+  // sticks down for the rest of the match.
+  e.preventDefault();
+};
+cv.addEventListener("touchend", endTouch, { passive: false });
+cv.addEventListener("touchcancel", endTouch, { passive: false });
 
 /* ---- pointer lock listeners ----------------------------------------------
 
@@ -11376,6 +11620,26 @@ function drawMenu() {
   const valueRow = (x, y, w, label, value, hint, key) => {
     const on = cur === key;
     layoutProbe.menu.labels.push({ key, y, bottom: y + 34 });
+    /*
+      Three regions per row: tapping the LABEL selects the row, and tapping either
+      END steps its value down or up. That mirrors what the arrow keys do, so a
+      tap and a keypress reach the same handler — the row is selected first, then
+      the step is applied, which is exactly the keyboard sequence.
+    */
+    const stepW = 44;
+    clickable(x, y, w, 34, () => { game.menuRow = rows.indexOf(key); });
+    clickable(x, y, stepW, 34, () => {
+      game.menuRow = rows.indexOf(key);
+      pressed[SCHEME[0].left] = true;
+      keys[SCHEME[0].left] = true;
+      tapKeys.push(SCHEME[0].left);
+    });
+    clickable(x + w - stepW, y, stepW, 34, () => {
+      game.menuRow = rows.indexOf(key);
+      pressed[SCHEME[0].right] = true;
+      keys[SCHEME[0].right] = true;
+      tapKeys.push(SCHEME[0].right);
+    });
 
     if (on) {
       ctx.fillStyle = "rgba(125,211,252,0.14)";
@@ -11524,6 +11788,11 @@ function drawMenu() {
     const ny = navY + row * (navH + navGap);
 
     layoutProbe.menu.labels.push({ key: k, y: ny, bottom: ny + navH });
+    // A nav button does one thing, so a tap selects it AND activates it.
+    clickable(nx, ny, navW, navH, () => {
+      game.menuRow = rows.indexOf(k);
+      pressed.Space = true; keys.Space = true; tapKeys.push("Space");
+    });
     ctx.fillStyle = on ? "rgba(255,255,255,0.14)" : "rgba(8,15,28,0.78)";
     roundRect(nx, ny, navW, navH, 8);
     ctx.fill();
@@ -11551,6 +11820,10 @@ function drawMenu() {
     ctx.strokeStyle = on ? "#e879f9" : "rgba(192,132,252,0.35)";
     ctx.lineWidth = on ? 2.5 : 1.5;
     ctx.stroke();
+    clickable(bx3, by3, bw3, bh3, () => {
+      game.menuRow = rows.indexOf("roguelike");
+      pressed.Space = true; keys.Space = true; tapKeys.push("Space");
+    });
     text("⚔  ROGUELIKE RUN", W / 2, by3 + bh3 / 2 - 1, 14,
          on ? "#ffffff" : "#c4b5fd", "center", 900);
     const best = (() => {
@@ -11568,6 +11841,10 @@ function drawMenu() {
     const bw2 = 320, bh2 = 46;
     const bx2 = (W - bw2) / 2, by2 = navBottom + 44;
     layoutProbe.menu.labels.push({ key: "start", y: by2, bottom: by2 + bh2 });
+    clickable(bx2, by2, bw2, bh2, () => {
+      game.menuRow = rows.indexOf("start");
+      pressed.Space = true; keys.Space = true; tapKeys.push("Space");
+    });
 
     if (on) {
       // Breathing halo, so the primary action is unmistakable.
@@ -12039,10 +12316,18 @@ function drawRoster() {
 }
 
 /** A vertical list of choices, used by the pause and settings screens. */
-function drawMenuList(items, cursor, x, y, w, rowH, gap) {
+/**
+ * A vertical list of rows, as used by the pause and settings screens.
+ *
+ * `onPick` is optional: given one, each row becomes clickable and the callback
+ * receives its index. Shared by both screens, so making the list tappable made
+ * both tappable at once.
+ */
+function drawMenuList(items, cursor, x, y, w, rowH, gap, onPick) {
   items.forEach((it, i) => {
     const on = i === cursor;
     const ry = y + i * (rowH + gap);
+    if (onPick) clickable(x, ry, w, rowH, () => onPick(i));
     ctx.fillStyle = on ? "rgba(255,255,255,0.13)" : "rgba(255,255,255,0.05)";
     roundRect(x, ry, w, rowH, 9);
     ctx.fill();
@@ -12163,7 +12448,11 @@ function drawPause() {
       ? { label: l.label, accent: l.accent, hint: l.hint, value: !!game.opt.music }
       : { label: l.label, accent: l.accent };
   });
-  drawMenuList(items, game.pauseRow, W / 2 - 160, cy0 + 96, 320, rowH, rowGap);
+  // Tapping a pause row selects it and activates it, as a click should.
+  drawMenuList(items, game.pauseRow, W / 2 - 160, cy0 + 96, 320, rowH, rowGap, (i) => {
+    game.pauseRow = i;
+    pressed.Space = true; keys.Space = true; tapKeys.push("Space");
+  });
 
   if (net.active) {
     // Be honest: the other machine is still running.
@@ -12205,7 +12494,10 @@ function drawSettings() {
       hint: "read connected controllers" },
     { label: "BACK", accent: "#4ade80" },
   ];
-  drawMenuList(items, game.settingsRow, W / 2 - 260, 154, 520, 54, 10);
+  drawMenuList(items, game.settingsRow, W / 2 - 260, 154, 520, 54, 10, (i) => {
+    game.settingsRow = i;
+    pressed.Space = true; keys.Space = true; tapKeys.push("Space");
+  });
 
   text("left/right or kick to toggle  ·  ESC to go back",
        W / 2, H - 30, 12, "#6b819e", "center", 600);
@@ -13224,6 +13516,19 @@ function drawSelect() {
       const ry = 288 + k * 28;
       const on = !game.cpu[i] && !seatFixed(i) && !game.locked[i] &&
                  game.lookRow[i] === k;
+      /*
+        TAPPABLE. Selecting the row, then stepping its value, are the same two
+        actions the keyboard performs — routed through this seat's own bindings so
+        a tap and a keypress reach updateSelect by exactly the same path.
+      */
+      if (!game.cpu[i] && !seatFixed(i)) {
+        const S = SCHEME[i];
+        const tapKey = (code) => { pressed[code] = true; keys[code] = true; tapKeys.push(code); };
+        clickable(px + 24, ry, pw - 48, 24, () => { game.lookRow[i] = k; });
+        clickable(px + 24, ry, 88, 24, () => { game.lookRow[i] = k; tapKey(S.left); });
+        clickable(px + pw - 48 - 88 + 24, ry, 88, 24,
+                  () => { game.lookRow[i] = k; tapKey(S.right); });
+      }
       ctx.fillStyle = on ? "rgba(125,211,252,0.16)" : "rgba(255,255,255,0.05)";
       roundRect(px + 24, ry, pw - 48, 24, 6);
       ctx.fill();
@@ -13254,6 +13559,17 @@ function drawSelect() {
     for (let t = 0; t < TEAMS.length; t++) {
       const on = t === game.sel[i];
       const dx = dotX0 + t * dotGap;
+      /*
+        Tapping a dot picks that team outright, which is far quicker than stepping
+        through sixteen of them — and it is the only part of this screen where a
+        pointer can do something the keyboard cannot.
+      */
+      if (!game.cpu[i] && !seatFixed(i) && !game.locked[i]) {
+        clickable(dx - dotGap / 2, dotY - 16, Math.max(18, dotGap), 32, () => {
+          game.sel[i] = t;
+          game.lookRow[i] = 0;
+        });
+      }
       ctx.fillStyle = TEAMS[t].color;
       ctx.beginPath();
       ctx.arc(dx, dotY, on ? 9 : 6, 0, Math.PI * 2);
@@ -13265,13 +13581,54 @@ function drawSelect() {
       }
     }
 
-    if (lockedNow) {
+    /*
+      LOCK IN. A real button, not just a hint: on a touch device this is the ONLY
+      way to finish choosing, and without it the select screen was a dead end you
+      could reach but never leave. It doubles as the readiness indicator, so the
+      same spot always tells you where this seat stands.
+    */
+    if (!game.cpu[i] && !seatFixed(i)) {
+      const lw = pw - 48, lh = 34, lx = px + 24, ly = 520;
+      const S = SCHEME[i];
+      clickable(lx, ly, lw, lh, () => {
+        // The seat's own kick binding, so lock and un-lock behave identically to
+        // pressing it — updateSelect already treats kick as a toggle.
+        pressed[S.kick] = true;
+        keys[S.kick] = true;
+        tapKeys.push(S.kick);
+      });
+      const hot = pointer.inside && pointer.x >= lx && pointer.x <= lx + lw &&
+                  pointer.y >= ly && pointer.y <= ly + lh;
+      ctx.fillStyle = lockedNow ? "rgba(74,222,128,0.28)"
+                    : hot ? "rgba(125,211,252,0.28)" : "rgba(125,211,252,0.14)";
+      roundRect(lx, ly, lw, lh, 9);
+      ctx.fill();
+      ctx.strokeStyle = lockedNow ? "#4ade80" : "#7dd3fc";
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      text(lockedNow ? "✓ READY — tap to change"
+                     : `LOCK IN  ·  ${keyLabel(S.kick)}`,
+           px + pw / 2, ly + lh / 2, 13,
+           lockedNow ? "#4ade80" : "#ffffff", "center", 900);
+    } else if (lockedNow) {
       text(seatFixed(i) && !game.cpu[i] ? "LOCKED IN" : "READY",
-           px + pw / 2, 528, 14, "#4ade80", "center", 900);
+           px + pw / 2, 534, 14, "#4ade80", "center", 900);
     }
-    else if (!game.cpu[i]) {
-      text("up/down to switch row", px + pw / 2, 528, 10, "#6b819e", "center", 600);
-    }
+  }
+
+  // A way back to the menu, which on a touch device has no ESC key to press.
+  {
+    const bw = 150, bh = 28, bx = W / 2 - bw / 2, by = 566;
+    clickable(bx, by, bw, bh, () => {
+      pressed.Escape = true; keys.Escape = true; tapKeys.push("Escape");
+    });
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    roundRect(bx, by, bw, bh, 8);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    text("◄  BACK", W / 2, by + bh / 2, 11, "#9fb4d0", "center", 800);
   }
 }
 
@@ -13420,30 +13777,36 @@ function drawOverlays() {
 }
 
 function draw() {
+  /*
+    Regions are collected fresh every frame, so a screen that stops drawing a
+    button stops accepting taps on it. commitRegions() at the end of every exit
+    path swaps the new list in — see drawFinish.
+  */
+  nextRegions = [];
   ctx.save();
 
   // Full-screen scenes that draw no pitch.
-  if (game.scene === SCENE.MENU)     { drawMenu();     ctx.restore(); return; }
-  if (game.scene === SCENE.ONLINE)   { drawOnline();   ctx.restore(); return; }
-  if (game.scene === SCENE.ROSTER)   { drawRoster();   ctx.restore(); return; }
-  if (game.scene === SCENE.PAUSE)    { drawPause();    ctx.restore(); return; }
-  if (game.scene === SCENE.SETTINGS) { drawSettings(); ctx.restore(); return; }
-  if (game.scene === SCENE.BOARD)    { drawBoard();    ctx.restore(); return; }
-  if (game.scene === SCENE.CONTROLS) { drawControls(); ctx.restore(); return; }
-  if (game.scene === SCENE.CREDITS)  { drawCredits();  ctx.restore(); return; }
-  if (game.scene === SCENE.UPGRADE)  { drawUpgrade();  ctx.restore(); return; }
-  if (game.scene === SCENE.RUNOVER)  { drawRunEnd(false); ctx.restore(); return; }
-  if (game.scene === SCENE.RUNWIN)   { drawRunEnd(true);  ctx.restore(); return; }
-  if (game.scene === SCENE.RULES)    { drawRules();    ctx.restore(); return; }
-  if (game.scene === SCENE.SELECT)   { drawSelect();   ctx.restore(); return; }
-  if (game.scene === SCENE.BRACKET)  { drawBracket();  ctx.restore(); return; }
-  if (game.scene === SCENE.CHAMPION) { drawChampion(); ctx.restore(); return; }
+  if (game.scene === SCENE.MENU)     { drawMenu();     drawFinish(); return; }
+  if (game.scene === SCENE.ONLINE)   { drawOnline();   drawFinish(); return; }
+  if (game.scene === SCENE.ROSTER)   { drawRoster();   drawFinish(); return; }
+  if (game.scene === SCENE.PAUSE)    { drawPause();    drawFinish(); return; }
+  if (game.scene === SCENE.SETTINGS) { drawSettings(); drawFinish(); return; }
+  if (game.scene === SCENE.BOARD)    { drawBoard();    drawFinish(); return; }
+  if (game.scene === SCENE.CONTROLS) { drawControls(); drawFinish(); return; }
+  if (game.scene === SCENE.CREDITS)  { drawCredits();  drawFinish(); return; }
+  if (game.scene === SCENE.UPGRADE)  { drawUpgrade();  drawFinish(); return; }
+  if (game.scene === SCENE.RUNOVER)  { drawRunEnd(false); drawFinish(); return; }
+  if (game.scene === SCENE.RUNWIN)   { drawRunEnd(true);  drawFinish(); return; }
+  if (game.scene === SCENE.RULES)    { drawRules();    drawFinish(); return; }
+  if (game.scene === SCENE.SELECT)   { drawSelect();   drawFinish(); return; }
+  if (game.scene === SCENE.BRACKET)  { drawBracket();  drawFinish(); return; }
+  if (game.scene === SCENE.CHAMPION) { drawChampion(); drawFinish(); return; }
   /*
     The 3D arena paints its own world, HUD and scoreboard: none of the 2D pitch
     furniture below applies to it. Placed with the other full-screen scenes for
     exactly that reason.
   */
-  if (game.scene === SCENE.ARENA3D)  { drawArena3D();  ctx.restore(); return; }
+  if (game.scene === SCENE.ARENA3D)  { drawArena3D();  drawFinish(); return; }
 
   if (game.shake > 0) {
     // Gated here rather than at the ~11 places that set `shake`, so the
@@ -13479,7 +13842,240 @@ function draw() {
     text("ESC — pause", W - 14, H - 12, 10, "rgba(143,163,192,0.65)", "right", 600);
   }
 
+  // On a touch device, live play needs on-screen controls or it cannot be played.
+  if (touchControlsWanted()) drawTouchControls();
+
+  drawFinish();
+}
+
+/* ---- on-screen controls --------------------------------------------------
+
+   A phone has no keyboard, so live play needs buttons. They are drawn only on a
+   touch device and only during play, and they feed the SAME `intent` a keyboard
+   fills — so the simulation cannot tell the difference and nothing downstream
+   needed changing.
+*/
+
+/** Should on-screen controls be drawn right now? */
+const touchControlsWanted = () =>
+  isTouchDevice() &&
+  (game.scene === SCENE.PLAY || game.scene === SCENE.COUNTDOWN ||
+   game.scene === SCENE.CELEBRATE || game.scene === SCENE.ARENA3D);
+
+/*
+  Layout. A thumb rests at the bottom corners, so movement sits bottom-left and
+  actions bottom-right; the pads are large because a small target is unusable
+  while also watching the ball.
+*/
+const TC = {
+  padR: 58,            // movement pad radius
+  btnR: 34,            // action button radius
+  margin: 18,
+};
+
+/** The on-screen control layout for the current mode, as hit-testable circles. */
+function touchControlLayout() {
+  const m = TC.margin;
+  const three = game.mode === MODE.ARENA3D;
+  const bx = W - m - TC.btnR;
+  const by = H - m - TC.btnR;
+  const out = {
+    stick: { x: m + TC.padR, y: H - m - TC.padR, r: TC.padR },
+    buttons: [],
+  };
+  // KICK is the primary action, nearest the thumb.
+  out.buttons.push({ id: "kick", x: bx, y: by, r: TC.btnR, label: "KICK", col: "#4ade80" });
+  out.buttons.push({ id: "jump", x: bx - TC.btnR * 2.3, y: by,
+                     r: TC.btnR, label: three ? "JET" : "JUMP", col: "#7dd3fc" });
+  out.buttons.push({ id: "dash", x: bx, y: by - TC.btnR * 2.3,
+                     r: TC.btnR * 0.82, label: "DASH", col: "#fbbf24" });
+  out.buttons.push({ id: "super", x: bx - TC.btnR * 2.1, y: by - TC.btnR * 2.1,
+                     r: TC.btnR * 0.82, label: "SUPER", col: "#a78bfa" });
+  if (three) {
+    out.buttons.push({ id: "grab", x: bx - TC.btnR * 4.2, y: by,
+                       r: TC.btnR * 0.82, label: "GRAB", col: "#f472b6" });
+    out.buttons.push({ id: "wall", x: bx - TC.btnR * 3.9, y: by - TC.btnR * 2.1,
+                       r: TC.btnR * 0.78, label: "WALL", col: "#c084fc" });
+    /*
+      A LOOK area: dragging anywhere in the middle of the screen aims, which is
+      the standard phone-shooter solution to having no mouse. It deliberately
+      excludes the control corners so a thumb on the stick never also turns you.
+    */
+    out.look = { x: W * 0.28, y: 0, w: W * 0.72, h: H * 0.72 };
+  } else {
+    out.buttons.push({ id: "wall", x: bx - TC.btnR * 4.2, y: by,
+                       r: TC.btnR * 0.82, label: "BUILD", col: "#c084fc" });
+  }
+  return out;
+}
+
+/**
+ * Fold live touches into seat 0's intent.
+ *
+ * Called from gatherIntent, so a touch is just another way to fill the same
+ * record the keyboard, the pad, the CPU and the network all write.
+ */
+function touchIntent(a, edge) {
+  const L = touchControlLayout();
+  const inCircle = (t, c) => Math.hypot(t.x - c.x, t.y - c.y) <= c.r * 1.25;
+
+  let stickTouch = null;
+  const held = new Set();
+  let look = null;
+  for (const t of touchPoints.values()) {
+    if (inCircle(t, L.stick)) { stickTouch = t; continue; }
+    let onButton = false;
+    for (const b of L.buttons) {
+      if (inCircle(t, b)) { held.add(b.id); onButton = true; break; }
+    }
+    if (onButton) continue;
+    if (L.look && t.x >= L.look.x && t.y <= L.look.y + L.look.h) look = t;
+  }
+
+  /*
+    The stick is relative to where the finger went DOWN, not to the pad's centre,
+    so a thumb that lands slightly off still reads as neutral. Anything past a
+    small dead zone counts as a direction.
+  */
+  if (stickTouch) {
+    const dx = stickTouch.x - stickTouch.sx;
+    const dy = stickTouch.y - stickTouch.sy;
+    const dz = 12;
+    if (dx < -dz) a.left = true;
+    if (dx > dz) a.right = true;
+    if (dy < -dz) a.up = true;
+    if (dy > dz) a.down = true;
+  }
+
+  const was = touchPrev;
+  a.kick = held.has("kick");
+  a.kickEdge = edge && held.has("kick") && !was.has("kick");
+  a.wallEdge = edge && held.has("wall") && !was.has("wall");
+  a.dashEdge = edge && held.has("dash") && !was.has("dash");
+  a.superEdge = edge && held.has("super") && !was.has("super");
+  a.grabEdge = edge && held.has("grab") && !was.has("grab");
+  // Jump is HELD in 3D, because holding it is what runs the jetpack.
+  if (game.mode === MODE.ARENA3D) a.jump = held.has("jump");
+  else if (held.has("jump")) a.up = true;
+
+  // Aim by dragging: the delta since the last frame, so it is rate-independent.
+  if (look) {
+    if (touchLook.id !== null) {
+      a.aimX += (look.x - touchLook.x) * TOUCH_LOOK_SENS;
+      a.aimY -= (look.y - touchLook.y) * TOUCH_LOOK_SENS;
+    }
+    touchLook.id = 1;
+    touchLook.x = look.x;
+    touchLook.y = look.y;
+  } else {
+    touchLook.id = null;
+  }
+
+  if (edge) touchPrev = held;
+}
+
+/** Which buttons were held last frame, for edge detection. */
+let touchPrev = new Set();
+const touchLook = { id: null, x: 0, y: 0 };
+const TOUCH_LOOK_SENS = 0.0045;
+
+/** Draw the on-screen controls, highlighting whatever is being held. */
+function drawTouchControls() {
+  const L = touchControlLayout();
+  const pressedIds = new Set();
+  let stickTouch = null;
+  for (const t of touchPoints.values()) {
+    if (Math.hypot(t.x - L.stick.x, t.y - L.stick.y) <= L.stick.r * 1.25) {
+      stickTouch = t;
+      continue;
+    }
+    for (const b of L.buttons) {
+      if (Math.hypot(t.x - b.x, t.y - b.y) <= b.r * 1.25) pressedIds.add(b.id);
+    }
+  }
+
+  ctx.save();
+  // Movement pad.
+  ctx.globalAlpha = 0.5;
+  ctx.strokeStyle = "rgba(255,255,255,0.4)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(L.stick.x, L.stick.y, L.stick.r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(6,12,22,0.35)";
+  ctx.fill();
+  // The thumb position, clamped to the pad so it reads as a stick.
+  if (stickTouch) {
+    const dx = clamp(stickTouch.x - stickTouch.sx, -L.stick.r, L.stick.r);
+    const dy = clamp(stickTouch.y - stickTouch.sy, -L.stick.r, L.stick.r);
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = "#7dd3fc";
+    ctx.beginPath();
+    ctx.arc(L.stick.x + dx * 0.6, L.stick.y + dy * 0.6, L.stick.r * 0.36, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath();
+    ctx.arc(L.stick.x, L.stick.y, L.stick.r * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  for (const b of L.buttons) {
+    const on = pressedIds.has(b.id);
+    ctx.globalAlpha = on ? 0.9 : 0.5;
+    ctx.fillStyle = on ? b.col : "rgba(6,12,22,0.45)";
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = b.col;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    text(b.label, b.x, b.y, b.r > 30 ? 11 : 9, on ? "#0b1220" : b.col, "center", 900);
+  }
   ctx.restore();
+}
+
+/**
+ * End a draw pass: a pause button on touch, then swap in this frame's regions.
+ *
+ * Every exit path from draw() runs through here, so the click regions can never
+ * be left over from an earlier frame — which would mean tapping where a button
+ * used to be.
+ */
+function drawFinish() {
+  /*
+    TAP TO CONTINUE. Several screens — the win card, the bracket, the champion,
+    the credits, a finished run — simply wait for any key. A full-screen region
+    behind everything else makes a tap anywhere do the same thing, which is what a
+    phone user will try first. Registered FIRST so any real button drawn on those
+    screens sits on top of it and wins the hit test.
+  */
+  if (TAP_ANYWHERE.has(game.scene)) {
+    // Unshifted onto the FRONT of the list: regionAt searches back to front, so
+    // anything drawn during the pass sits on top of this and wins the hit test.
+    nextRegions.unshift({ x: 0, y: 0, w: W, h: H, act: "Space" });
+  }
+  /*
+    A touch device has no ESC key, so PAUSABLE scenes get a corner button. Added
+    here rather than in each scene's own draw so no pausable scene can forget it.
+  */
+  if (isTouchDevice() && PAUSABLE.has(game.scene)) {
+    const s = 34, x = W - s - 8, y = 8;
+    clickable(x, y, s, s, () => { if (!game.paused) openPause(); });
+    ctx.fillStyle = "rgba(6,12,22,0.7)";
+    roundRect(x, y, s, s, 8);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.2)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = "#cddcf2";
+    ctx.fillRect(x + 12, y + 10, 3.5, 14);
+    ctx.fillRect(x + 19, y + 10, 3.5, 14);
+  }
+  ctx.restore();
+  commitRegions();
 }
 
 /* ------------------------------------------------------ 11. SELF-TEST SUITE */
@@ -13499,6 +14095,11 @@ const PHYS = {
   cleanName, loadNames, saveNames, NAME_MAX, DEFAULT_NAMES, seatLabel,
   openPause, closePause, quitToMenu, updatePause, updateSettings, drawPause,
   drawMenu, drawMenuBackdrop, drawLogo, stepMenuFx, menuFx, layoutProbe, MENU_GROUP,
+  // Pointer and touch input.
+  clickable, commitRegions, regionAt, pointerActivate, toLogical, pointer,
+  touchPoints, touchIntent, touchControlLayout, touchControlsWanted,
+  drawTouchControls, isTouchDevice, drawFinish, tapKeys,
+  getClickRegions: () => clickRegions,
   updateMenu, MENU_ROWS,
   loadBoard, saveBoard, boardRecord, rankBoard, recordResult, lbPlayed, lbWinPct,
   MAPS, mapById, activePlatforms, MODE_PLATFORMS, resolvePlatform, ballVsPlatforms, playerVsPlatforms,
@@ -24572,6 +25173,294 @@ function runTests() {
     game.particles = [];
     game.bullets = [];
     game.helpers = [];
+  }
+
+  /* ---------------------------------------------------------------------
+     POINTER AND TOUCH
+
+     The game was keyboard-only, which is impossible on a phone. Every screen now
+     registers click regions as it draws, so the rectangle you can tap is by
+     construction the rectangle that was painted.
+     ------------------------------------------------------------------- */
+  // 28a. Regions, hit testing and synthesised keys.
+  {
+    const saved = { scene: game.scene, mode: game.mode, menuRow: game.menuRow,
+                    cpu: [...game.cpu], sel: [...game.sel],
+                    locked: [...game.locked], lookRow: [...game.lookRow],
+                    players: game.players, ball: game.ball };
+
+    /** Draw, tap a point, then run one update — the real per-frame sequence. */
+    /*
+     * Draw, tap, update — the same order the frame loop uses, INCLUDING its
+     * end-of-frame key release. Without that release a tapped key stays held and
+     * the next tap arrives with the previous one still down, which is how a
+     * sequence of taps starts producing results no single tap would.
+     */
+    const tap = (x, y) => {
+      draw();                       // regions are whatever the last pass painted
+      const hitIt = pointerActivate(x, y);
+      edgeFrame = true;             // a tap is an edge, exactly like a keypress
+      step(0);
+      for (const k in pressed) delete pressed[k];
+      for (const k of tapKeys) keys[k] = false;
+      tapKeys.length = 0;
+      return hitIt;
+    };
+
+    ok("a tap outside every region does nothing",
+       (() => { game.scene = SCENE.MENU; draw();
+                return pointerActivate(-50, -50) === false; })());
+    ok("regionAt finds the topmost region",
+       (() => { clickRegions = [{ x: 0, y: 0, w: 100, h: 100, act: "A" },
+                                { x: 10, y: 10, w: 20, h: 20, act: "B" }];
+                return regionAt(15, 15).act === "B"; })());
+    ok("and nothing outside them",
+       (() => { clickRegions = [{ x: 0, y: 0, w: 10, h: 10, act: "A" }];
+                return regionAt(50, 50) === null; })());
+    ok("a synthesised key is released after the frame that reads it",
+       (() => {
+         tapKeys.length = 0;
+         clickRegions = [{ x: 0, y: 0, w: W, h: H, act: "KeyZ" }];
+         pointerActivate(5, 5);
+         if (!keys.KeyZ) return false;
+         // The frame loop clears them; emulate that step.
+         for (const k of tapKeys) keys[k] = false;
+         tapKeys.length = 0;
+         return !keys.KeyZ;
+       })());
+    ok("logical coordinates are derived from the canvas rect, not raw client px",
+       (() => { const p = toLogical(0, 0); return isFinite(p.x) && isFinite(p.y); })());
+
+    // 28b. The MENU is fully operable by pointer.
+    {
+      game.scene = SCENE.MENU;
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, true];
+      game.menuRow = 0;
+      draw();
+      const regions = clickRegions;
+      ok("the menu registers click regions", regions.length > 10, `${regions.length}`);
+      const lbl = (k) => layoutProbe.menu.labels.find((l) => l.key === k);
+
+      // Stepping a value row by tapping its right-hand end.
+      const before = game.mode;
+      const mr = lbl("mode");
+      const wide = clickRegions
+        .filter((r) => Math.abs(r.y - mr.y) < 1)
+        .reduce((a, b) => (b.w > a.w ? b : a));
+      tap(wide.x + wide.w - 12, mr.y + 17);
+      ok("tapping the end of a menu row changes its value",
+         game.mode !== before, `${before} -> ${game.mode}`);
+
+      // A nav button both selects and activates.
+      game.mode = MODE.SINGLE;
+      draw();
+      const cr = lbl("controls");
+      const creg = clickRegions
+        .find((r) => Math.abs(r.y - cr.y) < 1 && r.w < 200);
+      tap(creg.x + creg.w / 2, cr.y + 10);
+      ok("tapping a nav button opens that screen", game.scene === SCENE.CONTROLS,
+         game.scene);
+
+      /*
+        START. The nav test above left the CONTROLS screen open, and its own state
+        (ctrlFrom, ctrlBinding) would send the next ESC or ENTER back there — so
+        the screen is properly closed before this is measured rather than merely
+        overwriting `scene`.
+      */
+      game.ctrlFrom = null;
+      game.ctrlBinding = null;
+      game.locked = [false, false];
+      game.scene = SCENE.MENU;
+      game.mode = MODE.SINGLE;
+      game.menuRow = 0;
+      /*
+        Drawn TWICE on purpose. The first pass rebuilds the row list for the mode
+        just restored — the earlier taps changed it — and the second records the
+        regions for that list. Reading a label from one layout and tapping it in
+        another is what made this fail: the tap landed on whatever row now sits at
+        those coordinates.
+      */
+      draw();
+      draw();
+      const sr = lbl("start");
+      tap(W / 2, sr.y + 20);
+      ok("tapping START begins team selection", game.scene === SCENE.SELECT,
+         game.scene);
+    }
+
+    /*
+      28c. The SELECT screen. This was a dead end on a phone: reachable, with no
+      way to choose a team or to finish. Every part of it must be tappable.
+    */
+    {
+      game.scene = SCENE.SELECT;
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, false];
+      game.sel = [0, 3];
+      game.locked = [false, false];
+      game.lookRow = [0, 0];
+      draw();
+
+      // No keys held over from an earlier tap, or a stray left/right would step
+      // the team as well and the assertion would be off by one.
+      for (const k in pressed) delete pressed[k];
+      for (const k of tapKeys) keys[k] = false;
+      tapKeys.length = 0;
+
+      // Team dots: one region each, and tapping one picks that team outright.
+      const dots = clickRegions.filter((r) => Math.abs(r.y - 484) < 2 && r.x < 500);
+      ok("every team has a tappable dot on the select screen",
+         dots.length === TEAMS.length, `${dots.length} of ${TEAMS.length}`);
+      tap(dots[7].x + dots[7].w / 2, 500);
+      ok("tapping a team dot selects that team", game.sel[0] === 7, `${game.sel[0]}`);
+
+      // The picker rows step with a tap on either end.
+      const faceBefore = lookForSeat(0).face;
+      draw();
+      const faceRow = clickRegions.filter((r) => Math.abs(r.y - 316) < 2 && r.x < 500);
+      ok("a picker row registers a body and two arrows", faceRow.length === 3,
+         `${faceRow.length}`);
+      const rightArrow = faceRow.reduce((a, b) => (b.x > a.x ? b : a));
+      tap(rightArrow.x + 10, 328);
+      ok("tapping a picker arrow changes the value",
+         lookForSeat(0).face !== faceBefore,
+         `${faceBefore} -> ${lookForSeat(0).face}`);
+
+      /*
+        LOCK IN. Without this button the screen cannot be completed by touch at
+        all, which is the bug this whole section exists to prevent regressing.
+      */
+      draw();
+      const lock0 = clickRegions.find((r) => Math.abs(r.y - 520) < 1 && r.x < 500);
+      ok("each seat has a LOCK IN button", !!lock0);
+      const lock1 = clickRegions.find((r) => Math.abs(r.y - 520) < 1 && r.x > 500);
+      ok("including the second seat", !!lock1);
+      tap(lock0.x + lock0.w / 2, 537);
+      ok("tapping LOCK IN readies that seat", game.locked[0] === true);
+      // Tapping again un-readies, so a change of mind is possible.
+      draw();
+      tap(lock0.x + lock0.w / 2, 537);
+      ok("and tapping it again un-readies", game.locked[0] === false);
+
+      // Both seats ready starts the match.
+      draw();
+      tap(lock0.x + lock0.w / 2, 537);
+      draw();
+      tap(lock1.x + lock1.w / 2, 537);
+      ok("readying both seats starts the match", game.scene === SCENE.COUNTDOWN,
+         game.scene);
+
+      // BACK leaves the screen, which ESC now does too.
+      game.scene = SCENE.SELECT;
+      game.locked = [false, false];
+      draw();
+      const back = clickRegions.find((r) => Math.abs(r.y - 566) < 2);
+      ok("the select screen offers a way back", !!back);
+      tap(back.x + back.w / 2, 580);
+      ok("and tapping it returns to the menu", game.scene === SCENE.MENU, game.scene);
+      // The same must work from the keyboard, which it previously did not.
+      game.scene = SCENE.SELECT;
+      pressed.Escape = true;
+      edgeFrame = true;
+      updateSelect(0);
+      ok("ESC also leaves the select screen", game.scene === SCENE.MENU, game.scene);
+      delete pressed.Escape;
+      escUsed = false;
+    }
+
+    // 28d. Tap-anywhere screens, and the pause list.
+    {
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, true];
+      game.sel = [0, 3];
+      startMatch();
+      game.scene = SCENE.WIN;
+      game.winner = 0;
+      draw();
+      ok("a tap-anywhere screen accepts a tap in the middle",
+         !!regionAt(W / 2, H / 2));
+      tap(W / 2, H / 2);
+      ok("and it advances", game.scene !== SCENE.WIN, game.scene);
+
+      // The pause list rows are tappable, sharing drawMenuList with settings.
+      startMatch();
+      game.scene = SCENE.PLAY;
+      openPause();
+      draw();
+      const rows = clickRegions.filter((r) => r.w === 320);
+      ok("the pause menu rows are tappable",
+         rows.length === PAUSE_ITEMS.length, `${rows.length}`);
+      // RESUME is the first row.
+      tap(rows[0].x + 10, rows[0].y + 10);
+      ok("tapping RESUME closes the pause overlay",
+         game.scene !== SCENE.PAUSE, game.scene);
+    }
+
+    // 28e. On-screen controls feed the same intent a keyboard does.
+    {
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, true];
+      game.sel = [0, 3];
+      startMatch();
+      game.scene = SCENE.PLAY;
+      const L = touchControlLayout();
+      ok("the touch layout puts movement bottom-left",
+         L.stick.x < W / 2 && L.stick.y > H / 2);
+      ok("and the actions bottom-right",
+         L.buttons.every((b) => b.x > W / 2 && b.y > H / 3));
+      ok("and every button is on screen",
+         L.buttons.every((b) => b.x - b.r >= 0 && b.x + b.r <= W &&
+                                b.y - b.r >= 0 && b.y + b.r <= H),
+         L.buttons.filter((b) => b.x + b.r > W).map((b) => b.id).join());
+      ok("with a kick button, which is the primary action",
+         L.buttons.some((b) => b.id === "kick"));
+
+      // A finger on the stick, dragged right, must read as "right".
+      touchPoints.clear();
+      touchPoints.set(1, { x: L.stick.x + 40, y: L.stick.y,
+                           sx: L.stick.x, sy: L.stick.y });
+      const a = intent[0];
+      a.left = a.right = a.up = a.down = false;
+      touchIntent(a, true);
+      ok("dragging the stick right moves right", a.right && !a.left);
+      touchPoints.clear();
+      touchPoints.set(1, { x: L.stick.x, y: L.stick.y - 40,
+                           sx: L.stick.x, sy: L.stick.y });
+      a.left = a.right = a.up = a.down = false;
+      touchIntent(a, true);
+      ok("and dragging it up jumps", a.up && !a.down);
+      // A neutral finger is not a direction.
+      touchPoints.clear();
+      touchPoints.set(1, { x: L.stick.x + 2, y: L.stick.y + 2,
+                           sx: L.stick.x, sy: L.stick.y });
+      a.left = a.right = a.up = a.down = false;
+      touchIntent(a, true);
+      ok("a resting thumb is not a direction",
+         !a.left && !a.right && !a.up && !a.down);
+
+      // A press on the kick button must produce exactly one kick edge.
+      touchPoints.clear();
+      touchPrev = new Set();
+      const kb = L.buttons.find((b) => b.id === "kick");
+      touchPoints.set(2, { x: kb.x, y: kb.y, sx: kb.x, sy: kb.y });
+      a.kickEdge = false;
+      touchIntent(a, true);
+      ok("tapping KICK produces a kick", a.kick && a.kickEdge);
+      touchIntent(a, true);
+      ok("and holding it does not kick again", a.kick && !a.kickEdge);
+      touchPoints.clear();
+      touchPrev = new Set();
+      ok("drawing the controls does not throw",
+         (() => { try { drawTouchControls(); return true; }
+                  catch (e) { return false; } })());
+    }
+
+    clickRegions = [];
+    tapKeys.length = 0;
+    touchPoints.clear();
+    Object.assign(game, saved);
+    game.particles = [];
   }
 
   // 23. Determinism: identical initial conditions give identical results.
