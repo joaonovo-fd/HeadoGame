@@ -461,12 +461,16 @@ const CELEBRATE_T = 1.8;
 const COUNTDOWN_T = 3.2;
 
 /*
-  Tournament: a single-elimination bracket for 2-8 hot-seat players sharing the
+  Tournament: a single-elimination bracket for 2-16 hot-seat players sharing the
   two control schemes. Each round pairs the survivors; the winner of each tie
   advances. With an odd number of entrants one player gets a bye that round.
+
+  16 is four full rounds — last 16, quarters, semis, final — which is the largest
+  bracket the standings screen can list legibly. The bracket code is size-agnostic
+  (it pairs whatever survives), so this is a limit on the DISPLAY, not the logic.
 */
 const TOURN_MIN = 2;
-const TOURN_MAX = 8;
+const TOURN_MAX = 16;
 
 /*
   Player names. Typed on the setup screen, persisted in localStorage so they
@@ -8501,6 +8505,36 @@ function fireShot(f) {
   return true;
 }
 
+/*
+  How hard a bullet shoves the ball. Well below a kick: shooting the ball is for
+  nudging a loose one goalward or clearing your own line, not a replacement for
+  getting to it — otherwise there would be no reason to run at the ball at all.
+*/
+const A_SHOT_PUSH = 620;
+
+/**
+ * Does a shot's travel this step touch the ball?
+ *
+ * Swept, like the fighter test, and for the same reason: at SHOT_SPD a bullet
+ * crosses the ball in a fraction of one substep, so a point-in-sphere test would
+ * miss nearly every hit.
+ */
+function shotVsBall(s, b, dt) {
+  const ax = s.x, ay = s.y, az = s.z;
+  const dx = s.vx * dt, dy = s.vy * dt, dz = s.vz * dt;
+  const rr = (b.r + SHOT_R) * (b.r + SHOT_R);
+  // Closest approach of the segment to the ball centre, clamped to the segment.
+  const dd = dx * dx + dy * dy + dz * dz;
+  let t = 0;
+  if (dd > 1e-9) {
+    t = ((b.x - ax) * dx + (b.y - ay) * dy + (b.z - az) * dz) / dd;
+    t = clamp(t, 0, 1);
+  }
+  const px = ax + dx * t, py = ay + dy * t, pz = az + dz * t;
+  const ex = px - b.x, ey = py - b.y, ez = pz - b.z;
+  return ex * ex + ey * ey + ez * ez <= rr;
+}
+
 /**
  * Does a shot's travel this step touch a fighter?
  *
@@ -8606,6 +8640,32 @@ function stepShots(dt) {
     if (s.life <= 0) { A.shots.splice(i, 1); continue; }
 
     let done = false;
+
+    /*
+      THE BALL IS A TARGET. Shots used to test only against fighters and passed
+      straight through the ball, which made the gun useless in a mode won on
+      goals — you could not blast a loose ball toward the net or clear one off
+      your own line. Checked BEFORE fighters so a shot along a line that touches
+      both hits whichever is nearer, and a carried ball is skipped because it is
+      the carrier who gets hit instead.
+    */
+    if (A.ball && A.carriedBy < 0 && shotVsBall(s, A.ball, dt)) {
+      const dir = v3norm(v3(s.vx, s.vy, s.vz));
+      A.ball.vx += dir.x * A_SHOT_PUSH;
+      A.ball.vz += dir.z * A_SHOT_PUSH;
+      // Always some lift, so a shot along the floor still pops the ball up
+      // rather than merely scuffing it along.
+      A.ball.vy += Math.max(dir.y * A_SHOT_PUSH, A_SHOT_PUSH * 0.3);
+      limitArenaBall(A.ball);
+      A.ball.lastTouch = s.owner;
+      A.hitFx.push({ x: s.x, y: s.y, z: s.z, life: 0.25 });
+      game.shake = Math.max(game.shake, 0.14);
+      const shooter = A.fighters[s.owner];
+      if (shooter) superGain(shooter, SUPER_GAIN_KICK * (game.rules.superRate || 1));
+      A.shots.splice(i, 1);
+      continue;
+    }
+
     for (const f of A.fighters) {
       // Never friendly fire: a shot cannot hit the seat that fired it.
       if (f.seat === s.owner) continue;
@@ -13486,7 +13546,8 @@ const PHYS = {
   isArena3D, segmentHitsCover, updateArenaCameras, outsideArena, occludedFromCam,
   mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
   stepFighter, moveBasis, arenaBounds, fighterVsCover,
-  fireShot, stepShots, shotVsFighter, applyDamage, arenaFrag, aimRay, fighterEye,
+  fireShot, stepShots, shotVsFighter, shotVsBall, applyDamage, arenaFrag, aimRay,
+  fighterEye, A_SHOT_PUSH,
   arenaMouseSeat,
   drawArena3D, drawArenaWorld, drawFighterBillboard, drawArenaHUD, arenaViews,
   drawArenaSky, drawArenaScoreboard, arenaFloorFaces, arenaWallFaces, shiftHex,
@@ -22593,12 +22654,20 @@ function runTests() {
     game.cpu = [false, true];
     game.sel = [0, 3];
 
-    /** A fresh match with both fighters parked where the test wants them. */
+    /**
+     * A fresh match with both fighters parked where the test wants them.
+     *
+     * The BALL is parked well out of the way: shots now collide with it, so a
+     * ball left on the centre spot would intercept every shot aimed down the
+     * pitch and these tests would be measuring the wrong thing.
+     */
     const duel = (aPos, bPos) => {
       startMatch();
       const [a, b] = game.arena.fighters;
       Object.assign(a, aPos, { vx: 0, vy: 0, vz: 0 });
       Object.assign(b, bPos, { vx: 0, vy: 0, vz: 0 });
+      Object.assign(game.arena.ball,
+        { x: ARENA_HW - 60, y: A_BALL_R, z: ARENA_HD - 60, vx: 0, vy: 0, vz: 0 });
       return [a, b];
     };
 
@@ -23779,6 +23848,114 @@ function runTests() {
     }
   }
 
+  // 25z. 3D shots must move the BALL, not pass through it.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, timeIdx: game.timeIdx, goalsToWin: game.goalsToWin };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    game.timeIdx = 0;
+    game.goalsToWin = 9;
+
+    /** A fighter aiming down the pitch at a ball sitting on the centre spot. */
+    const shooter = () => {
+      startMatch();
+      const f = game.arena.fighters[0];
+      Object.assign(f, { x: 0, y: 0, z: -300, yaw: 0, pitch: 0,
+                         vx: 0, vy: 0, vz: 0, fireCD: 0 });
+      Object.assign(game.arena.ball,
+        { x: 0, y: A_BALL_R, z: 0, vx: 0, vy: 0, vz: 0 });
+      game.arena.cover.length = 0;
+      return [f, game.arena.ball];
+    };
+
+    {
+      const [f, b] = shooter();
+      // Aim slightly up, at the middle of the ball rather than its base.
+      f.pitch = Math.atan2(A_BALL_R - EYE_H, 300);
+      fireShot(f);
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot moves the ball", Math.hypot(b.vx, b.vy, b.vz) > 100,
+         `speed ${Math.hypot(b.vx, b.vy, b.vz).toFixed(0)}`);
+      ok("downfield, in the direction the shot travelled", b.vz > 0,
+         `vz=${b.vz.toFixed(0)}`);
+      ok("and lifts it off the floor", b.vy > 0, `vy=${b.vy.toFixed(0)}`);
+      ok("and the shot is consumed", game.arena.shots.length === 0);
+      ok("and the shooter is credited with the touch", b.lastTouch === f.seat);
+    }
+    // A shot is weaker than a kick, so running at the ball still matters.
+    {
+      const [f, b] = shooter();
+      f.pitch = Math.atan2(A_BALL_R - EYE_H, 300);
+      fireShot(f);
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      const shotSpeed = Math.hypot(b.vx, b.vy, b.vz);
+      const [f2, b2] = shooter();
+      Object.assign(f2, { z: -60, kickCD: 0 });
+      kickArenaBall(f2);
+      const kickSpeed = Math.hypot(b2.vx, b2.vy, b2.vz);
+      ok("shooting the ball is weaker than kicking it", shotSpeed < kickSpeed,
+         `shot ${shotSpeed.toFixed(0)} vs kick ${kickSpeed.toFixed(0)}`);
+    }
+    // A shot wide of the ball leaves it alone.
+    {
+      const [f, b] = shooter();
+      b.x = 400;                          // well off the line of fire
+      fireShot(f);
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot wide of the ball does not move it",
+         Math.hypot(b.vx, b.vy, b.vz) < 1e-6);
+    }
+    // A CARRIED ball is not shootable: the carrier takes the hit instead.
+    {
+      const [f] = shooter();
+      const foe = game.arena.fighters[1];
+      Object.assign(foe, { x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
+                           vx: 0, vy: 0, vz: 0, grabCD: 0 });
+      const p = carryPoint(foe);
+      Object.assign(game.arena.ball, { x: p.x, y: p.y, z: p.z });
+      grabBall(foe);
+      ok("the opponent is holding the ball", isCarrying(foe));
+      f.pitch = Math.atan2(FIGHTER_H * 0.5 - EYE_H, 300);
+      f.fireCD = 0;
+      fireShot(f);
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot at a carried ball hits the carrier instead",
+         foe.hp < HP_MAX, `hp ${foe.hp}`);
+    }
+    // A fast shot must not tunnel past the ball between substeps.
+    {
+      const [f, b] = shooter();
+      f.pitch = Math.atan2(A_BALL_R - EYE_H, 300);
+      fireShot(f);
+      stepShots(0.25);                    // one oversized step
+      ok("a fast shot cannot tunnel through the ball",
+         Math.hypot(b.vx, b.vy, b.vz) > 1, `${Math.hypot(b.vx, b.vy, b.vz).toFixed(1)}`);
+    }
+    // And a shot can score, which is the point of the whole change.
+    {
+      const [f, b] = shooter();
+      Object.assign(f, { z: ARENA_HD - 400 });
+      Object.assign(b, { x: 0, y: A_BALL_R, z: ARENA_HD - 120, vx: 0, vy: 0, vz: 0 });
+      f.pitch = Math.atan2(A_BALL_R - EYE_H, 280);
+      f.fireCD = 0;
+      fireShot(f);
+      let scored = -1;
+      for (let i = 0; i < Math.round(3 / DT) && scored < 0; i++) {
+        stepShots(DT);
+        if (game.arena.carriedBy < 0) stepArenaBall(DT);
+        scored = arenaGoalScored(b);
+      }
+      ok("a ball shot over the line scores", scored === 1, `${scored}`);
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
   // 26a. 3D GRAB and THROW.
   {
     const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
@@ -24216,6 +24393,18 @@ function runTests() {
     game.mode = MODE.SINGLE;
     game.cpu = [false, true];
 
+    /*
+      Power-ups OFF for this sweep. A `smaller` pickup landing during the five
+      seconds of live match resized the player independently of the power, and the
+      cleanup assertion below blamed the power for it — a 1-in-20 flake that read
+      as "bulwark left the player resized". The point here is the power's own
+      bookkeeping, so the pitch is kept clear of anything else that scales.
+    */
+    const savedRules = { ...game.rules };
+    game.rules.puRate = 0;
+    game.rules.mineRate = 0;
+    game.chaos = false;
+
     let bad = null;
     for (let i = 0; i < TEAMS.length && !bad; i++) {
       game.sel = [i, (i + 1) % TEAMS.length];
@@ -24268,6 +24457,7 @@ function runTests() {
     }
     ok("every superpower fires, runs its course and cleans up after itself",
        !bad, bad || "");
+    Object.assign(game.rules, savedRules);
 
     /*
       A power fired just before a goal must keep expiring through the
