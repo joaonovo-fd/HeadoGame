@@ -4083,6 +4083,7 @@ const net = {
   pending: null,         // host: the slot currently awaiting an answer
   nextPeerId: 1,         // host: ids handed to joiners, never reused
   myEntrant: 0,          // which entrant THIS machine plays (host is always 0)
+  identified: false,     // guest: has the host told us which entrant we are?
   joinNote: "",          // transient lobby message (someone joined or dropped)
   joinNoteT: 0,
 };
@@ -4105,6 +4106,7 @@ function netReset() {
   net.peers = [];
   net.nextPeerId = 1;
   net.myEntrant = 0;
+  net.identified = false;
   net.joinNote = "";
   net.joinNoteT = 0;
   net.active = false;
@@ -4890,7 +4892,8 @@ function netHandle(msg, peer) {
     if (typeof msg.e === "number" && Number.isFinite(msg.e) &&
         msg.e >= 0 && msg.e < TOURN_MAX) {
       net.myEntrant = msg.e;
-      applyTieControl();               // re-seat now that we know who we are
+      net.identified = true;           // we now know which entrant we are
+      applyTieControl();               // re-seat accordingly
     }
     return;
   }
@@ -5087,8 +5090,26 @@ function applyTieControl() {
 
     The right question is the same on every machine: is MY entrant in this tie?
   */
+  /*
+    Use entrant-based seating when this machine actually KNOWS which entrant it
+    is: the host always does, and a lobby guest is told by a "me" packet. A
+    legacy two-machine guest is never sent one, so it keeps the owner-string path
+    below — without this distinction it would assume entrant 0, the host's, and
+    drive the wrong seat.
+  */
+  /*
+    Entrant-based seating applies when this machine is part of a MULTI-PLAYER
+    session and knows which entrant it is.
+
+    A hub host always qualifies. A guest qualifies once the host has told it (the
+    "me" packet). A legacy two-machine session qualifies for neither: its guest is
+    never sent an identity, and its host plays every tie itself — including local
+    and CPU ones, where entrant 0 is not seated at all. Both keep the
+    owner-string path below, which is what that session shape expects.
+  */
   const inTournament = game.mode === MODE.TOURNAMENT && net.myEntrant != null;
-  if (netIsHub() || inTournament) {
+  const knowsSelf = netIsHub() || net.identified === true;
+  if (inTournament && knowsSelf) {
     const mine = game.seats.indexOf(net.myEntrant);
     if (mine >= 0) {
       net.localSeat = mine;
@@ -17598,6 +17619,192 @@ function runTests() {
     Object.assign(net, savedNet);
     Object.assign(game, saved);
     game.rules = saved.rules;
+    game.particles = [];
+  }
+
+  // 19as. Lobby reliability: joining, identity, spectating and bracket size.
+  {
+    const saved = { mode: game.mode, scene: game.scene, players: game.players,
+                    ball: game.ball, entrants: game.entrants, cpu: [...game.cpu],
+                    entrantCount: game.entrantCount, seats: [...game.seats] };
+    const savedNet = { ...net };
+
+    /*
+      A JOINING PEER MUST NOT HIJACK THE HOST'S SCREEN. `net.state` is this
+      machine's own connection state; a peer's channel opening used to set it to
+      "live", which tore the host out of its lobby the instant anybody joined —
+      the join code and player list vanished, no more players could be added, and
+      START ran a 1v1 instead of the tournament.
+    */
+    {
+      netReset();
+      game.scene = SCENE.ONLINE;
+      net.active = true; net.role = "host"; net.state = "lobby";
+      net.offerText = "X".repeat(120);
+      for (let i = 1; i <= 3; i++) {
+        const peer = { id: i, entrantId: i, name: "", chan: null, pc: null,
+                       lastRecv: 0, state: "new" };
+        net.peers.push(peer);
+        const chan = { readyState: "open", onopen: null, onclose: null,
+                       onerror: null, onmessage: null, send: () => {}, close: () => {} };
+        netAttachChannel(chan, peer);
+        chan.onopen();
+        ok(`the host keeps its lobby with ${i} joined`, net.state === "lobby",
+           net.state);
+        ok(`joiner ${i} is marked live on its own`, peer.state === "live",
+           String(peer.state));
+      }
+      const shot = capturePaint(drawOnline);
+      ok("the lobby is still on screen after joins",
+         shot.strings.some((t) => /TOURNAMENT LOBBY/.test(t)));
+      ok("and it is not showing the two-player card",
+         !shot.strings.some((t) => /✓ CONNECTED/.test(t)));
+
+      // One peer erroring must not blank the whole lobby either.
+      const p0 = net.peers[0];
+      const chan2 = { readyState: "open", onopen: null, onclose: null,
+                      onerror: null, onmessage: null, send: () => {}, close: () => {} };
+      netAttachChannel(chan2, p0);
+      chan2.onerror();
+      ok("one peer's error does not break the lobby", !net.error, net.error);
+      netReset();
+    }
+
+    /*
+      EVERY JOINER MUST BE TOLD WHICH ENTRANT IT IS. The bracket is a broadcast so
+      it cannot carry a per-recipient answer; without a private "me" packet a
+      guest kept the default of 0 — the HOST's entrant — published input for a
+      seat it did not own, and was timed out and replaced by a CPU.
+    */
+    {
+      netReset();
+      net.active = true; net.role = "host";
+      const sent = [];
+      const peer = { id: 1, entrantId: 2, name: "B",
+                     chan: { readyState: "open", send: (d) => sent.push(JSON.parse(d)) },
+                     pc: null, lastRecv: 0 };
+      net.peers.push(peer);
+      netSendBracket();
+      ok("the host tells each peer its own entrant",
+         sent.some((m) => m.t === "me" && m.e === 2), JSON.stringify(sent));
+
+      // The guest adopts it and re-seats.
+      net.peers = [];
+      net.role = "guest";
+      net.myEntrant = 0;
+      net.identified = false;
+      game.mode = MODE.TOURNAMENT;
+      game.entrants = [
+        { id: 0, name: "A", owner: "host", alive: true, teamIdx: 0, look: null },
+        { id: 1, name: "B", owner: "guest", alive: true, teamIdx: 1, look: null },
+      ];
+      game.seats = [1, 0];               // the guest's entrant sits at seat 0
+      netHandle({ t: "me", e: 1 });
+      ok("a guest learns which entrant it plays", net.myEntrant === 1);
+      ok("and it is flagged as identified", net.identified === true);
+      ok("and it re-seats onto the right seat", net.localSeat === 0,
+         `${net.localSeat}`);
+
+      // A nonsense identity is refused rather than indexing off the bracket.
+      netHandle({ t: "me", e: 999 });
+      ok("an out-of-range identity is refused", net.myEntrant === 1,
+         `${net.myEntrant}`);
+      netHandle({ t: "me", e: "two" });
+      ok("a non-numeric identity is refused", net.myEntrant === 1);
+      netReset();
+    }
+
+    /*
+      A SPECTATOR MUST STILL SPEAK. Sending nothing while watching somebody else's
+      tie meant the host heard six seconds of silence and dropped a player who was
+      sitting there happily — the reported mid-tournament disconnect.
+    */
+    {
+      netReset();
+      net.active = true; net.role = "guest";
+      const sent = [];
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      net.spectating = true;
+      net.localSeat = -1;
+      for (let i = 0; i < Math.ceil(1 / DT); i++) netPump();   // one second
+      ok("a spectator sends a heartbeat", sent.length > 0, `${sent.length}`);
+      ok("and it is only a heartbeat, never input",
+         sent.every((m) => m.t === "ka"),
+         sent.map((m) => m.t).join(","));
+      ok("the heartbeat rate is modest", sent.length <= NET_BEAT_HZ + 1,
+         `${sent.length} in a second`);
+      ok("a heartbeat carries no seat", sent.every((m) => m.b === undefined));
+
+      // It must keep the connection alive for longer than the timeout.
+      net.active = true; net.role = "host";
+      const peer = { id: 1, entrantId: 1, name: "B",
+                     chan: { readyState: "open", send: () => {} },
+                     pc: null, lastRecv: 0 };
+      net.peers = [peer];
+      for (let i = 0; i < Math.ceil((NET_TIMEOUT + 2) / DT); i++) {
+        netPump();
+        // The channel handler resets this on any inbound frame, heartbeat too.
+        if (i % Math.round(1 / (NET_BEAT_HZ * DT)) === 0) peer.lastRecv = 0;
+      }
+      ok("a heartbeating peer is never dropped", net.peers.length === 1,
+         `${net.peers.length}`);
+      // And the host still accepts the message without mistaking it for junk.
+      let threw = null;
+      try { netHandle({ t: "ka" }, peer); } catch (e) { threw = e.message; }
+      ok("a heartbeat is handled cleanly", !threw, threw || "");
+      netReset();
+    }
+
+    /*
+      BRACKET SIZE. Two humans are enough to start; CPUs fill the rest, and the
+      size chosen on the setup screen is honoured when it seats everyone present.
+    */
+    {
+      netReset();
+      net.active = true; net.role = "host"; net.myEntrant = 0;
+      game.names = ["HOST", "X"];
+      game.goalsToWin = 3;
+      game.timeIdx = 0;
+      const build = (joiners, chosen) => {
+        net.peers = [];
+        for (let i = 1; i <= joiners; i++) {
+          net.peers.push({ id: i, entrantId: i, name: `P${i + 1}`,
+                           chan: { readyState: "open", send: () => {} },
+                           pc: null, lastRecv: 0 });
+        }
+        game.mode = MODE.TOURNAMENT;
+        game.entrantCount = chosen;
+        startLobbyTournament();
+        return {
+          n: game.entrantCount,
+          humans: game.entrants.filter((e) => e.owner !== "cpu").length,
+          cpus: game.entrants.filter((e) => e.owner === "cpu").length,
+        };
+      };
+
+      const two = build(1, 4);
+      ok("two humans can start a tournament", two.n === 4, `${two.n}`);
+      ok("and the rest of the bracket is CPUs", two.cpus === 2 && two.humans === 2,
+         `${two.humans} human / ${two.cpus} CPU`);
+
+      const big = build(1, 8);
+      ok("the chosen bracket size is honoured", big.n === 8, `${big.n}`);
+      ok("with CPUs filling every empty slot", big.cpus === 6, `${big.cpus}`);
+
+      const full = build(7, 8);
+      ok("a full lobby needs no CPUs", full.cpus === 0 && full.humans === 8,
+         `${full.humans} human / ${full.cpus} CPU`);
+
+      // The bracket can never be smaller than the turnout.
+      const over = build(7, 2);
+      ok("the bracket never seats fewer than the people present", over.n === 8,
+         `${over.n} for 8 humans`);
+      ok("nor fewer than the minimum", build(0, 1).n >= TOURN_MIN);
+      netReset();
+    }
+
+    Object.assign(net, savedNet);
+    Object.assign(game, saved);
     game.particles = [];
   }
 
