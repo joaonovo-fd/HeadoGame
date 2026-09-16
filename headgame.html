@@ -6741,6 +6741,163 @@ function stepFighter(f, a, dt) {
   arenaBounds(f);
 }
 
+/* ---- shooting -------------------------------------------------------- */
+
+/** Muzzle position: the fighter's eye line. */
+const fighterEye = (f) => v3(f.x, f.y + EYE_H, f.z);
+
+/**
+ * The unit direction a fighter is aiming.
+ *
+ * Yaw and pitch together, so shots go where the crosshair is — the crosshair
+ * sits at the viewport centre and the camera looks along this same vector, which
+ * is what makes the aim honest.
+ */
+function aimRay(f) {
+  const cp = Math.cos(f.pitch);
+  return v3(Math.sin(f.yaw) * cp, Math.sin(f.pitch), Math.cos(f.yaw) * cp);
+}
+
+/** Fire, if the cooldown allows. Returns true when a shot was created. */
+function fireShot(f) {
+  if (f.dead || f.fireCD > 0) return false;
+  const dir = aimRay(f);
+  const eye = fighterEye(f);
+  game.arena.shots.push({
+    // Spawned slightly ahead of the eye so a shot never starts inside its owner.
+    x: eye.x + dir.x * (FIGHTER_R + 2),
+    y: eye.y + dir.y * (FIGHTER_R + 2),
+    z: eye.z + dir.z * (FIGHTER_R + 2),
+    vx: dir.x * SHOT_SPD,
+    vy: dir.y * SHOT_SPD,
+    vz: dir.z * SHOT_SPD,
+    life: SHOT_LIFE,
+    owner: f.seat,
+  });
+  f.fireCD = FIRE_CD;
+  return true;
+}
+
+/**
+ * Does a shot's travel this step touch a fighter?
+ *
+ * Tested as a swept segment against the fighter's capsule rather than a point
+ * against a sphere: at 1750 units/s a shot crosses a 26-unit fighter in well
+ * under one substep, so a point test would miss most hits outright.
+ */
+function shotVsFighter(s, f, dt) {
+  if (f.dead) return false;
+  const a = v3(s.x, s.y, s.z);
+  const b = v3(s.x + s.vx * dt, s.y + s.vy * dt, s.z + s.vz * dt);
+  const d = v3sub(b, a);
+  const dd = v3dot(d, d);
+
+  // The fighter's body as a vertical segment, foot to head.
+  const c0 = v3(f.x, f.y + FIGHTER_R, f.z);
+  const c1 = v3(f.x, f.y + FIGHTER_H - FIGHTER_R, f.z);
+  const rr = (FIGHTER_R + SHOT_R) * (FIGHTER_R + SHOT_R);
+
+  // Sample the swept segment against the body segment. Closed-form
+  // segment-segment distance would be exact, but the shot is a straight line
+  // over a hair of a second: sampling is simpler to read and its error is far
+  // below the radii involved.
+  const N = 6;
+  for (let i = 0; i <= N; i++) {
+    const t = dd > 0 ? i / N : 0;
+    const p = v3(a.x + d.x * t, a.y + d.y * t, a.z + d.z * t);
+    // Closest point on the body segment to p, clamped to the segment.
+    const bv = v3sub(c1, c0);
+    const bl = v3dot(bv, bv);
+    const u = bl > 0 ? clamp(v3dot(v3sub(p, c0), bv) / bl, 0, 1) : 0;
+    const q = v3add(c0, v3scale(bv, u));
+    const diff = v3sub(p, q);
+    if (v3dot(diff, diff) <= rr) return true;
+    if (dd === 0) break;
+  }
+  return false;
+}
+
+/**
+ * Apply damage, and resolve a death if it kills.
+ *
+ * `bySeat` is the shooter, so the frag is credited to them and never to the
+ * victim. Returns true when this hit was fatal.
+ */
+function applyDamage(f, dmg, bySeat) {
+  if (f.dead) return false;
+  f.hp -= dmg;
+  f.hurt = 0.25;
+  if (f.hp > 0) return false;
+
+  f.hp = 0;
+  f.dead = true;
+  f.respawn = RESPAWN_T;
+  f.vx = f.vy = f.vz = 0;
+  const killer = game.arena.fighters.find((o) => o.seat === bySeat);
+  if (killer && killer !== f) arenaFrag(killer, f);
+  return true;
+}
+
+/**
+ * Credit a frag and check whether that ends the match.
+ *
+ * The scoreline mirrors the frag count so the shared scoreboard, leaderboard and
+ * win handling all work unchanged — `finishMatch` and `recordResult` are the
+ * same ones every other mode uses.
+ */
+function arenaFrag(killer, victim) {
+  game.arena.frags[killer.seat]++;
+  game.score[killer.seat] = game.arena.frags[killer.seat];
+  game.lastScorer = killer.seat;
+  game.shake = Math.max(game.shake, 0.3);
+  game.flash = Math.max(game.flash, 0.22);
+  game.arena.hitFx.push({ x: victim.x, y: victim.y + EYE_H, z: victim.z, life: 0.6 });
+
+  if (game.arena.frags[killer.seat] >= game.goalsToWin) {
+    finishMatch(killer.seat, false);
+    endArena3D();
+  }
+}
+
+/** Advance every projectile, resolving hits and expiry. */
+function stepShots(dt) {
+  const A = game.arena;
+  for (let i = A.shots.length - 1; i >= 0; i--) {
+    const s = A.shots[i];
+    s.life -= dt;
+    if (s.life <= 0) { A.shots.splice(i, 1); continue; }
+
+    let done = false;
+    for (const f of A.fighters) {
+      // Never friendly fire: a shot cannot hit the seat that fired it.
+      if (f.seat === s.owner) continue;
+      if (shotVsFighter(s, f, dt)) {
+        applyDamage(f, SHOT_DMG, s.owner);
+        A.hitFx.push({ x: s.x, y: s.y, z: s.z, life: 0.3 });
+        done = true;
+        break;
+      }
+    }
+    if (done) { A.shots.splice(i, 1); continue; }
+
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.z += s.vz * dt;
+
+    // Cover and walls stop a shot dead: no ricochets, so cover is dependable.
+    if (s.y <= 0 || outsideArena(v3(s.x, s.y, s.z)) ||
+        segmentHitsCover(v3(s.x, s.y, s.z), v3(s.x, s.y, s.z))) {
+      A.hitFx.push({ x: s.x, y: s.y, z: s.z, life: 0.22 });
+      A.shots.splice(i, 1);
+    }
+  }
+
+  for (let i = A.hitFx.length - 1; i >= 0; i--) {
+    A.hitFx[i].life -= dt;
+    if (A.hitFx[i].life <= 0) A.hitFx.splice(i, 1);
+  }
+}
+
 function step(dt) {
   /*
     A GUEST runs no simulation at all — the host owns the world and streams it.
@@ -10411,6 +10568,7 @@ const PHYS = {
   isArena3D, segmentHitsCover, updateArenaCameras, outsideArena,
   mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
   stepFighter, moveBasis, arenaBounds, fighterVsCover,
+  fireShot, stepShots, shotVsFighter, applyDamage, arenaFrag, aimRay, fighterEye,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
@@ -19402,6 +19560,200 @@ function runTests() {
         }
       }
       ok("no sequence of inputs produces a non-finite fighter", !bad, bad || "");
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 24j. Combat: hits, damage, frags and the end of a match.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, score: [...game.score], board: game.board,
+                    goalsToWin: game.goalsToWin, clock: game.clock,
+                    winner: game.winner, shake: game.shake, flash: game.flash };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+
+    /** A fresh match with both fighters parked where the test wants them. */
+    const duel = (aPos, bPos) => {
+      startMatch();
+      const [a, b] = game.arena.fighters;
+      Object.assign(a, aPos, { vx: 0, vy: 0, vz: 0 });
+      Object.assign(b, bPos, { vx: 0, vy: 0, vz: 0 });
+      return [a, b];
+    };
+
+    // Aim: the ray must agree with yaw and pitch.
+    {
+      const f = makeFighter(0, TEAMS[0]);
+      f.yaw = 0; f.pitch = 0;
+      const r = aimRay(f);
+      ok("aiming with yaw 0 points along +z",
+         near(r.z, 1, 1e-9) && near(r.x, 0, 1e-9) && near(r.y, 0, 1e-9));
+      f.yaw = Math.PI / 2;
+      ok("aiming with yaw 90° points along +x", near(aimRay(f).x, 1, 1e-9));
+      f.yaw = 0; f.pitch = PITCH_MAX;
+      ok("aiming up gives a positive y component", aimRay(f).y > 0);
+      ok("and the aim ray is always a unit vector",
+         (() => {
+           for (let i = 0; i < 40; i++) {
+             f.yaw = i * 0.37; f.pitch = ((i % 7) - 3) * 0.3;
+             if (Math.abs(v3len(aimRay(f)) - 1) > 1e-9) return false;
+           }
+           return true;
+         })());
+    }
+
+    // A shot fired straight at an opponent hits.
+    {
+      const [a, b] = duel({ x: 0, z: -300, yaw: 0, pitch: 0 }, { x: 0, z: 0 });
+      // Clear the pillar out of the way: this test is about the hit, not cover.
+      game.arena.cover = [];
+      ok("firing creates a projectile", fireShot(a) && game.arena.shots.length === 1);
+      const hpBefore = b.hp;
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot along the aim ray hits the opponent", b.hp < hpBefore,
+         `hp ${hpBefore} -> ${b.hp}`);
+      ok("and does exactly the documented damage", b.hp === hpBefore - SHOT_DMG,
+         `${hpBefore - b.hp}`);
+      ok("and the projectile is consumed by the hit", game.arena.shots.length === 0);
+    }
+
+    // A shot aimed past the opponent misses.
+    {
+      const [a, b] = duel({ x: 0, z: -300, yaw: 0, pitch: 0 }, { x: 220, z: 0 });
+      game.arena.cover = [];
+      fireShot(a);
+      for (let i = 0; i < 60 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot aimed well past the opponent misses", b.hp === HP_MAX, `${b.hp}`);
+    }
+    // Firing respects its cooldown.
+    {
+      const [a] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      ok("the first shot fires", fireShot(a));
+      ok("an immediate second shot is refused", !fireShot(a));
+      a.fireCD = 0;
+      ok("and allowed once the cooldown has elapsed", fireShot(a));
+    }
+    // A dead fighter cannot shoot.
+    {
+      const [a] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      a.dead = true;
+      ok("a dead fighter cannot fire", !fireShot(a));
+    }
+
+    /*
+      NO FRIENDLY FIRE. Checked by firing straight through the shooter's own
+      position: the shot must pass through its owner untouched.
+    */
+    {
+      const [a, b] = duel({ x: 0, z: 0, yaw: 0, pitch: 0 }, { x: 0, z: 400 });
+      game.arena.cover = [];
+      fireShot(a);
+      const hpA = a.hp;
+      for (let i = 0; i < 8; i++) stepShots(DT);
+      ok("a shot never damages the seat that fired it", a.hp === hpA, `${a.hp}`);
+    }
+
+    // Four hits kill; three do not.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      applyDamage(b, SHOT_DMG, 0);
+      applyDamage(b, SHOT_DMG, 0);
+      applyDamage(b, SHOT_DMG, 0);
+      ok("three hits leave a fighter standing", !b.dead && b.hp === 25, `${b.hp}`);
+      const fatal = applyDamage(b, SHOT_DMG, 0);
+      ok("the fourth hit kills", b.dead && fatal);
+      ok("and health floors at zero rather than going negative", b.hp === 0, `${b.hp}`);
+      ok("and a respawn timer starts", near(b.respawn, RESPAWN_T, 1e-9));
+      ok("and a dead fighter takes no further damage",
+         (() => { const r = applyDamage(b, SHOT_DMG, 0); return !r && b.hp === 0; })());
+    }
+
+    // A kill credits the shooter, never the victim.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      game.goalsToWin = 5;
+      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      ok("a kill credits the shooter", game.arena.frags[0] === 1);
+      ok("and credits the victim with nothing", game.arena.frags[1] === 0);
+      ok("and the shared scoreline mirrors the frag count",
+         game.score[0] === 1 && game.score[1] === 0);
+    }
+    // Suicide is impossible: damage attributed to the victim credits nobody.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      game.goalsToWin = 5;
+      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 1);
+      ok("dying to your own damage credits no frag at all",
+         game.arena.frags[0] === 0 && game.arena.frags[1] === 0,
+         `${game.arena.frags}`);
+    }
+
+    // Dying respawns the fighter after the timer, at full health.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      game.goalsToWin = 5;
+      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      const a0 = { left: false, right: false, up: false, down: false,
+                   aimX: 0, aimY: 0, jump: false, dashEdge: false };
+      const n = Math.round((RESPAWN_T + 0.05) / DT);
+      for (let i = 0; i < n; i++) stepFighter(b, a0, DT);
+      ok("a dead fighter comes back after the respawn delay", !b.dead);
+      ok("and comes back at full health", b.hp === HP_MAX);
+    }
+
+    // Reaching the frag target ends the match through the shared path.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      game.goalsToWin = 2;
+      const boardBefore = JSON.stringify(game.board);
+      // First frag: not enough.
+      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      ok("one frag short of the target does not end the match",
+         game.scene === SCENE.ARENA3D, game.scene);
+      // Second frag: the match ends.
+      b.dead = false; b.hp = HP_MAX;
+      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      ok("reaching the frag target ends the match", game.scene === SCENE.WIN,
+         game.scene);
+      ok("and names the right winner", game.winner === 0, `${game.winner}`);
+      ok("and tears the arena down", game.arena === null);
+      ok("and records the result on the leaderboard",
+         JSON.stringify(game.board) !== boardBefore);
+    }
+
+    // Shots stop at cover, so cover is dependable.
+    {
+      const [a, b] = duel({ x: 0, z: -300, yaw: 0, pitch: 0 }, { x: 0, z: 300 });
+      fireShot(a);                       // straight through the centre pillar
+      for (let i = 0; i < 90 && game.arena.shots.length; i++) stepShots(DT);
+      ok("a shot is stopped by cover instead of passing through",
+         b.hp === HP_MAX, `${b.hp}`);
+    }
+    // And expire rather than accumulating forever.
+    {
+      const [a] = duel({ x: 0, z: -460, yaw: Math.PI, pitch: 0 }, { x: 400, z: 400 });
+      game.arena.cover = [];
+      fireShot(a);
+      const n = Math.round((SHOT_LIFE + 0.2) / DT);
+      for (let i = 0; i < n; i++) stepShots(DT);
+      ok("a shot that hits nothing is eventually removed",
+         game.arena.shots.length === 0, `${game.arena.shots.length}`);
+    }
+    // A fast shot must not tunnel past a fighter between substeps.
+    {
+      const [a, b] = duel({ x: 0, z: -300, yaw: 0, pitch: 0 }, { x: 0, z: 0 });
+      game.arena.cover = [];
+      fireShot(a);
+      // One big step, larger than the time the shot needs to cross the body.
+      stepShots(0.2);
+      ok("a fast shot cannot tunnel through a fighter in one big step",
+         b.hp < HP_MAX, `${b.hp}`);
     }
 
     endArena3D();
