@@ -283,6 +283,110 @@ const GOAL_SIZE_BIG = 1.75;
 const GOAL_SIZE_SMALL = 0.5;
 
 /*
+  DASH — a short burst of speed on a cooldown, available in every mode.
+
+  Distinct from the SPEED power-up: that raises your top speed for seconds, this
+  is an instant reposition you spend and wait for. It is the one movement option
+  that does not depend on finding a pickup, so both players always have it.
+
+  The 2D dash is horizontal along `facing`; the 3D arena's is along the camera
+  forward. Both read these constants, so the move feels the same in both halves
+  of the game.
+*/
+const DASH_V = 720;           // 2D horizontal burst (px/s)
+const DASH_CD = 1.45;         // seconds before it recharges
+const DASH_T = 0.16;          // how long the burst lasts
+const DASH_AIR = 1;           // dashes allowed per airtime, so it is not a fly
+
+/*
+  SUPERPOWERS — one signature ability per team, charged by playing.
+
+  Deliberately NOT another entry in POWERUPS. A power-up is random and found on
+  the floor; a superpower is who your character IS: the same team always has the
+  same power, so picking Green Giants is a tactical choice rather than a colour.
+
+  Charge accrues from doing things that matter — touching the ball, taking a hit,
+  conceding — so it rewards involvement and a losing player is never locked out.
+  At full charge the ability is spent with the SUPER key and the meter empties.
+
+  Each power is matched to its team's stats rather than assigned at random, so a
+  Bulldozer's power suits a heavy immovable side and a Sprinter's suits a fast
+  light one.
+*/
+const SUPER_MAX = 100;              // charge needed to fire
+const SUPER_GAIN_TOUCH = 9;         // per ball touch
+const SUPER_GAIN_KICK = 4;          // per kick that connects
+const SUPER_GAIN_HIT = 16;          // when hit by a bullet or mine
+const SUPER_GAIN_CONCEDE = 34;      // when the opponent scores
+const SUPER_GAIN_TIME = 2.1;        // per second, so a quiet match still charges
+const SUPER_GAIN_FRAG = 22;         // 3D arena: per frag scored
+const SUPER_GAIN_DAMAGE = 11;       // 3D arena: per hit taken
+
+const SUPERS = {
+  /*
+    Each entry: a label, a colour for the meter, how long the effect lasts, and
+    a one-line hint shown on the select screen. `dur` of 0 is instantaneous.
+  */
+  rocket:   { label: "ROCKET BOOST", color: "#ef4444", dur: 5,
+              hint: "huge shot power and a blazing burst" },
+  quake:    { label: "QUAKE",        color: "#78716c", dur: 0,
+              hint: "slam the ground: stuns and launches the ball" },
+  bulwark:  { label: "BULWARK",      color: "#3f9c48", dur: 6,
+              hint: "immovable and double size" },
+  flea:     { label: "FLEA JUMP",    color: "#e5c534", dur: 6,
+              hint: "endless mid-air jumps" },
+  cannon:   { label: "CANNON",       color: "#8b56c9", dur: 5,
+              hint: "the ball becomes a guided missile on your kick" },
+  tumble:   { label: "TUMBLE",       color: "#e2822f", dur: 6,
+              hint: "no gravity — fly freely" },
+  blink:    { label: "BLINK",        color: "#2fb9c4", dur: 0,
+              hint: "teleport instantly to the ball" },
+  freeze:   { label: "DEEP FREEZE",  color: "#38bdf8", dur: 2.6,
+              hint: "freeze your opponent where they stand" },
+  panther:  { label: "POUNCE",       color: "#ec4899", dur: 5,
+              hint: "speed, reach and a longer dash" },
+  titan:    { label: "TITAN GRIP",   color: "#0d9488", dur: 6,
+              hint: "the ball is drawn toward you" },
+  volley:   { label: "ARROW STORM",  color: "#f59e0b", dur: 0,
+              hint: "a volley of shots, all at once" },
+  owl:      { label: "OWL EYES",     color: "#4f46e5", dur: 6,
+              hint: "slow the world while you keep pace" },
+  livewire: { label: "LIVEWIRE",     color: "#84cc16", dur: 5,
+              hint: "the ball sticks to you and never escapes" },
+  charge:   { label: "BULL CHARGE",  color: "#b91c1c", dur: 4,
+              hint: "unstoppable: barge through everything" },
+  sentinel: { label: "LAST WALL",    color: "#64748b", dur: 8,
+              hint: "a keeper AND a striker at once" },
+  venom:    { label: "VENOM SHOT",   color: "#a855f7", dur: 5,
+              hint: "your shots curve toward the goal" },
+};
+const SUPER_KEYS = Object.keys(SUPERS);
+
+/*
+  Which team has which power, by roster index. Ordered to match TEAMS exactly,
+  so the pairing is legible here rather than buried in a lookup — and asserted by
+  the suite, since a mismatch would silently give a team the wrong identity.
+*/
+const TEAM_SUPER = [
+  "rocket",    // Red Rockets      — all-rounder, so a straightforward buff
+  "blink",     // Blue Bolts       — fastest, so a teleport
+  "bulwark",   // Green Giants     — biggest, so immovability
+  "flea",      // Yellow Fleas     — best jumper, so infinite jumps
+  "cannon",    // Purple Cannons   — best shot, so a guided missile
+  "tumble",    // Orange Acrobats  — acrobat, so free flight
+  "quake",     // Cyan Sprinters   — light and quick, so a ground slam
+  "charge",    // Black Bulldozers — heaviest, so an unstoppable barge
+  "panther",   // Pink Panthers    — balanced attacker
+  "titan",     // Teal Titans      — heavy, so it pulls the ball in
+  "volley",    // Amber Arrows     — arrows, so a volley
+  "owl",       // Indigo Owls      — owl eyes, so bullet time
+  "livewire",  // Lime Livewires   — the ball sticks to it
+  "freeze",    // Crimson Bulls    — slow but strong, so it stops the other
+  "sentinel",  // Slate Sentinels  — defensive, so it summons helpers
+  "venom",     // Violet Vipers    — best shot and speed, so curving shots
+];
+
+/*
   Volleyball mode: a net at midfield, players confined to their own half, and a
   point is conceded when the ball touches the ground on your side. Goals are not
   used at all, so the scoring rule is entirely separate.
@@ -543,6 +647,12 @@ const RULE_DEFS = [
     hint: "seconds between chaos re-rolls" },
   { key: "movingGoals",label: "MOVING GOALS",   type: "flag",
     hint: "normally only chaos slides the nets" },
+  { key: "dash",       label: "DASH",           type: "flag",
+    hint: "the burst move, on every character" },
+  { key: "supers",     label: "SUPERPOWERS",    type: "flag",
+    hint: "each team's signature ability" },
+  { key: "superRate",  label: "SUPER CHARGE",   type: "mul",  min: 0.25, max: 3, step: 0.25,
+    hint: "how fast a superpower meter fills" },
 ];
 
 /** Authored defaults, cloned into game.rules at boot. */
@@ -550,6 +660,9 @@ const RULE_DEFAULTS = {
   puRate: 1, puLife: 1, puMaxLive: 3,
   mineRate: 1, mineMaxLive: 3,
   chaosRate: 1, movingGoals: false,
+  // Both new abilities default ON: they are meant to be part of the game rather
+  // than an option to discover, and the rules screen can switch them off.
+  dash: true, supers: true, superRate: 1,
 };
 
 const ruleDef = (key) => RULE_DEFS.find((r) => r.key === key);
@@ -1972,6 +2085,273 @@ const HELP_KICK = 620;        // striker kick impulse
 const HELP_KICK_CD = 0.55;    // striker kick cooldown
 const HELP_KEEP_X = 92;       // keeper distance from its own goal line
 
+/* ---- dash and superpowers ------------------------------------------------
+
+   Both are shared by the 2D modes and the 3D arena. The charge bookkeeping and
+   the power table live here, once, so the two simulations cannot drift on what a
+   superpower means — only on how it is applied.
+*/
+
+/**
+ * Which superpower a team carries.
+ *
+ * Looked up by roster position, so TEAM_SUPER reads as a table beside TEAMS. An
+ * unknown team (a test fixture, say) falls back to the first power rather than
+ * leaving a player with no ability at all.
+ */
+function superForTeam(team) {
+  const i = TEAMS.indexOf(team);
+  return (i >= 0 && TEAM_SUPER[i]) || TEAM_SUPER[0];
+}
+
+/** The power definition for a fighter or player, or null if it has none. */
+function superDef(who) {
+  return who && who.superId ? SUPERS[who.superId] || null : null;
+}
+
+/**
+ * Add charge to a player or fighter, capped at full.
+ *
+ * Everything that charges the meter routes through here so the cap and the
+ * "already firing" rule are enforced in one place: charge gained mid-power would
+ * let a long ability roll straight into the next one.
+ */
+function superGain(who, amount) {
+  if (!who || !game.rules.supers) return;
+  if (who.superT > 0) return;
+  who.superCharge = clamp(who.superCharge + amount, 0, SUPER_MAX);
+}
+
+/** Is this player's power charged and ready to fire? */
+const superReady = (who) =>
+  !!who && !!game.rules.supers && who.superT <= 0 && who.superCharge >= SUPER_MAX;
+
+/** Fraction of the meter filled, for the HUD. */
+const superFrac = (who) => (who ? clamp(who.superCharge / SUPER_MAX, 0, 1) : 0);
+
+/**
+ * Spend a full meter and start the power.
+ *
+ * Instantaneous powers (`dur === 0`) do their work here and leave `superT` at
+ * zero; timed powers set `superT` and are finished by endSuper. Splitting it that
+ * way means tickSuper only ever has to handle powers that are actually running.
+ */
+function fireSuper(pl) {
+  const def = superDef(pl);
+  if (!def) return false;
+  pl.superCharge = 0;
+  pl.superT = def.dur;
+  game.superFx = { seat: pl.index, id: pl.superId, t: 1.1 };
+  game.shake = Math.max(game.shake, 0.3);
+  burst(pl.x, pl.y, def.color, 40);
+
+  const b = game.ball;
+  const foe = game.players[1 - pl.index];
+
+  switch (pl.superId) {
+    case "quake": {
+      /*
+        A ground slam. Only meaningful from the air, so it drives the player down
+        first if they are not already grounded — otherwise the power would be
+        wasted by pressing it at the wrong moment.
+      */
+      if (!pl.onGround) { pl.vy = Math.max(pl.vy, 1500); pl.quakePending = true; break; }
+      quakeSlam(pl);
+      break;
+    }
+    case "blink": {
+      // Teleport to the ball, landing just short of it so the arrival does not
+      // count as a kick the player never made.
+      if (b) {
+        const side = b.x < pl.x ? 1 : -1;
+        pl.x = clamp(b.x + side * (pl.r + b.r + 2), WALL + pl.r, W - WALL - pl.r);
+        pl.y = clamp(b.y, pl.r, GROUND_Y - pl.r);
+        pl.vx = 0;
+        pl.vy = 0;
+        burst(pl.x, pl.y, SUPERS.blink.color, 26);
+      }
+      break;
+    }
+    case "volley": {
+      // A fan of shots at once, regardless of ammo: the power IS the ammo.
+      const n = 5;
+      for (let i = 0; i < n; i++) {
+        const spread = (i - (n - 1) / 2) * 0.16;
+        game.bullets.push({
+          x: pl.x + pl.facing * (pl.r + 6),
+          y: pl.y - 4,
+          vx: pl.facing * BULLET_SPD * Math.cos(spread),
+          vy: BULLET_SPD * Math.sin(spread) * 0.5,
+          r: BULLET_R, life: BULLET_LIFE, owner: pl.index,
+        });
+      }
+      break;
+    }
+    case "freeze": {
+      // Stun the opponent where they stand. Their gravity still applies, so they
+      // fall rather than hanging in the air — the same rule a mine stun uses.
+      if (foe) {
+        foe.stun = Math.max(foe.stun, SUPERS.freeze.dur);
+        burst(foe.x, foe.y, SUPERS.freeze.color, 30);
+      }
+      break;
+    }
+    case "sentinel":
+      // Both helpers at once, which is the defensive team's whole identity.
+      spawnHelper(pl.index, "keeper");
+      spawnHelper(pl.index, "striker");
+      break;
+    case "bulwark":
+      // Doubling size has to go through applySize, which owns `r` and massNow.
+      pl.applySize();
+      break;
+    default:
+      break;
+  }
+  return true;
+}
+
+/** A quake's actual effect: launch the ball, stun a grounded opponent. */
+function quakeSlam(pl) {
+  const b = game.ball;
+  game.shake = Math.max(game.shake, 0.6);
+  burst(pl.x, GROUND_Y - 6, SUPERS.quake.color, 44);
+  if (b) {
+    // Everything within reach is thrown up and away from the impact.
+    const d = Math.abs(b.x - pl.x);
+    if (d < 300) {
+      const k = 1 - d / 300;
+      b.vy = Math.min(b.vy, -720 * k);
+      b.vx += Math.sign(b.x - pl.x || 1) * 420 * k;
+      limitSpeed(b, BALL_MAX_V);
+    }
+  }
+  const foe = game.players[1 - pl.index];
+  // Only a GROUNDED opponent feels a ground slam, which makes jumping the
+  // counter-play rather than leaving the power unanswerable.
+  if (foe && foe.onGround && Math.abs(foe.x - pl.x) < 320) {
+    foe.stun = Math.max(foe.stun, 0.85);
+    foe.vy = -420;
+    foe.vx += Math.sign(foe.x - pl.x || 1) * 300;
+  }
+}
+
+/**
+ * Clean up when a timed power expires.
+ *
+ * Deliberately does NOT clear game.superFx: the banner runs on its own short
+ * timer, and a six-second power would otherwise keep its announcement on screen
+ * for the whole duration.
+ */
+function endSuper(pl) {
+  // Size is owned by applySize, so a power that changed it must hand it back.
+  if (pl.superId === "bulwark") pl.applySize();
+}
+
+/**
+ * Per-substep work for a power that is currently running.
+ *
+ * Only the continuous powers need anything here; the rest did their work at
+ * fire time. Kept in one switch so what each power does over time is readable
+ * in a single place.
+ */
+function tickSuper(pl, dt) {
+  if (pl.superT <= 0) return;
+  const b = game.ball;
+
+  switch (pl.superId) {
+    case "titan": {
+      // Draw the ball toward the player, strongest when close.
+      if (!b) break;
+      const dx = pl.x - b.x, dy = pl.y - b.y;
+      const d = Math.max(1, Math.hypot(dx, dy));
+      if (d < 420) {
+        const k = (1 - d / 420) * 1400 * dt;
+        b.vx += (dx / d) * k;
+        b.vy += (dy / d) * k;
+        limitSpeed(b, BALL_MAX_V);
+      }
+      break;
+    }
+    case "livewire": {
+      /*
+        The ball sticks: held just ahead of the player, moving with them, until
+        the power ends or they kick. Velocity is written rather than nudged, so
+        it cannot drift away over several substeps.
+      */
+      if (!b) break;
+      const tx = pl.x + pl.facing * (pl.r + b.r + 4);
+      const ty = pl.y - 2;
+      b.x += (tx - b.x) * clamp(dt * 14, 0, 1);
+      b.y += (ty - b.y) * clamp(dt * 14, 0, 1);
+      b.vx = pl.vx;
+      b.vy = pl.vy;
+      break;
+    }
+    case "venom": {
+      // Curve the ball toward the opponent's goal once it is moving away.
+      if (!b) break;
+      const goalX = pl.index === 0 ? W - GOAL_D : GOAL_D;
+      const goalY = goalTop(pl.index === 0 ? 1 : 0) + goalHeight() / 2;
+      const movingRight = pl.index === 0 ? b.vx > 60 : b.vx < -60;
+      if (movingRight) {
+        const dy = goalY - b.y;
+        b.vy += clamp(dy, -260, 260) * dt * 2.4;
+        b.vx += Math.sign(goalX - b.x || 1) * 120 * dt;
+        limitSpeed(b, BALL_MAX_V);
+      }
+      break;
+    }
+    case "cannon": {
+      // A guided missile: while the power runs, the ball homes after a kick.
+      if (!b) break;
+      if (game.ballLastTouch === pl.index && Math.hypot(b.vx, b.vy) > 200) {
+        const goalX = pl.index === 0 ? W - GOAL_D / 2 : GOAL_D / 2;
+        const goalY = goalTop(pl.index === 0 ? 1 : 0) + goalHeight() / 2;
+        const dx = goalX - b.x, dy = goalY - b.y;
+        const d = Math.max(1, Math.hypot(dx, dy));
+        b.vx += (dx / d) * 900 * dt;
+        b.vy += (dy / d) * 900 * dt;
+        limitSpeed(b, BALL_MAX_V);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/**
+ * Multipliers a running power applies to a player's stats.
+ *
+ * Read by applySize and the kick maths rather than mutating the player, so a
+ * power can never leave a permanent change behind if it ends unexpectedly.
+ */
+function superSizeMul(pl) {
+  if (!pl || pl.superT <= 0) return 1;
+  if (pl.superId === "bulwark") return 2;
+  return 1;
+}
+function superKickMul(pl) {
+  if (!pl || pl.superT <= 0) return 1;
+  if (pl.superId === "rocket") return 1.85;
+  if (pl.superId === "cannon") return 1.5;
+  if (pl.superId === "venom") return 1.3;
+  return 1;
+}
+function superSpeedMul(pl) {
+  if (!pl || pl.superT <= 0) return 1;
+  if (pl.superId === "rocket") return 1.5;
+  if (pl.superId === "panther") return 1.55;
+  if (pl.superId === "charge") return 1.4;
+  return 1;
+}
+/** Is this player immovable — unshoveable and unstunnable — right now? */
+function superImmovable(pl) {
+  return !!pl && pl.superT > 0 &&
+         (pl.superId === "bulwark" || pl.superId === "charge");
+}
+
 /* --------------------------------------------------------------- 6. INPUT */
 
 const keys = Object.create(null);
@@ -2123,12 +2503,13 @@ const SCHEME_DEFAULTS = [
       CONTROLS screen already renders an unbound action as an empty keycap, so a
       player who prefers keys can simply bind them.
     */
-    aimUp: "", aimDown: "", aimLeft: "", aimRight: "", dash: "ShiftLeft" },
+    aimUp: "", aimDown: "", aimLeft: "", aimRight: "",
+    dash: "ShiftLeft", super: "KeyQ" },
   { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown",
     kick: "Enter", wall: "ShiftRight",
     // P2 has no mouse, so aim gets a key cluster beside the arrow keys.
     aimUp: "KeyI", aimDown: "KeyK", aimLeft: "KeyJ", aimRight: "KeyL",
-    dash: "ControlRight" },
+    dash: "ControlRight", super: "Slash" },
 ];
 const SCHEME = SCHEME_DEFAULTS.map((s) => ({ ...s }));
 
@@ -2140,16 +2521,18 @@ const ACTIONS = [
   { key: "down",  label: "FAST FALL" },
   { key: "kick",  label: "KICK / FIRE" },
   { key: "wall",  label: "BUILD WALL / JUMP" },
+  // Dash and superpower work in every mode, so they sit with the 2D bindings.
+  { key: "dash",  label: "DASH" },
+  { key: "super", label: "SUPERPOWER" },
   /*
-    3D-only actions. They sit at the end so the six 2D bindings keep the row
-    order players already know, and they are labelled "3D" so nobody hunts for
-    their effect in a soccer match.
+    3D-only actions. They sit at the end so the bindings players already know
+    keep their row order, and they are labelled "3D" so nobody hunts for their
+    effect in a soccer match.
   */
   { key: "aimUp",    label: "3D AIM UP" },
   { key: "aimDown",  label: "3D AIM DOWN" },
   { key: "aimLeft",  label: "3D AIM LEFT" },
   { key: "aimRight", label: "3D AIM RIGHT" },
-  { key: "dash",     label: "3D DASH" },
 ];
 
 /** A readable name for a KeyboardEvent.code. */
@@ -2275,6 +2658,14 @@ function pollPads(edge) {
     a.kickEdge = edge && kick && !pads.prev[seat].kick;
     a.wallEdge = edge && wall && !pads.prev[seat].wall;
 
+    // Dash and superpower, in every mode: shoulder buttons, edge-detected here
+    // because a pad has no keydown event of its own.
+    const padDash = btn(6) || btn(4);
+    const padSuper = btn(7) || btn(5);
+    a.dashEdge = edge && padDash && !pads.prev[seat].dash;
+    a.superEdge = edge && padSuper && !pads.prev[seat].super;
+    if (edge) { pads.prev[seat].dash = padDash; pads.prev[seat].super = padSuper; }
+
     /*
       3D arena: the RIGHT stick aims, which is the layout every console shooter
       has trained players to expect. A pad seat therefore needs no keyboard at
@@ -2284,7 +2675,6 @@ function pollPads(edge) {
     a.aimX = 0;
     a.aimY = 0;
     a.jump = false;
-    a.dashEdge = false;
     if (isArena3D()) {
       const rx = gp.axes && gp.axes.length > 2 ? gp.axes[2] : 0;
       const ry = gp.axes && gp.axes.length > 3 ? gp.axes[3] : 0;
@@ -2292,10 +2682,6 @@ function pollPads(edge) {
       a.aimX = dz(rx) * STICK_SENS * DT;
       a.aimY = -dz(ry) * STICK_SENS * DT;      // stick down is aim down
       a.jump = anyOf(PAD_BTN.jump);
-      // Dash on a shoulder button, edge-detected like the others.
-      const dash = btn(6) || btn(4);
-      a.dashEdge = edge && dash && !pads.prev[seat].dash;
-      if (edge) pads.prev[seat].dash = dash;
       /*
         In the arena the left stick must steer four-way movement, and jump has
         its own button — so `up` must NOT double as jump the way it does in the
@@ -2322,11 +2708,14 @@ function pollPads(edge) {
 const intent = [
   { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
     wallEdge: false,
-    // 3D arena only: aim deltas in radians for this step, plus its two buttons.
-    aimX: 0, aimY: 0, jump: false, dashEdge: false },
+    // Every mode: dash and superpower, both edge-triggered so one press is one use.
+    dashEdge: false, superEdge: false,
+    // 3D arena only: aim deltas in radians for this step, plus its jump button.
+    aimX: 0, aimY: 0, jump: false },
   { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
     wallEdge: false,
-    aimX: 0, aimY: 0, jump: false, dashEdge: false },
+    dashEdge: false, superEdge: false,
+    aimX: 0, aimY: 0, jump: false },
 ];
 
 /** Pack a seat's intent into one byte, for the network. */
@@ -2386,6 +2775,10 @@ function gatherIntent(edge) {
     a.kick  = kickDown(i);
     a.kickEdge = edge && kickHit(i);
     a.wallEdge = edge && hit(S.wall);
+    // Dash and superpower are available in every mode, so they are read here
+    // rather than inside either simulation.
+    a.dashEdge = edge && hit(S.dash);
+    a.superEdge = edge && hit(S.super);
     /*
       3D arena input. Read here rather than in the arena's own step so every
       seat — keyboard, pad or CPU — reaches the simulation through the same
@@ -2411,10 +2804,8 @@ function gatherIntent(edge) {
       }
       // Jump reuses the wall key, which builds nothing in this mode.
       a.jump = !!keys[S.wall];
-      a.dashEdge = edge && hit(S.dash);
     } else {
       a.jump = false;
-      a.dashEdge = false;
     }
   }
 }
@@ -2501,6 +2892,18 @@ class Player {
     this.wallRecharge = WALL_RECHARGE;
     this.facing = this.index === 0 ? 1 : -1;
     this.effects = Object.create(null);
+    /*
+      Dash and superpower state. The dash is always available; the superpower
+      charges through play. `super` deliberately carries over NOTHING between
+      kickoffs except the charge itself, which is reset here — a meter that
+      survived a goal would let a player bank a power across restarts.
+    */
+    this.dashCD = 0;
+    this.dashT = 0;                     // >0 while the burst is active
+    this.dashAir = 0;                   // dashes used since leaving the ground
+    this.superCharge = 0;
+    this.superT = 0;                    // >0 while the power is running
+    this.superId = superForTeam(this.team);
     this.applySize();
   }
 
@@ -2509,6 +2912,9 @@ class Player {
     if (inRun() && this.index === 0) s *= game.run.mods.size;
     if (this.effects.bigger)  s *= 1.55;
     if (this.effects.smaller) s *= 0.62;
+    // A running superpower may scale the player too. Read rather than baked in,
+    // so the size returns on its own when the power expires.
+    s *= superSizeMul(this);
     this.r = this.baseR * s;
     this.massNow = this.mass * s * s;
 
@@ -2610,7 +3016,7 @@ class Player {
 
   update(dt, other) {
     const act = intent[this.index];     // keyboard, CPU or remote — same shape
-    const spdMul = this.effects.speed ? 1.5 : 1;
+    const spdMul = (this.effects.speed ? 1.5 : 1) * superSpeedMul(this);
     const jmpMul = this.effects.powerjump ? 1.45 : 1;
 
     // Mine stun: no input is accepted, but gravity and collisions still apply
@@ -2625,32 +3031,100 @@ class Player {
       if (dir !== 0) this.facing = dir;
     }
 
+    /*
+      DASH. A burst along the current facing, spent and recharged.
+
+      While `dashT` runs, the normal speed cap below is lifted — otherwise the
+      cap would swallow the burst on the very next substep and the dash would do
+      nothing at all. Air dashes are limited per airtime so it cannot be used to
+      fly, and the counter resets on landing.
+    */
+    if (this.dashCD > 0) this.dashCD -= dt;
+    if (this.dashT > 0) this.dashT = Math.max(0, this.dashT - dt);
+    if (this.onGround) this.dashAir = 0;
+
+    if (!stunned && act.dashEdge && game.rules.dash && this.dashCD <= 0 &&
+        (this.onGround || this.dashAir < DASH_AIR)) {
+      const boost = this.effects.panther || this.superT > 0 && this.superId === "panther"
+        ? 1.4 : 1;
+      this.vx = this.facing * DASH_V * boost;
+      // A touch of lift, so a dash clears a low wall and feels like a move
+      // rather than a slide. Only when grounded: an air dash stays flat.
+      if (this.onGround) this.vy = Math.min(this.vy, -110);
+      else this.dashAir++;
+      this.dashCD = DASH_CD;
+      this.dashT = DASH_T;
+      burst(this.x, this.y + this.r * 0.4, this.team.accent, 12);
+    }
+
+    // SUPERPOWER. Fired on the edge, only at full charge.
+    if (!stunned && act.superEdge && superReady(this)) fireSuper(this);
+    if (this.superT > 0) {
+      this.superT = Math.max(0, this.superT - dt);
+      if (this.superT === 0) endSuper(this);
+    }
+    // Charge accrues with time so a quiet match still builds toward a power.
+    if (game.scene === SCENE.PLAY) {
+      superGain(this, SUPER_GAIN_TIME * (game.rules.superRate || 1) * dt);
+    }
+    tickSuper(this, dt);
+
     const ctl = this.onGround ? 1 : PLAYER_AIR_CTL;
     if (dir !== 0) {
       this.vx += dir * this.accel * spdMul * ctl * dt;
+      // The dash burst is exempt from the cap while it lasts, or it would be
+      // clamped away before the player ever moved.
       const mv = this.maxv * spdMul;
-      this.vx = clamp(this.vx, -mv, mv);
-    } else if (this.onGround) {
+      if (this.dashT <= 0) this.vx = clamp(this.vx, -mv, mv);
+    } else if (this.onGround && this.dashT <= 0) {
       this.vx -= this.vx * clamp(PLAYER_FRICTION * dt, 0, 1);
     }
 
-    if (!stunned && act.up && this.onGround) {
+    /*
+      FLEA JUMP lets the jump fire in mid-air as well. Edge-triggered on the
+      power's own latch rather than on `act.up` being held, so holding the key
+      does not machine-gun the player into orbit.
+    */
+    const flea = this.superT > 0 && this.superId === "flea";
+    const canJump = this.onGround || (flea && !this.fleaHeld);
+    if (!stunned && act.up && canJump) {
       // Scaled by jumpScale() so jump HEIGHT survives a gravity re-roll while
       // airtime still changes — see the note by GRAV_MIN_MUL.
       this.vy = -this.jumpV * jmpMul * jumpScale();
       this.onGround = false;
+      if (flea && !this.onGround) burst(this.x, this.y + this.r, "#fff2a0", 8);
     }
+    this.fleaHeld = !!act.up;
     if (!stunned && act.down && !this.onGround) this.vy += gravity * 0.9 * dt;  // fast-fall
 
-    this.vy += gravity * dt;
+    // TUMBLE cancels gravity entirely, so the acrobat can fly for its duration.
+    const flying = this.superT > 0 && this.superId === "tumble";
+    this.vy += (flying ? gravity * 0.04 : gravity) * dt;
+    if (flying && !stunned) {
+      // With gravity gone, up/down become direct thrust — otherwise "flying"
+      // would just mean hanging motionless in the air.
+      if (act.up) this.vy -= 900 * dt;
+      if (act.down) this.vy += 900 * dt;
+      this.vy = clamp(this.vy, -380, 380);
+    }
     this.x += this.vx * dt;
     this.y += this.vy * dt;
 
     // Ground + walls.
     if (this.y + this.r >= GROUND_Y) {
+      const wasFalling = this.vy;
       this.y = GROUND_Y - this.r;
       if (this.vy > 0) this.vy = 0;
       this.onGround = true;
+      /*
+        A QUAKE fired in mid-air drives the player down and detonates on impact,
+        so the slam lands where they land. `quakePending` is set at fire time and
+        consumed here, which is why the power works from any height.
+      */
+      if (this.quakePending && wasFalling > 400) {
+        this.quakePending = false;
+        quakeSlam(this);
+      }
     } else if (this.vy !== 0) {
       this.onGround = false;
     }
@@ -2675,9 +3149,23 @@ class Player {
     if (other) {
       const a = { x: this.x,  y: this.y,  vx: this.vx,  vy: this.vy,  r: this.r,  mass: this.massNow };
       const b = { x: other.x, y: other.y, vx: other.vx, vy: other.vy, r: other.r, mass: other.massNow };
+      /*
+        An IMMOVABLE player keeps its own position and velocity through the
+        shove: the other is still pushed out, so nobody overlaps, but a bulwark
+        cannot be barged off the goal line. Applied after resolveCircles rather
+        than by faking a huge mass, so the separation itself stays exact.
+      */
+      const meFixed = superImmovable(this);
+      const themFixed = superImmovable(other);
+      const keepMe = { x: this.x, y: this.y, vx: this.vx, vy: this.vy };
+      const keepThem = { x: other.x, y: other.y, vx: other.vx, vy: other.vy };
       if (resolveCircles(a, b, 0.25)) {
         this.x = a.x; this.y = a.y; this.vx = a.vx; this.vy = a.vy;
         other.x = b.x; other.y = b.y; other.vx = b.vx; other.vy = b.vy;
+        // Both immovable is a stalemate: neither moves, so let the plain
+        // separation stand rather than leaving them interpenetrating.
+        if (meFixed && !themFixed) Object.assign(this, keepMe);
+        if (themFixed && !meFixed) Object.assign(other, keepThem);
         this.x = clamp(this.x, WALL + this.r, W - WALL - this.r);
         other.x = clamp(other.x, WALL + other.r, W - WALL - other.r);
 
@@ -2912,7 +3400,7 @@ const MODE_HINT = {
   [MODE.VOLLEY]: "big light ball — don't let it land",
   [MODE.TENNIS]: "low net, one bounce per side",
   [MODE.BASKET]: "shoot through the hoops",
-  [MODE.ARENA3D]: "third-person deathmatch — WASD + mouse",
+  [MODE.ARENA3D]: "3D soccer, third person — WASD + mouse",
   [MODE.TOURNAMENT]: "knockout bracket, hot-seat",
 };
 
@@ -3189,6 +3677,8 @@ const game = {
     a previous match. Built by startArena3D, torn down by endArena3D.
   */
   arena: null,
+  // Banner shown when a superpower fires: { seat, id, t }, or null.
+  superFx: null,
   run: null,            // roguelike run state, or null
   ctrlSeat: 0,          // which player the controls screen is editing
   ctrlRow: 0,
@@ -3725,6 +4215,12 @@ function scoreGoal(side) {
   const scorer = side === -1 ? 1 : 0;
   game.score[scorer]++;
   game.lastScorer = scorer;
+  /*
+    Conceding is the biggest single charge in the game, so a player who is behind
+    builds toward their power fastest. A comeback mechanic rather than a reward
+    for winning: the leader would otherwise snowball.
+  */
+  superGain(game.players[1 - scorer], SUPER_GAIN_CONCEDE * (game.rules.superRate || 1));
   game.scene = SCENE.CELEBRATE;
   game.timer = CELEBRATE_T;
   game.shake = 0.45;
@@ -3978,11 +4474,16 @@ function updateBullets(dt) {
       if (!pl || pl.index === u.owner) continue;
       if (len(pl.x - u.x, pl.y - u.y) < pl.r + u.r) {
         const dir = Math.sign(u.vx) || 1;
-        pl.stun = Math.max(pl.stun, BULLET_STUN);
-        pl.vx += dir * BULLET_KNOCK * (3 / pl.massNow);
-        pl.vy = Math.min(pl.vy, -BULLET_KNOCK * 0.4);
-        pl.onGround = false;
-        pl.kickT = 0;
+        // Taking a hit charges the victim's meter — and an immovable power shrugs
+        // the stun off entirely, which is what makes it worth its charge.
+        superGain(pl, SUPER_GAIN_HIT * (game.rules.superRate || 1));
+        if (!superImmovable(pl)) {
+          pl.stun = Math.max(pl.stun, BULLET_STUN);
+          pl.vx += dir * BULLET_KNOCK * (3 / pl.massNow);
+          pl.vy = Math.min(pl.vy, -BULLET_KNOCK * 0.4);
+          pl.onGround = false;
+          pl.kickT = 0;
+        }
         burst(pl.x, pl.y, "#fca5a5", 16);
         game.shake = Math.max(game.shake, 0.24);
         consumed = true;
@@ -5595,6 +6096,8 @@ function ballVsPlayer(pl) {
   if (resolveCircles(pb, bb, 0.62)) {
     game.ballLastTouch = pl.index;      // for wall-damage attribution
     b.x = bb.x; b.y = bb.y; b.vx = bb.vx; b.vy = bb.vy;
+    // Touching the ball charges the superpower meter.
+    superGain(pl, SUPER_GAIN_TOUCH * (game.rules.superRate || 1));
 
     // Every body touch launches the ball upward. Striking the top of the head
     // launches it harder still.
@@ -5685,7 +6188,7 @@ function ballVsPlayer(pl) {
       // The swing-timing window is wider now (0.72..1.3 rather than 0.8..1.15),
       // so catching the ball late in the swing is a visible reward.
       let power = pl.shotP * (hasPower ? POWERSHOT_MUL : 1) *
-                  lerp(0.72, 1.3, tip.t) * modeKickMul();
+                  lerp(0.72, 1.3, tip.t) * modeKickMul() * superKickMul(pl);
 
       // Clearance: drive the ball AWAY from the defender's own goal, regardless
       // of which way they happen to be facing.
@@ -5707,6 +6210,9 @@ function ballVsPlayer(pl) {
 
       // Mark the ball as charged so it can knock the opponent back.
       if (hasPower) { game.ballPowered = true; game.ballPoweredBy = pl.index; }
+      // A connecting kick builds the superpower meter: involvement is what
+      // charges it, so the player doing the work gets the reward.
+      superGain(pl, SUPER_GAIN_KICK * (game.rules.superRate || 1));
       const up = hasPower ? KICK_UP * 0.45 : KICK_UP;
       // Force the horizontal offset to match the kick direction so a clearance
       // can't be dragged back toward the defender's own goal.
@@ -6410,9 +6916,36 @@ function updateParticles(dt) {
    player, so the two halves of the game are recognisably the same game.
 */
 
+/*
+  The pitch. Longer than it is wide, like a real one: goals face each other down
+  the z axis, so "downfield" is +z for one player and -z for the other.
+*/
 const ARENA_HW = 520;         // half-width  (x from -520 to 520)
-const ARENA_HD = 520;         // half-depth  (z from -520 to 520)
+const ARENA_HD = 760;         // half-depth  (z from -760 to 760) — the long axis
 const ARENA_WALL_H = 210;     // enclosing wall height
+
+/*
+  3D GOALS. One at each end of the long axis, recessed into the end wall so the
+  ball has somewhere to go rather than merely crossing a line.
+
+  A goal is scored when the ball's CENTRE passes the goal line between the posts
+  and under the bar — the same rule the 2D game uses, so the two modes agree on
+  what a goal is.
+*/
+const A_GOAL_W = 300;         // mouth width  (x from -150 to 150)
+const A_GOAL_H = 150;         // crossbar height
+const A_GOAL_D = 90;          // how deep the net is recessed
+const A_POST_R = 8;           // post and crossbar radius
+const A_BALL_R = 26;          // the ball is big enough to see at a distance
+const A_BALL_REST = 0.62;     // bounce off the floor
+const A_BALL_DRAG = 0.42;     // air drag, so a shot slows realistically
+const A_BALL_GRAV = 1250;     // a little floatier than the players
+const A_BALL_MAX_V = 1900;
+const A_KICK_V = 1050;        // base kick speed
+const A_KICK_UP = 0.34;       // fraction of a kick directed upward
+const A_KICK_REACH = 62;      // how far in front of the player a kick connects
+const A_KICK_CD = 0.32;
+const A_BALL_SPIN = 0.86;     // how much of the kicker's motion the ball carries
 const FIGHTER_R = 26;         // collision radius
 const FIGHTER_H = 74;         // standing height, feet at y=0
 const EYE_H = 58;             // eye/muzzle height above the feet
@@ -6445,24 +6978,288 @@ const STICK_SENS = 2.4;       // radians per second at full stick deflection
 const isArena3D = () => game.scene === SCENE.ARENA3D && !!game.arena;
 
 /*
-  Cover layout. Four corner crates and a taller centre pillar: enough to break
-  sight lines and give the bot something to path around, few enough that the
-  painter's-algorithm sort stays exact (see the renderer).
+  Cover layout. Low obstacles only, set off the centre line: they break up a run
+  and give the ball something to bounce off, without walling off the middle of the
+  pitch the way the old deathmatch pillar did.
 
-  Boxes are axis-aligned and never overlap, which is what lets collision be a
-  simple per-axis rejection and lets face sorting ignore interpenetration.
+  Nothing is tall enough to hide a goal, because a soccer mode needs sight of
+  what you are shooting at. Boxes are axis-aligned and never overlap, which is
+  what lets collision be a per-axis rejection and lets face sorting ignore
+  interpenetration.
 */
 function arenaCover() {
   const c = [];
   const crate = (x, z, w, h, d) => c.push({ x, y: h / 2, z, hw: w / 2, hh: h / 2, hd: d / 2 });
-  crate(-250, -250, 150, 96, 150);
-  crate(250, -250, 150, 96, 150);
-  crate(-250, 250, 150, 96, 150);
-  crate(250, 250, 150, 96, 150);
-  crate(0, 0, 120, 190, 120);          // centre pillar, too tall to shoot over
-  crate(-330, 0, 90, 62, 240);         // low side walls, waist height
-  crate(330, 0, 90, 62, 240);
+  // Four low blocks in the quarters, to bounce the ball off and duck behind.
+  crate(-300, -330, 130, 70, 130);
+  crate(300, -330, 130, 70, 130);
+  crate(-300, 330, 130, 70, 130);
+  crate(300, 330, 130, 70, 130);
+  // Two waist-high walls flanking the centre circle, leaving the middle open.
+  crate(-390, 0, 80, 62, 300);
+  crate(390, 0, 80, 62, 300);
   return c;
+}
+
+/** The goal line z for a side: 0 defends -z, 1 defends +z. */
+const aGoalLineZ = (side) => (side === 0 ? -ARENA_HD : ARENA_HD);
+
+/**
+ * Which goal has the ball gone into, if any?
+ *
+ * Returns the side that CONCEDED (0 or 1), or -1. Mirrors the 2D goalScored
+ * contract: inside the mouth and under the bar scores, everything else does not.
+ */
+function arenaGoalScored(b) {
+  if (!b) return -1;
+  if (Math.abs(b.x) > A_GOAL_W / 2) return -1;      // wide of the posts
+  if (b.y > A_GOAL_H) return -1;                    // over the bar
+  if (b.z <= aGoalLineZ(0)) return 0;               // into side 0's net
+  if (b.z >= aGoalLineZ(1)) return 1;               // into side 1's net
+  return -1;
+}
+
+/** A fresh ball on the centre spot. */
+function makeArenaBall() {
+  return { x: 0, y: A_BALL_R + 40, z: 0, vx: 0, vy: 0, vz: 0, r: A_BALL_R,
+           lastTouch: -1 };
+}
+
+/**
+ * Advance the ball: gravity, drag, the floor, the walls, cover and the posts.
+ *
+ * Substepped like everything else, so a hard shot cannot tunnel through a post
+ * or the back of the net.
+ */
+function stepArenaBall(dt) {
+  const b = game.arena.ball;
+  if (!b) return;
+
+  b.vy -= A_BALL_GRAV * dt;
+  const d = 1 - A_BALL_DRAG * dt;
+  b.vx *= d; b.vz *= d; b.vy *= d;
+
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
+  b.z += b.vz * dt;
+
+  // Floor.
+  if (b.y < b.r) {
+    b.y = b.r;
+    if (b.vy < 0) b.vy = -b.vy * A_BALL_REST;
+    // Rolling friction, so the ball settles instead of sliding forever.
+    b.vx *= 0.985;
+    b.vz *= 0.985;
+    if (Math.abs(b.vy) < 30) b.vy = 0;
+  }
+  // Ceiling.
+  if (b.y > ARENA_WALL_H - b.r) {
+    b.y = ARENA_WALL_H - b.r;
+    if (b.vy > 0) b.vy = -b.vy * A_BALL_REST;
+  }
+
+  // Side walls always bounce.
+  const lx = ARENA_HW - b.r;
+  if (b.x < -lx) { b.x = -lx; b.vx = Math.abs(b.vx) * A_BALL_REST; }
+  if (b.x > lx) { b.x = lx; b.vx = -Math.abs(b.vx) * A_BALL_REST; }
+
+  /*
+    The end walls bounce EXCEPT through the goal mouth, which is what makes a
+    goal possible at all. Inside the mouth the ball carries on into the net and
+    is stopped by the back of it, so a goal visibly ends with the ball in the net
+    rather than vanishing at the line.
+  */
+  const inMouth = Math.abs(b.x) < A_GOAL_W / 2 - b.r * 0.2 && b.y < A_GOAL_H;
+  const lz = ARENA_HD - b.r;
+  if (b.z < -lz) {
+    if (inMouth) {
+      // Back of the net.
+      const back = -ARENA_HD - A_GOAL_D + b.r;
+      if (b.z < back) { b.z = back; b.vz = Math.abs(b.vz) * 0.2; }
+    } else {
+      b.z = -lz; b.vz = Math.abs(b.vz) * A_BALL_REST;
+    }
+  }
+  if (b.z > lz) {
+    if (inMouth) {
+      const back = ARENA_HD + A_GOAL_D - b.r;
+      if (b.z > back) { b.z = back; b.vz = -Math.abs(b.vz) * 0.2; }
+    } else {
+      b.z = lz; b.vz = -Math.abs(b.vz) * A_BALL_REST;
+    }
+  }
+
+  // Posts and crossbar: a shot off the woodwork must rebound, not pass through.
+  for (const side of [0, 1]) {
+    const gz = aGoalLineZ(side);
+    if (Math.abs(b.z - gz) > b.r + A_POST_R) continue;
+    // Uprights.
+    for (const px of [-A_GOAL_W / 2, A_GOAL_W / 2]) {
+      if (b.y < A_GOAL_H && Math.abs(b.x - px) < b.r + A_POST_R) {
+        b.x = px + Math.sign(b.x - px || 1) * (b.r + A_POST_R);
+        b.vx = Math.sign(b.x - px || 1) * Math.abs(b.vx) * A_BALL_REST;
+        b.vz *= 0.7;
+      }
+    }
+    // Crossbar.
+    if (Math.abs(b.x) < A_GOAL_W / 2 && Math.abs(b.y - A_GOAL_H) < b.r + A_POST_R) {
+      b.y = A_GOAL_H + Math.sign(b.y - A_GOAL_H || 1) * (b.r + A_POST_R);
+      b.vy = Math.sign(b.y - A_GOAL_H || 1) * Math.abs(b.vy) * A_BALL_REST;
+    }
+  }
+
+  ballVsArenaCover(b);
+}
+
+/** Bounce the ball off cover boxes, along the axis of least penetration. */
+function ballVsArenaCover(b) {
+  for (const c of game.arena.cover) {
+    const dx = b.x - c.x, dy = b.y - c.y, dz = b.z - c.z;
+    const ox = c.hw + b.r - Math.abs(dx);
+    const oy = c.hh + b.r - Math.abs(dy);
+    const oz = c.hd + b.r - Math.abs(dz);
+    if (ox <= 0 || oy <= 0 || oz <= 0) continue;
+    // Push out the shallow way and reflect that component.
+    if (oy <= ox && oy <= oz) {
+      b.y += dy >= 0 ? oy : -oy;
+      b.vy = (dy >= 0 ? 1 : -1) * Math.abs(b.vy) * A_BALL_REST;
+    } else if (ox <= oz) {
+      b.x += dx >= 0 ? ox : -ox;
+      b.vx = (dx >= 0 ? 1 : -1) * Math.abs(b.vx) * A_BALL_REST;
+    } else {
+      b.z += dz >= 0 ? oz : -oz;
+      b.vz = (dz >= 0 ? 1 : -1) * Math.abs(b.vz) * A_BALL_REST;
+    }
+  }
+}
+
+/**
+ * Body contact between a fighter and the ball: a shove, not a kick.
+ *
+ * Dribbling falls out of this — walking into the ball nudges it along ahead of
+ * you, so a player can carry it upfield without pressing anything.
+ */
+function fighterVsArenaBall(f) {
+  const b = game.arena.ball;
+  if (!b || f.dead) return;
+  const dx = b.x - f.x, dz = b.z - f.z;
+  const dy = b.y - (f.y + FIGHTER_H * 0.5);
+  /*
+    A generous contact radius. At exactly FIGHTER_R + ball radius the two only
+    touch when already interpenetrating, which made dribbling feel dead — the
+    ball slipped past the player instead of being pushed. The extra reach means a
+    player running at the ball reliably makes contact with it.
+  */
+  const rr = FIGHTER_R + b.r + 16;
+  const flat = Math.hypot(dx, dz);
+  if (flat > rr || Math.abs(dy) > FIGHTER_H * 0.75) return;
+
+  const nx = flat > 1e-6 ? dx / flat : 1;
+  const nz = flat > 1e-6 ? dz / flat : 0;
+  // Separate, then push the ball away with some of the player's momentum.
+  b.x = f.x + nx * rr;
+  b.z = f.z + nz * rr;
+  const along = f.vx * nx + f.vz * nz;
+  b.vx += nx * 190 + f.vx * 0.42 + nx * Math.max(0, along) * 0.4;
+  b.vz += nz * 190 + f.vz * 0.42 + nz * Math.max(0, along) * 0.4;
+  if (b.y < b.r * 1.2) b.vy = Math.max(b.vy, 120);   // pops off the ground
+  limitArenaBall(b);
+  b.lastTouch = f.seat;
+}
+
+/** Cap the ball's speed in 3D. */
+function limitArenaBall(b) {
+  const s = Math.hypot(b.vx, b.vy, b.vz);
+  if (s > A_BALL_MAX_V) {
+    const k = A_BALL_MAX_V / s;
+    b.vx *= k; b.vy *= k; b.vz *= k;
+  }
+  return b;
+}
+
+/**
+ * Kick the ball, if it is within reach ahead of the fighter.
+ *
+ * Aimed along the fighter's look direction rather than merely forward, so pitch
+ * decides whether a shot is driven low or lofted — the crosshair means the same
+ * thing here as it did when this mode was a shooter.
+ */
+function kickArenaBall(f) {
+  const A = game.arena;
+  const b = A.ball;
+  if (!b || f.dead || f.kickCD > 0) return false;
+  f.kickCD = A_KICK_CD;
+  f.kickT = 0.18;                       // for the leg animation
+
+  const dir = aimRay(f);
+  const eye = fighterEye(f);
+  // Reach is measured from a point just ahead of the player, so a kick connects
+  // with what is in front of them rather than what is inside them.
+  const ahead = v3(f.x + dir.x * A_KICK_REACH * 0.5, f.y + FIGHTER_H * 0.4,
+                   f.z + dir.z * A_KICK_REACH * 0.5);
+  const d = Math.hypot(b.x - ahead.x, (b.y - ahead.y) * 0.7, b.z - ahead.z);
+  if (d > FIGHTER_R + b.r + A_KICK_REACH) return false;
+
+  const power = A_KICK_V * superKickMul(f);
+  b.vx = dir.x * power + f.vx * A_BALL_SPIN;
+  b.vz = dir.z * power + f.vz * A_BALL_SPIN;
+  // Always some lift, plus whatever the player is aiming at.
+  b.vy = Math.max(dir.y * power, 0) + power * A_KICK_UP;
+  limitArenaBall(b);
+  b.lastTouch = f.seat;
+  superGain(f, SUPER_GAIN_KICK * (game.rules.superRate || 1));
+  A.hitFx.push({ x: b.x, y: b.y, z: b.z, life: 0.18 });
+  game.shake = Math.max(game.shake, 0.12);
+  void eye;
+  return true;
+}
+
+/**
+ * A goal was scored. `conceded` is the side whose net it went into.
+ *
+ * Routes through the same finishMatch and recordResult as every other mode, so
+ * the scoreboard, leaderboard and win screen need no special case.
+ */
+function arenaGoal(conceded) {
+  const A = game.arena;
+  const scorer = 1 - conceded;
+  A.goals[scorer]++;
+  game.score[scorer] = A.goals[scorer];
+  game.lastScorer = scorer;
+  game.shake = Math.max(game.shake, 0.5);
+  game.flash = Math.max(game.flash, 0.4);
+  A.celebrate = 2.2;
+  A.hitFx.push({ x: A.ball.x, y: A.ball.y, z: A.ball.z, life: 0.9 });
+  // Conceding charges the loser's superpower, exactly as in the 2D game.
+  const victim = A.fighters[conceded];
+  superGain(victim, SUPER_GAIN_CONCEDE * (game.rules.superRate || 1));
+
+  if (A.goals[scorer] >= game.goalsToWin) {
+    finishMatch(scorer, false);
+    return;
+  }
+  arenaKickoff(scorer);
+}
+
+/** Reset for a kickoff. The side that CONCEDED gets the advantage of position. */
+function arenaKickoff(lastScorer) {
+  const A = game.arena;
+  A.ball = makeArenaBall();
+  A.shots.length = 0;
+  for (const f of A.fighters) {
+    const sp = arenaSpawns()[f.seat === 0 ? 0 : 3];
+    f.x = sp.x; f.y = 0; f.z = sp.z;
+    f.vx = f.vy = f.vz = 0;
+    f.yaw = sp.yaw;
+    f.pitch = 0;
+    f.kickCD = 0;
+    f.kickT = 0;
+    f.hp = HP_MAX;
+    f.dead = false;
+    f.respawn = 0;
+  }
+  void lastScorer;
+  updateArenaCameras();
 }
 
 /*
@@ -6476,13 +7273,17 @@ function arenaCover() {
   first version of this table had every corner facing the wall behind it.
 */
 function arenaSpawns() {
-  const d = 400;
   const facingCentre = (x, z) => Math.atan2(-x, -z);
+  /*
+    Set back in each half, on the long axis, so a kickoff starts each player in
+    front of their own goal facing the centre spot — where the ball is. Off the
+    exact centre line so neither has a straight run at it.
+  */
   return [
-    { x: -d, z: -d, yaw: facingCentre(-d, -d) },
-    { x: d, z: -d, yaw: facingCentre(d, -d) },
-    { x: -d, z: d, yaw: facingCentre(-d, d) },
-    { x: d, z: d, yaw: facingCentre(d, d) },
+    { x: -130, z: -470, yaw: facingCentre(-130, -470) },
+    { x: 130, z: -470, yaw: facingCentre(130, -470) },
+    { x: -130, z: 470, yaw: facingCentre(-130, 470) },
+    { x: 130, z: 470, yaw: facingCentre(130, 470) },
   ];
 }
 
@@ -6503,9 +7304,106 @@ function makeFighter(seat, team) {
     dead: false,
     respawn: 0,
     hurt: 0,             // >0 briefly after taking a hit, for the HUD flash
+    kickCD: 0,           // between kicks
+    kickT: 0,            // >0 while the leg is swinging, for the animation
+    /*
+      Superpower state, sharing the meter, table and charge rules with the 2D
+      game — so a team's identity is the same in both halves. What each power
+      DOES differs, since there is no ball here: see fireArenaSuper.
+    */
+    superCharge: 0,
+    superT: 0,
+    superId: superForTeam(team),
+    superSpeed: 1,       // multiplier while a movement power runs
+    shield: 0,           // >0 while damage is being absorbed
+    rapid: 0,            // >0 while the fire rate is boosted
     // Bot memory, only used when this seat is CPU-driven.
     ai: null,
   };
+}
+
+/**
+ * Fire a fighter's superpower in the 3D arena.
+ *
+ * The team's power is the same; its effect is translated into deathmatch terms,
+ * because half the 2D powers act on a ball that does not exist here. The mapping
+ * is deliberately thematic rather than literal — a Bulwark still turns you into a
+ * wall, it just absorbs bullets instead of shoves.
+ */
+function fireArenaSuper(f) {
+  const def = superDef(f);
+  if (!def) return false;
+  f.superCharge = 0;
+  f.superT = def.dur || 0;
+  game.shake = Math.max(game.shake, 0.3);
+  game.arena.hitFx.push({ x: f.x, y: f.y + EYE_H, z: f.z, life: 0.5 });
+
+  const foe = game.arena.fighters.find((o) => o.seat !== f.seat);
+
+  switch (f.superId) {
+    case "rocket":
+    case "panther":
+    case "charge":
+      // Movement powers: raw speed for the duration.
+      f.superSpeed = f.superId === "panther" ? 1.6 : 1.45;
+      break;
+    case "bulwark":
+    case "sentinel":
+      // Defensive powers absorb damage rather than resisting a shove.
+      f.shield = def.dur;
+      break;
+    case "volley":
+    case "cannon":
+    case "venom":
+      // Offensive powers become rapid fire, which is what "more shots" means here.
+      f.rapid = def.dur;
+      break;
+    case "flea":
+    case "tumble":
+      // Air powers: a large upward launch, and reduced gravity handled in
+      // stepFighter via superT.
+      f.vy = Math.max(f.vy, F_JUMP * 1.35);
+      f.onGround = false;
+      break;
+    case "blink": {
+      // Teleport behind the opponent — the deathmatch reading of "get to the
+      // ball instantly" is "get to the fight instantly".
+      if (foe) {
+        const away = v3norm(v3(f.x - foe.x, 0, f.z - foe.z));
+        f.x = clamp(foe.x - away.x * 90, -ARENA_HW + FIGHTER_R, ARENA_HW - FIGHTER_R);
+        f.z = clamp(foe.z - away.z * 90, -ARENA_HD + FIGHTER_R, ARENA_HD - FIGHTER_R);
+        f.yaw = Math.atan2(foe.x - f.x, foe.z - f.z);
+        f.vx = f.vz = 0;
+        fighterVsCover(f);
+      }
+      break;
+    }
+    case "quake": {
+      // A shockwave: damages and launches a grounded opponent nearby.
+      if (foe && !foe.dead) {
+        const d = Math.hypot(foe.x - f.x, foe.z - f.z);
+        if (d < 320 && foe.onGround) {
+          applyDamage(foe, SHOT_DMG, f.seat);
+          if (game.arena) { foe.vy = F_JUMP * 0.9; foe.onGround = false; }
+        }
+      }
+      break;
+    }
+    case "freeze": {
+      // Root the opponent: their movement is disabled while this runs.
+      if (foe) foe.frozen = def.dur;
+      break;
+    }
+    case "titan":
+    case "livewire":
+    case "owl":
+      // Control powers all read as "slow the other side down" here.
+      if (foe) foe.slowed = def.dur;
+      break;
+    default:
+      break;
+  }
+  return true;
 }
 
 /**
@@ -6538,6 +7436,17 @@ function respawnFighter(f) {
   f.onGround = true;
   f.fireCD = 0;
   f.dashCD = 0;
+  /*
+    Death cancels a running power but KEEPS the charge meter. Losing the charge
+    too would punish the player twice for one death, and the meter is meant to be
+    a comeback mechanic.
+  */
+  f.superT = 0;
+  f.superSpeed = 1;
+  f.shield = 0;
+  f.rapid = 0;
+  f.frozen = 0;
+  f.slowed = 0;
 }
 
 /**
@@ -6557,7 +7466,15 @@ function startArena3D() {
       { yaw: fighters[1].yaw, pitch: 0.06, dist: CAM_DIST, pos: v3(0, 0, 0) },
     ],
     shots: [],
+    /*
+      GOALS are the win condition, not frags. `frags` is kept alongside as a
+      secondary statistic — shooting still stuns an opponent and is worth doing —
+      but only `goals` decides the match.
+    */
+    ball: makeArenaBall(),
+    goals: [0, 0],
     frags: [0, 0],
+    celebrate: 0,           // >0 briefly after a goal, for the banner
     cover: arenaCover(),
     hitFx: [],
     // Two humans share the screen; one human plus a bot does not.
@@ -6664,6 +7581,27 @@ function outsideArena(p) {
   return p.x < -ARENA_HW + 6 || p.x > ARENA_HW - 6 ||
          p.z < -ARENA_HD + 6 || p.z > ARENA_HD - 6 ||
          p.y < 8 || p.y > ARENA_WALL_H - 6;
+}
+
+/**
+ * Is `p` hidden from the camera by cover?
+ *
+ * THE WALLHACK FIX. The renderer is a painter's-algorithm rasteriser with no
+ * depth buffer, so anything drawn after the world — fighters, the ball, tracers,
+ * impacts — appeared straight through solid crates. Cover you can see through is
+ * not cover, and it made the pillar in the middle of the arena pointless.
+ *
+ * Sprites therefore test their own visibility here before drawing. It is a
+ * per-object test rather than per-pixel, so a fighter half behind a crate either
+ * shows whole or not at all; at these object sizes that reads as intended
+ * occlusion, and it costs one slab test per box instead of a depth buffer.
+ */
+function occludedFromCam(p, cam) {
+  if (!game.arena) return false;
+  // A small pad, so a sprite grazing the edge of a crate is still considered
+  // visible — popping out at the exact silhouette is more distracting than a
+  // pixel of overlap.
+  return segmentHitsCover(cam.pos, p, -2);
 }
 
 /* ---- mouse look ----------------------------------------------------------
@@ -6826,18 +7764,29 @@ function stepFighter(f, a, dt) {
   if (f.fireCD > 0) f.fireCD -= dt;
   if (f.dashCD > 0) f.dashCD -= dt;
   if (f.hurt > 0) f.hurt -= dt;
+  if (f.shield > 0) f.shield = Math.max(0, f.shield - dt);
+  if (f.rapid > 0) f.rapid = Math.max(0, f.rapid - dt);
+  if (f.frozen > 0) f.frozen = Math.max(0, f.frozen - dt);
+  if (f.slowed > 0) f.slowed = Math.max(0, f.slowed - dt);
 
   // Aim. Yaw wraps freely; pitch is clamped so the camera cannot tumble.
-  f.yaw += a.aimX || 0;
-  f.pitch = clamp(f.pitch + (a.aimY || 0), -PITCH_MAX, PITCH_MAX);
+  // A frozen fighter cannot even look around, which is what makes the power
+  // frightening rather than a mild inconvenience.
+  if (!(f.frozen > 0)) {
+    f.yaw += a.aimX || 0;
+    f.pitch = clamp(f.pitch + (a.aimY || 0), -PITCH_MAX, PITCH_MAX);
+  }
 
   // Movement, in the camera's frame rather than the world's.
+  const frozen = f.frozen > 0;
   const b = moveBasis(f.yaw);
   let wx = 0, wz = 0;
-  if (a.up) { wx += b.fwd.x; wz += b.fwd.z; }
-  if (a.down) { wx -= b.fwd.x; wz -= b.fwd.z; }
-  if (a.right) { wx += b.right.x; wz += b.right.z; }
-  if (a.left) { wx -= b.right.x; wz -= b.right.z; }
+  if (!frozen) {
+    if (a.up) { wx += b.fwd.x; wz += b.fwd.z; }
+    if (a.down) { wx -= b.fwd.x; wz -= b.fwd.z; }
+    if (a.right) { wx += b.right.x; wz += b.right.z; }
+    if (a.left) { wx -= b.right.x; wz -= b.right.z; }
+  }
 
   const wl = Math.hypot(wx, wz);
   if (wl > 1e-6) {
@@ -6853,25 +7802,44 @@ function stepFighter(f, a, dt) {
     f.vz *= k;
   }
 
-  // Ground speed cap. Applied to the horizontal plane only, so a jump's
-  // vertical speed is never clipped by it.
+  /*
+    Ground speed cap, on the horizontal plane only so a jump's vertical speed is
+    never clipped. A movement superpower raises the cap; being slowed by an
+    opponent's power lowers it — both scale the same number, so the two can
+    cancel rather than one silently winning.
+  */
+  const cap = F_MAXV * (f.superSpeed || 1) * (f.slowed > 0 ? 0.45 : 1);
   const sp = Math.hypot(f.vx, f.vz);
-  if (sp > F_MAXV) { const k = F_MAXV / sp; f.vx *= k; f.vz *= k; }
+  if (sp > cap) { const k = cap / sp; f.vx *= k; f.vz *= k; }
 
-  if (a.jump && f.onGround) {
+  // FLEA JUMP and TUMBLE both allow a mid-air jump while they run.
+  const airJump = f.superT > 0 && (f.superId === "flea" || f.superId === "tumble");
+  if (a.jump && !frozen && (f.onGround || airJump)) {
     f.vy = F_JUMP;
     f.onGround = false;
   }
 
   // Dash: a burst along the current facing, on a cooldown. Deliberately
   // horizontal — a dash that also launched you would replace jumping.
-  if (a.dashEdge && f.dashCD <= 0) {
-    f.vx += b.fwd.x * F_DASH;
-    f.vz += b.fwd.z * F_DASH;
+  if (a.dashEdge && game.rules.dash && f.dashCD <= 0) {
+    const boost = f.superT > 0 && f.superId === "panther" ? 1.4 : 1;
+    f.vx += b.fwd.x * F_DASH * boost;
+    f.vz += b.fwd.z * F_DASH * boost;
     f.dashCD = F_DASH_CD;
   }
 
-  f.vy -= F_GRAV * dt;
+  // SUPERPOWER, on the same key and the same meter as the 2D game.
+  if (a.superEdge && superReady(f)) fireArenaSuper(f);
+  if (f.superT > 0) {
+    f.superT = Math.max(0, f.superT - dt);
+    if (f.superT === 0) f.superSpeed = 1;
+  }
+  superGain(f, SUPER_GAIN_TIME * (game.rules.superRate || 1) * dt);
+
+  // TUMBLE lightens gravity, so the acrobat genuinely floats rather than merely
+  // jumping higher.
+  const floaty = f.superT > 0 && f.superId === "tumble";
+  f.vy -= F_GRAV * (floaty ? 0.28 : 1) * dt;
 
   f.x += f.vx * dt;
   f.y += f.vy * dt;
@@ -6919,7 +7887,8 @@ function fireShot(f) {
     life: SHOT_LIFE,
     owner: f.seat,
   });
-  f.fireCD = FIRE_CD;
+  // Rapid fire, from an offensive superpower.
+  f.fireCD = FIRE_CD * (f.rapid > 0 ? 0.32 : 1);
   return true;
 }
 
@@ -6970,8 +7939,21 @@ function shotVsFighter(s, f, dt) {
  */
 function applyDamage(f, dmg, bySeat) {
   if (!game.arena || f.dead) return false;
+  /*
+    A shield absorbs the hit entirely rather than reducing it. Partial reduction
+    would still let four shots kill through a defensive power, which would make it
+    the weakest ability in the game instead of the sturdiest.
+  */
+  if (f.shield > 0) {
+    f.hurt = 0.18;
+    game.arena.hitFx.push({ x: f.x, y: f.y + EYE_H, z: f.z, life: 0.25 });
+    superGain(f, SUPER_GAIN_DAMAGE * (game.rules.superRate || 1));
+    return false;
+  }
   f.hp -= dmg;
   f.hurt = 0.25;
+  // Taking damage charges the victim's meter, so a losing fight builds a comeback.
+  superGain(f, SUPER_GAIN_DAMAGE * (game.rules.superRate || 1));
   if (f.hp > 0) return false;
 
   f.hp = 0;
@@ -6990,19 +7972,19 @@ function applyDamage(f, dmg, bySeat) {
  * win handling all work unchanged — `finishMatch` and `recordResult` are the
  * same ones every other mode uses.
  */
+/**
+ * Credit a knockdown.
+ *
+ * GOALS decide the match, so this no longer ends anything: a knockdown removes
+ * the opponent from play for a couple of seconds, which is a chance to score
+ * rather than a score in itself. The count is kept and shown as a secondary
+ * statistic so shooting still visibly does something.
+ */
 function arenaFrag(killer, victim) {
   game.arena.frags[killer.seat]++;
-  game.score[killer.seat] = game.arena.frags[killer.seat];
-  game.lastScorer = killer.seat;
+  superGain(killer, SUPER_GAIN_FRAG * (game.rules.superRate || 1));
   game.shake = Math.max(game.shake, 0.3);
-  game.flash = Math.max(game.flash, 0.22);
   game.arena.hitFx.push({ x: victim.x, y: victim.y + EYE_H, z: victim.z, life: 0.6 });
-
-  if (game.arena.frags[killer.seat] >= game.goalsToWin) {
-    // finishMatch tears the arena down and releases the mouse for every exit
-    // path, so there is nothing more to do here.
-    finishMatch(killer.seat, false);
-  }
 }
 
 /** Advance every projectile, resolving hits and expiry. */
@@ -7066,17 +8048,20 @@ function stepShots(dt) {
 function updateArenaCPU(f, dt) {
   const a = intent[f.seat];
   const lvl = cpuCfg();
-  const foe = game.arena && game.arena.fighters.find((o) => o.seat !== f.seat);
+  const A = game.arena;
+  const foe = A && A.fighters.find((o) => o.seat !== f.seat);
 
   a.left = a.right = a.up = a.down = false;
   a.jump = false;
   a.dashEdge = false;
+  a.superEdge = false;
+  a.kickEdge = false;
   a.aimX = 0;
   a.aimY = 0;
   // No arena means the match just ended: the bot has nothing left to decide.
-  if (!game.arena || f.dead || !foe) return;
+  if (!A || f.dead || !foe) return;
 
-  if (!f.ai) f.ai = { think: 0, strafe: 1, jumpT: 0, fire: false };
+  if (!f.ai) f.ai = { think: 0, strafe: 1 };
   const ai = f.ai;
 
   // Re-decide only every `react` seconds: a bot that re-evaluates every substep
@@ -7088,52 +8073,103 @@ function updateArenaCPU(f, dt) {
     ai.idle = Math.random() < lvl.idle;
   }
 
-  const toFoe = v3sub(v3(foe.x, foe.y + EYE_H, foe.z), fighterEye(f));
-  const dist = Math.hypot(toFoe.x, toFoe.z);
+  const b = A.ball;
+  const ownGoalZ = aGoalLineZ(f.seat);
+  const theirGoalZ = aGoalLineZ(1 - f.seat);
+
+  /*
+    THE BOT PLAYS SOCCER, not deathmatch. It chases the ball, and once close
+    enough to strike it aims at the opponent's goal rather than at the ball —
+    otherwise it would dribble endlessly without ever shooting.
+  */
+  const ballD = b ? Math.hypot(b.x - f.x, b.z - f.z) : 1e9;
+  const striking = b && ballD < FIGHTER_R + b.r + A_KICK_REACH * 1.4;
+
+  let tx, ty, tz;
+  if (striking) {
+    // Aim at the goal mouth, a little above the line so the shot is not scuffed
+    // into the ground.
+    tx = clamp(b.x * 0.35, -A_GOAL_W / 2 + 40, A_GOAL_W / 2 - 40);
+    ty = A_GOAL_H * 0.45;
+    tz = theirGoalZ;
+  } else if (b) {
+    /*
+      Approach the ball from the DEFENSIVE side, so the bot ends up behind it
+      facing the right way. Aiming straight at the ball made it shepherd the ball
+      into its own net whenever it was upfield of it.
+    */
+    const behind = Math.sign(ownGoalZ) * 1;
+    tx = b.x;
+    ty = b.y;
+    tz = b.z + behind * (FIGHTER_R + b.r) * 1.1;
+  } else {
+    tx = 0; ty = 0; tz = 0;
+  }
+
+  const to = v3sub(v3(tx, ty + EYE_H * 0.4, tz), fighterEye(f));
+  const dist = Math.hypot(to.x, to.z);
 
   /*
     AIM. Turn toward the target at a bounded rate rather than snapping: a bot
     that snaps is unbeatable and reads as cheating. `err` offsets where it thinks
     the target is, so an easy bot misses honestly rather than by being slowed.
   */
-  const wantYaw = Math.atan2(toFoe.x, toFoe.z);
-  const wantPitch = Math.atan2(toFoe.y, Math.max(1, dist));
-  // Shortest way round the circle, so it never turns the long way about.
+  const wantYaw = Math.atan2(to.x, to.z);
+  const wantPitch = clamp(Math.atan2(to.y, Math.max(1, dist)), -PITCH_MAX, PITCH_MAX);
   let dYaw = wantYaw - f.yaw;
   while (dYaw > Math.PI) dYaw -= Math.PI * 2;
   while (dYaw < -Math.PI) dYaw += Math.PI * 2;
-  const errRad = (lvl.err / 600) * (Math.sin(performance.now() / 700 + f.seat) );
-  const turn = STICK_SENS * (0.6 + lvl.aggr) * dt;
+  const errRad = (lvl.err / 900) * Math.sin(performance.now() / 700 + f.seat);
+  const turn = STICK_SENS * (0.7 + lvl.aggr) * dt;
   a.aimX = clamp(dYaw + errRad, -turn, turn);
   a.aimY = clamp(wantPitch - f.pitch, -turn, turn);
 
   if (ai.idle) return;                       // a beat of doing nothing
 
-  // MOVEMENT. Close when far, strafe when comfortable, back off when crowded.
-  const wantDist = 260 - lvl.aggr * 90;
-  if (dist > wantDist + 70) a.up = true;
-  else if (dist < wantDist - 90) a.down = true;
-  if (ai.strafe > 0) a.right = true; else a.left = true;
+  // MOVEMENT: run at the ball. Strafe only when already on top of it, so the bot
+  // does not orbit the thing it is trying to kick.
+  const ballBehindMe = b && Math.sign(b.z - f.z) === Math.sign(ownGoalZ);
+  if (dist > 60) a.up = true;
+  if (striking && Math.abs(dYaw) > 0.5) {
+    if (ai.strafe > 0) a.right = true; else a.left = true;
+  }
+  // Retreat to defend when the ball is behind the bot, heading for its own goal.
+  if (ballBehindMe && ballD > 260) a.up = true;
 
   // Speed is scaled by using the movement keys only part of the time, which is
   // how the 2D CPU is throttled too — the physics stays identical for everyone.
   if (Math.random() > lvl.speed) { a.up = a.down = a.left = a.right = false; }
 
-  // Hop over a crate it has walked into, and occasionally to be less predictable.
-  if (f.onGround && (Math.random() < lvl.jump * dt * 2.2)) a.jump = true;
-  // Dash to close a long gap, if the level is aggressive enough to bother.
-  if (dist > 420 && f.dashCD <= 0 && Math.random() < lvl.aggr * dt * 2) {
+  // Hop occasionally, to clear a crate it has walked into.
+  if (f.onGround && Math.random() < lvl.jump * dt * 1.6) a.jump = true;
+  // Dash to close a long gap toward the ball.
+  if (ballD > 420 && f.dashCD <= 0 && Math.random() < lvl.aggr * dt * 2) {
     a.dashEdge = true;
   }
+  // Spend a superpower when it is charged; the bot has no notion of timing, but
+  // a power sitting unused is worse than one spent early.
+  if (superReady(f) && Math.random() < lvl.aggr * dt * 1.5) fireArenaSuper(f);
 
+  // KICK when the ball is in range and the bot is roughly facing its target.
+  if (striking && f.kickCD <= 0 && Math.abs(dYaw) < 0.4 + (1 - lvl.aggr) * 0.3) {
+    kickArenaBall(f);
+    return;
+  }
   /*
-    FIRE only with a genuinely clear shot: aimed close enough, and no cover in
-    the way. Shooting a crate would be free damage to nobody and makes the bot
-    look blind.
+    Otherwise take a pot shot at the opponent, but only with a genuinely clear
+    line. Shooting is now a way to disrupt whoever has the ball rather than the
+    route to winning, so the bot only bothers when the opponent is closer to the
+    ball than it is.
   */
-  const aimed = Math.abs(dYaw) < 0.14 + (1 - lvl.aggr) * 0.1;
-  const clear = !segmentHitsCover(fighterEye(f), v3(foe.x, foe.y + EYE_H, foe.z));
-  if (aimed && clear && f.fireCD <= 0 && !foe.dead) fireShot(f);
+  const foeCloser = b && Math.hypot(b.x - foe.x, b.z - foe.z) < ballD;
+  if (foeCloser && !foe.dead && f.fireCD <= 0) {
+    const toFoe = v3sub(v3(foe.x, foe.y + EYE_H, foe.z), fighterEye(f));
+    let fYaw = Math.atan2(toFoe.x, toFoe.z) - f.yaw;
+    while (fYaw > Math.PI) fYaw -= Math.PI * 2;
+    while (fYaw < -Math.PI) fYaw += Math.PI * 2;
+    const clear = !segmentHitsCover(fighterEye(f), v3(foe.x, foe.y + EYE_H, foe.z));
+    if (clear && Math.abs(fYaw) < 0.12) fireShot(f);
+  }
 }
 
 /**
@@ -7151,31 +8187,62 @@ function stepArena3D(dt) {
     if (game.cpu[i]) updateArenaCPU(A.fighters[i], dt);
   }
 
-  // Fire, for any human seat asking to. Bots fire from inside their own
-  // decision function, where they can check they have a clear shot.
+  /*
+    A goal celebration freezes play briefly: the players still animate, but the
+    ball is held and nothing can be scored, so a goal reads as an event rather
+    than flowing straight into the next kickoff.
+  */
+  if (A.celebrate > 0) {
+    A.celebrate -= dt;
+    for (let i = 0; i < 2; i++) stepFighter(A.fighters[i], intent[i], dt);
+    updateArenaCameras();
+    return;
+  }
+
+  /*
+    KICK is the primary action now that this is soccer; the gun is secondary.
+    Kick fires on the button EDGE so one press is one kick, and falls through to a
+    shot only when the ball is out of reach — so the same button does the
+    sensible thing at any distance without a second key to learn.
+  */
   for (let i = 0; i < 2; i++) {
     if (game.cpu[i]) continue;
     const a = intent[i];
-    // The mouse button is an alternative to the kick key, not a replacement:
-    // a player using the aim keys still needs a way to shoot.
-    const wants = a.kickEdge || a.kick ||
-                  (mouse.fireHeld && i === arenaMouseSeat());
-    if (wants) fireShot(A.fighters[i]);
+    const f = A.fighters[i];
+    const pressed = a.kickEdge || (mouse.fireHeld && i === arenaMouseSeat() &&
+                                   f.kickCD <= 0);
+    if (!pressed) continue;
+    if (!kickArenaBall(f)) fireShot(f);
   }
 
-  for (let i = 0; i < 2; i++) stepFighter(A.fighters[i], intent[i], dt);
+  for (let i = 0; i < 2; i++) {
+    stepFighter(A.fighters[i], intent[i], dt);
+    if (A.fighters[i].kickT > 0) A.fighters[i].kickT -= dt;
+    if (A.fighters[i].kickCD > 0) A.fighters[i].kickCD -= dt;
+  }
 
   // Fighters must not stand inside each other, or two players can occupy the
   // same spot and neither can tell who is where.
   separateFighters(A.fighters[0], A.fighters[1]);
 
+  stepArenaBall(dt);
+  for (const f of A.fighters) fighterVsArenaBall(f);
+
   stepShots(dt);
   /*
-    A frag may have ended the match inside stepShots, which tears the arena down.
-    Everything after this point would be operating on state that no longer
-    exists, so stop here.
+    A shot can end the match only indirectly now, but the teardown hazard is the
+    same: anything after this point would be operating on state that no longer
+    exists.
   */
   if (!game.arena) return;
+
+  // GOAL. Checked after the ball has moved and before the clock, so a goal on
+  // the final tick still counts.
+  const conceded = arenaGoalScored(A.ball);
+  if (conceded >= 0) {
+    arenaGoal(conceded);
+    if (!game.arena) return;
+  }
 
   updateArenaCameras();
 
@@ -7243,6 +8310,12 @@ function step(dt) {
   if (game.flash > 0) game.flash = Math.max(0, game.flash - dt);
   if (game.gravAnnounce > 0) game.gravAnnounce = Math.max(0, game.gravAnnounce - dt);
   if (game.rerollDenied > 0) game.rerollDenied = Math.max(0, game.rerollDenied - dt);
+  // The superpower banner fades on its own clock, so it survives a scene change
+  // (a power fired the instant before a goal should still be announced).
+  if (game.superFx) {
+    game.superFx.t -= dt;
+    if (game.superFx.t <= 0) game.superFx = null;
+  }
   // Goals slide continuously, including during countdowns and celebrations so
   // their motion never visibly stutters.
   goalPhase += dt;
@@ -7922,6 +8995,40 @@ function drawGoal(side) {
 function drawPlayer(pl) {
   const t = pl.team;
   const stunned = pl.stun > 0;
+
+  /*
+    A running superpower gets an aura in its own colour, drawn UNDER the player so
+    it reads as a glow rather than a mask. Without this the powers with no obvious
+    silhouette change — venom, cannon, titan — were invisible to both players.
+  */
+  if (pl.superT > 0) {
+    const def = superDef(pl);
+    if (def) {
+      const puls = 0.72 + Math.sin(performance.now() / 90) * 0.28;
+      const rr = pl.r * (1.5 + puls * 0.25);
+      const g = ctx.createRadialGradient(pl.x, pl.y, pl.r * 0.6, pl.x, pl.y, rr);
+      g.addColorStop(0, def.color);
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.globalAlpha = 0.5 * puls;
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(pl.x, pl.y, rr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+  // A dash leaves a brief motion streak behind it, so the burst is legible.
+  if (pl.dashT > 0) {
+    ctx.globalAlpha = clamp(pl.dashT / DASH_T, 0, 1) * 0.45;
+    ctx.fillStyle = t.accent;
+    for (let i = 1; i <= 3; i++) {
+      const bx = pl.x - pl.facing * i * pl.r * 0.55;
+      ctx.beginPath();
+      ctx.arc(bx, pl.y, pl.r * (1 - i * 0.18), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
 
   ctx.save();
   if (stunned) {
@@ -8901,6 +10008,44 @@ function arenaWallFaces(batch, theme) {
              { normal: v3(-1, 0, 0), tag: "wall" });
 }
 
+/**
+ * The two goals: posts, crossbar, and a net panel across the back.
+ *
+ * Built from thin boxes so they sort with the rest of the world in one batch,
+ * and coloured per side so a glance tells you which end you are attacking.
+ */
+function arenaGoalFaces(batch) {
+  for (const side of [0, 1]) {
+    const gz = aGoalLineZ(side);
+    const into = side === 0 ? -1 : 1;         // direction the net extends
+    const col = game.arena.fighters[side]
+      ? game.arena.fighters[side].team.color
+      : "#cccccc";
+    const post = shiftHex(col, 40);
+
+    // Uprights.
+    for (const px of [-A_GOAL_W / 2, A_GOAL_W / 2]) {
+      boxFaces(batch, px, A_GOAL_H / 2, gz, A_POST_R, A_GOAL_H / 2, A_POST_R,
+               post, "post");
+    }
+    // Crossbar.
+    boxFaces(batch, 0, A_GOAL_H, gz, A_GOAL_W / 2 + A_POST_R, A_POST_R, A_POST_R,
+             post, "post");
+    // The net: a translucent-looking panel at the back, plus side panels, so the
+    // goal reads as a box you can put the ball INTO rather than a flat frame.
+    const backZ = gz + into * A_GOAL_D;
+    boxFaces(batch, 0, A_GOAL_H / 2, backZ, A_GOAL_W / 2, A_GOAL_H / 2, 3,
+             shiftHex(col, -30), "net");
+    for (const px of [-A_GOAL_W / 2, A_GOAL_W / 2]) {
+      boxFaces(batch, px, A_GOAL_H / 2, gz + into * A_GOAL_D / 2,
+               2, A_GOAL_H / 2, A_GOAL_D / 2, shiftHex(col, -38), "net");
+    }
+    // A roof on the net, so it is not open from above.
+    boxFaces(batch, 0, A_GOAL_H, gz + into * A_GOAL_D / 2,
+             A_GOAL_W / 2, 2, A_GOAL_D / 2, shiftHex(col, -34), "net");
+  }
+}
+
 /** Sky: a flat gradient, since the room is sealed and has no horizon to sell. */
 function drawArenaSky(view, theme) {
   const g = ctx.createLinearGradient(0, view.y, 0, view.y + view.h);
@@ -8922,15 +10067,63 @@ function drawArenaWorld(cam, view, theme) {
 
   arenaFloorFaces(batch, theme);
   arenaWallFaces(batch, theme);
+  arenaGoalFaces(batch);
   for (const c of game.arena.cover) {
     boxFaces(batch, c.x, c.y, c.z, c.hw, c.hh, c.hd, shiftHex(theme.ground, 26), "cover");
   }
   const painted = batch.flush(cam, view, basis);
 
-  // Projectiles: small bright dots, drawn after the world so they are never
-  // hidden by a face they are in front of.
+  /*
+    THE BALL, drawn after the world with its own occlusion test — the same reason
+    the fighters need one: there is no depth buffer, so without this the ball
+    would show straight through a crate.
+  */
+  const ball = game.arena.ball;
+  if (ball && !occludedFromCam(v3(ball.x, ball.y, ball.z), cam)) {
+    const bp = project(v3(ball.x, ball.y, ball.z), cam, view, basis);
+    if (bp) {
+      const br = Math.max(2, ball.r * bp.s);
+      // A shadow on the floor directly beneath it, which is what makes the
+      // ball's position readable in 3D at all.
+      const sp = project(v3(ball.x, 0.5, ball.z), cam, view, basis);
+      if (sp) {
+        ctx.fillStyle = "rgba(0,0,0,0.32)";
+        ctx.beginPath();
+        ctx.ellipse(sp.x, sp.y, Math.max(2, ball.r * sp.s), Math.max(1, ball.r * sp.s * 0.36),
+                    0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // The ball itself, with a highlight so it does not read as a flat disc.
+      const g = ctx.createRadialGradient(bp.x - br * 0.3, bp.y - br * 0.35, br * 0.15,
+                                         bp.x, bp.y, br);
+      g.addColorStop(0, "#ffffff");
+      g.addColorStop(0.65, "#e8edf5");
+      g.addColorStop(1, "#8e9bb0");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(bp.x, bp.y, br, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(15,23,42,0.55)";
+      ctx.lineWidth = Math.max(0.5, br * 0.09);
+      ctx.stroke();
+      // A couple of panel marks, so spin and travel are visible.
+      if (br > 5) {
+        ctx.fillStyle = "rgba(15,23,42,0.55)";
+        for (const [ox, oy] of [[-0.32, -0.1], [0.3, 0.24], [0, 0.46]]) {
+          ctx.beginPath();
+          ctx.arc(bp.x + ox * br, bp.y + oy * br, br * 0.17, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  // Projectiles: small bright dots. Drawn after the world, so each must test its
+  // own occlusion — there is no depth buffer to do it for them.
   for (const s of game.arena.shots) {
-    const p = project(v3(s.x, s.y, s.z), cam, view, basis);
+    const sp = v3(s.x, s.y, s.z);
+    if (occludedFromCam(sp, cam)) continue;
+    const p = project(sp, cam, view, basis);
     if (!p) continue;
     const r = Math.max(1.5, SHOT_R * p.s);
     ctx.fillStyle = "#fde68a";
@@ -8952,7 +10145,9 @@ function drawArenaWorld(cam, view, theme) {
 
   // Impact flashes.
   for (const fx of game.arena.hitFx) {
-    const p = project(v3(fx.x, fx.y, fx.z), cam, view, basis);
+    const fp = v3(fx.x, fx.y, fx.z);
+    if (occludedFromCam(fp, cam)) continue;
+    const p = project(fp, cam, view, basis);
     if (!p) continue;
     const a = clamp(fx.life / 0.3, 0, 1);
     ctx.globalAlpha = a;
@@ -8975,6 +10170,16 @@ function drawArenaWorld(cam, view, theme) {
  */
 function drawFighterBillboard(f, cam, view, basis, self) {
   if (f.dead) return;
+  /*
+    Occlusion, tested against the CHEST rather than the feet: a fighter standing
+    behind a waist-high crate should still be visible from the chest up, which is
+    what the feet-only test got wrong. Their own body is exempt — the camera is
+    right behind it, so a grazing crate must not blink the player out.
+  */
+  if (!self && occludedFromCam(v3(f.x, f.y + FIGHTER_H * 0.62, f.z), cam) &&
+      occludedFromCam(v3(f.x, f.y + FIGHTER_H * 0.95, f.z), cam)) {
+    return;
+  }
   const feet = project(v3(f.x, f.y, f.z), cam, view, basis);
   const head = project(v3(f.x, f.y + FIGHTER_H, f.z), cam, view, basis);
   if (!feet || !head) return;
@@ -9062,12 +10267,80 @@ function drawArenaHUD(seat, view) {
   text(`${Math.max(0, Math.round(f.hp))}`, bx + bw / 2, by + bh / 2, 10,
        "#ffffff", "center", 900);
 
-  // Frags, bottom-right, with the opponent's for comparison.
+  // Superpower meter, directly above the health bar.
+  if (game.rules.supers) {
+    const def = superDef(f);
+    const my = by - 9, mh = 5;
+    ctx.fillStyle = "rgba(6,12,22,0.8)";
+    ctx.fillRect(bx, my, bw, mh);
+    const running = f.superT > 0;
+    const frac = running ? clamp(f.superT / (def ? def.dur || 1 : 1), 0, 1)
+                         : superFrac(f);
+    const ready = superReady(f);
+    ctx.fillStyle = running ? def.color
+      : ready && Math.sin(performance.now() / 110) > 0 ? "#ffffff"
+      : def ? def.color : "#7dd3fc";
+    ctx.fillRect(bx, my, bw * frac, mh);
+    if (ready) text(`${def ? def.label : "SUPER"} READY`, bx, my - 8, 9,
+                    "#ffffff", "left", 900);
+    else if (running) text(def.label, bx, my - 8, 9, def.color, "left", 900);
+  }
+  // Dash cooldown, as a small pip beside the health bar.
+  if (game.rules.dash) {
+    const px = bx + bw + 10, py = by + bh / 2;
+    const cd = clamp(1 - f.dashCD / F_DASH_CD, 0, 1);
+    ctx.fillStyle = cd >= 1 ? "#7dd3fc" : "rgba(125,211,252,0.28)";
+    ctx.beginPath();
+    ctx.arc(px, py, 6, 0, Math.PI * 2 * (cd >= 1 ? 1 : cd) - Math.PI / 2);
+    if (cd < 1) ctx.lineTo(px, py);
+    ctx.fill();
+    text("DASH", px + 12, py, 8, cd >= 1 ? "#7dd3fc" : "#5f7391", "left", 800);
+  }
+  // Frozen or slowed by the opponent's power: say so, or it reads as a bug.
+  if (f.frozen > 0) text("FROZEN", cx, cy + 40, 15, "#38bdf8", "center", 900);
+  else if (f.slowed > 0) text("SLOWED", cx, cy + 40, 12, "#c084fc", "center", 900);
+  if (f.shield > 0) text("SHIELDED", cx, cy - 40, 12, "#4ade80", "center", 900);
+
+  /*
+    GOALS, bottom-right, from this seat's point of view. Knockdowns are shown
+    smaller beneath: they matter, but they do not win the match, and the HUD
+    should not imply otherwise.
+  */
   const foe = A.fighters[1 - seat];
-  text(`${A.frags[seat]} — ${A.frags[1 - seat]}`,
-       view.x + view.w - 18, by + bh / 2, 15, "#ffffff", "right", 900);
+  text(`${A.goals[seat]} — ${A.goals[1 - seat]}`,
+       view.x + view.w - 18, by + bh / 2, 17, "#ffffff", "right", 900);
   text(`${seatLabel(seat)} vs ${seatLabel(1 - seat)}`,
        view.x + view.w - 18, by - 10, 9, "#9fb4d0", "right", 700);
+  if (A.frags[seat] || A.frags[1 - seat]) {
+    text(`knockdowns ${A.frags[seat]}–${A.frags[1 - seat]}`,
+         view.x + view.w - 18, by + bh + 8, 8, "#6b819e", "right", 700);
+  }
+
+  /*
+    A direction cue: which way is the goal you are attacking? Without it, a
+    third-person camera in a symmetrical room leaves players genuinely unsure
+    which end is theirs.
+  */
+  {
+    const cam = A.cam[seat];
+    const tz = aGoalLineZ(1 - seat);
+    const dxg = 0 - cam.pos.x, dzg = tz - cam.pos.z;
+    let rel = Math.atan2(dxg, dzg) - cam.yaw;
+    while (rel > Math.PI) rel -= Math.PI * 2;
+    while (rel < -Math.PI) rel += Math.PI * 2;
+    const ax = view.x + view.w / 2 + clamp(rel, -1.2, 1.2) * (view.w * 0.3);
+    const ay = view.y + 62;
+    const behind = Math.abs(rel) > Math.PI / 2;
+    ctx.fillStyle = behind ? "rgba(148,163,184,0.55)" : "rgba(125,211,252,0.9)";
+    ctx.beginPath();
+    ctx.moveTo(ax, ay - 6);
+    ctx.lineTo(ax + 7, ay + 5);
+    ctx.lineTo(ax - 7, ay + 5);
+    ctx.closePath();
+    ctx.fill();
+    text(behind ? "goal behind you" : "attack", ax, ay + 14, 8,
+         behind ? "#94a3b8" : "#7dd3fc", "center", 800);
+  }
 
   if (f.dead) {
     text("DOWN", cx, cy - 14, 26, "#ef4444", "center", 900);
@@ -9128,8 +10401,30 @@ function drawArena3D() {
     ctx.fillStyle = `rgba(255,255,255,${game.flash * 0.28})`;
     ctx.fillRect(0, 0, W, H);
   }
+
+  // GOAL banner, across both viewports.
+  if (A.celebrate > 0) {
+    const scorer = game.lastScorer;
+    const f = A.fighters[scorer];
+    const a = clamp(A.celebrate / 0.6, 0, 1);
+    ctx.globalAlpha = a;
+    const bw = 420, bh = 62, bx = (W - bw) / 2, by = H / 2 - bh / 2;
+    ctx.fillStyle = "rgba(6,12,22,0.9)";
+    roundRect(bx, by, bw, bh, 12);
+    ctx.fill();
+    ctx.strokeStyle = f ? f.team.color : "#7dd3fc";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    text("GOAL!", W / 2, by + 24, 30, f ? f.team.color : "#ffffff", "center", 900);
+    text(`${seatLabel(scorer)}  ·  ${A.goals[0]} — ${A.goals[1]}`,
+         W / 2, by + 46, 13, "#cddcf2", "center", 700);
+    ctx.globalAlpha = 1;
+  }
+
   if (game.opt.hints) {
-    text(mouse.locked ? "ESC — pause" : "CLICK to capture the mouse  ·  ESC — pause",
+    text(mouse.locked
+           ? "kick with the mouse or your KICK key  ·  ESC — pause"
+           : "CLICK to capture the mouse  ·  ESC — pause",
          W / 2, H - 8, 10, "rgba(143,163,192,0.75)", "center", 600);
   }
 }
@@ -9152,7 +10447,8 @@ function drawArenaScoreboard() {
     ctx.beginPath();
     ctx.arc(i === 0 ? bx + 20 : bx + bw - 20, by + bh / 2, 10, 0, Math.PI * 2);
     ctx.fill();
-    text(String(A.frags[i]), cx, by + bh / 2 - 2, 22, "#ffffff", "center", 900);
+    // GOALS, not knockdowns: this is the number that wins the match.
+    text(String(A.goals[i]), cx, by + bh / 2 - 2, 22, "#ffffff", "center", 900);
     text(game.cpu[i] ? "CPU" : `P${i + 1}`, cx, by + bh - 9, 8, "#9fb4d0", "center", 800);
   }
 
@@ -9163,7 +10459,7 @@ function drawArenaScoreboard() {
   } else {
     text("∞", W / 2, by + 17, 15, "#5f7391", "center", 900);
   }
-  text(`FIRST TO ${game.goalsToWin}`, W / 2, by + 34, 8, "#7dd3fc", "center", 800);
+  text(`FIRST TO ${game.goalsToWin} GOALS`, W / 2, by + 34, 8, "#7dd3fc", "center", 800);
 }
 
 const fmtClock = (s) => {
@@ -10786,6 +12082,30 @@ function drawScoreboard() {
     text(game.cpu[i] ? "CPU" : `P${i + 1}`,
          i === 0 ? bx + 26 : bx + bw - 26, by + bh / 2,
          game.cpu[i] ? 9 : 11, "#0b1220", "center", 900);
+
+    // Superpower meter, under each score. A ready power flashes, because the
+    // whole point of a charge meter is knowing the moment it is spendable.
+    if (game.rules.supers) {
+      const def = superDef(pl);
+      const mw = 74, mh = 5;
+      const mx = cx - mw / 2, my = by + bh - 8;
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(mx, my, mw, mh);
+      const ready = superReady(pl);
+      const running = pl.superT > 0;
+      const frac = running ? clamp(pl.superT / (def ? def.dur || 1 : 1), 0, 1)
+                           : superFrac(pl);
+      ctx.fillStyle = running
+        ? def.color
+        : ready && Math.sin(performance.now() / 110) > 0
+          ? "#ffffff"
+          : def ? def.color : "#7dd3fc";
+      ctx.fillRect(mx, my, mw * frac, mh);
+      if (ready || running) {
+        text(def ? def.label : "SUPER", cx, my - 6, 7,
+             running ? def.color : "#ffffff", "center", 900);
+      }
+    }
   }
 
   // Clock (or the goal target when untimed) sits between the two scores.
@@ -11076,6 +12396,30 @@ function drawOverlays() {
     ctx.globalAlpha = 1;
   }
 
+  /*
+    SUPERPOWER banner. Both players need to know which power just fired — several
+    of them act on the ball rather than visibly on the character, so without this
+    a Venom Shot or a Titan Grip looks like the physics glitching.
+  */
+  if (game.superFx && game.superFx.t > 0) {
+    const def = SUPERS[game.superFx.id];
+    if (def) {
+      const a = clamp(game.superFx.t / 0.5, 0, 1);
+      ctx.globalAlpha = a;
+      const bw = 340, bh = 44, bx = (W - bw) / 2, by = 104;
+      ctx.fillStyle = "rgba(6,12,22,0.88)";
+      roundRect(bx, by, bw, bh, 10);
+      ctx.fill();
+      ctx.strokeStyle = def.color;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      const who = seatLabel(game.superFx.seat);
+      text(def.label, W / 2, by + 16, 18, def.color, "center", 900);
+      text(`${who} — ${def.hint}`, W / 2, by + 33, 10, "#cddcf2", "center", 700);
+      ctx.globalAlpha = 1;
+    }
+  }
+
   // New-gravity banner, shown over the countdown after a goal.
   if (game.gravAnnounce > 0 && game.gravMul !== 1) {
     const band = gravBand(game.gravMul);
@@ -11297,7 +12641,7 @@ const PHYS = {
   camBasis, worldToCam, project, makeView, NEAR, PITCH_MAX,
   faceBatch, boxFaces, isBackFace, shadeFace, hexRGB, LIGHT_DIR, AMBIENT,
   startArena3D, endArena3D, makeFighter, respawnFighter, arenaSpawns, arenaCover,
-  isArena3D, segmentHitsCover, updateArenaCameras, outsideArena,
+  isArena3D, segmentHitsCover, updateArenaCameras, outsideArena, occludedFromCam,
   mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
   stepFighter, moveBasis, arenaBounds, fighterVsCover,
   fireShot, stepShots, shotVsFighter, applyDamage, arenaFrag, aimRay, fighterEye,
@@ -11305,6 +12649,19 @@ const PHYS = {
   drawArena3D, drawArenaWorld, drawFighterBillboard, drawArenaHUD, arenaViews,
   drawArenaSky, drawArenaScoreboard, arenaFloorFaces, arenaWallFaces, shiftHex,
   updateArenaCPU, stepArena3D, separateFighters,
+  // 3D soccer: the ball, the goals and the scoring rule.
+  makeArenaBall, stepArenaBall, arenaGoalScored, arenaGoal, arenaKickoff,
+  fighterVsArenaBall, kickArenaBall, ballVsArenaCover, limitArenaBall,
+  arenaGoalFaces, aGoalLineZ,
+  A_GOAL_W, A_GOAL_H, A_GOAL_D, A_POST_R, A_BALL_R, A_KICK_V, A_KICK_REACH,
+  A_BALL_MAX_V, A_BALL_GRAV,
+  // Dash and superpowers, shared by both simulations.
+  SUPERS, SUPER_KEYS, TEAM_SUPER, SUPER_MAX, superForTeam, superDef, superGain,
+  superReady, superFrac, fireSuper, endSuper, tickSuper, quakeSlam,
+  superSizeMul, superKickMul, superSpeedMul, superImmovable, fireArenaSuper,
+  DASH_V, DASH_CD, DASH_T, DASH_AIR,
+  SUPER_GAIN_TOUCH, SUPER_GAIN_KICK, SUPER_GAIN_HIT, SUPER_GAIN_CONCEDE,
+  SUPER_GAIN_TIME, SUPER_GAIN_FRAG, SUPER_GAIN_DAMAGE,
   // The live state object and the frame driver, so a harness can run the REAL
   // loop rather than approximating it by calling step and draw by hand.
   game, step, draw, frame,
@@ -11324,6 +12681,15 @@ function runTests() {
     out.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra && !cond ? "  — " + extra : ""}`);
   };
   const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+  /** Reset every field of both seats' intent, so one test cannot leak into another. */
+  const clearIntentAll = () => {
+    for (const a of intent) {
+      a.left = a.right = a.up = a.down = false;
+      a.kick = a.kickEdge = a.wallEdge = false;
+      a.dashEdge = a.superEdge = a.jump = false;
+      a.aimX = a.aimY = 0;
+    }
+  };
 
   // 1. Integration: free fall matches the closed form within a substep.
   {
@@ -17206,7 +18572,19 @@ function runTests() {
     const saved = { scene: game.scene, ctrlSeat: game.ctrlSeat, ctrlRow: game.ctrlRow,
                     ctrlBinding: game.ctrlBinding, cpu: [...game.cpu] };
 
-    ok("every action is listed for rebinding", ACTIONS.length === 11, `${ACTIONS.length}`);
+    /*
+      Every key in the default scheme must appear in ACTIONS, and vice versa —
+      derived rather than a hardcoded count, which went stale twice as bindings
+      were added. A binding missing from ACTIONS is unrebindable; an action
+      missing from the scheme has nowhere to store its key.
+    */
+    {
+      const actionKeys = ACTIONS.map((a) => a.key).sort();
+      const schemeKeys = Object.keys(SCHEME_DEFAULTS[0]).sort();
+      ok("every action is listed for rebinding",
+         actionKeys.join(",") === schemeKeys.join(","),
+         `actions [${actionKeys}] vs scheme [${schemeKeys}]`);
+    }
     /*
       Every action needs a default EXCEPT the 3D aim keys for seat 0, which are
       deliberately blank: that seat aims with the mouse, and the controls screen
@@ -20036,26 +21414,37 @@ function runTests() {
     game.sel = [0, 3];
     startMatch();
 
-    // The centre pillar sits at the origin, 190 tall, 120 wide.
-    ok("a segment straight through the centre pillar is blocked",
-       segmentHitsCover(v3(-300, 40, 0), v3(300, 40, 0)));
-    ok("a segment passing well beside it is clear",
-       !segmentHitsCover(v3(-300, 40, 460), v3(300, 40, 460)));
-    ok("a segment passing over a waist-high crate is clear",
-       !segmentHitsCover(v3(-330, 180, -250), v3(-170, 180, -250)));
-    ok("a segment through a waist-high crate is blocked",
-       segmentHitsCover(v3(-330, 40, -250), v3(-170, 40, -250)));
-    ok("a zero-length segment outside cover is clear",
-       !segmentHitsCover(v3(-500, 40, -500), v3(-500, 40, -500)));
-    ok("a segment that stops short of cover is clear",
-       // Starts clear of the left crate (which spans x -375..-285) and stops
-       // before the centre pillar (x -60..60).
-       !segmentHitsCover(v3(-260, 40, 0), v3(-100, 40, 0)));
-    ok("a segment starting inside cover reports blocked",
-       segmentHitsCover(v3(-300, 40, 0), v3(-100, 40, 0)));
-    ok("the slab test is symmetric",
-       segmentHitsCover(v3(-300, 40, 0), v3(300, 40, 0)) ===
-       segmentHitsCover(v3(300, 40, 0), v3(-300, 40, 0)));
+    /*
+      Derived from the live cover layout rather than hardcoded coordinates: the
+      arena has been re-laid-out once already, and a test full of magic numbers
+      simply broke rather than telling us anything.
+    */
+    {
+      const c = game.arena.cover[0];
+      const mid = v3(c.x, c.y, c.z);
+      // Straight through the middle of a box, along each axis in turn.
+      ok("a segment through a cover box is blocked",
+         segmentHitsCover(v3(c.x - c.hw - 200, c.y, c.z), v3(c.x + c.hw + 200, c.y, c.z)));
+      ok("and blocked along the other horizontal axis too",
+         segmentHitsCover(v3(c.x, c.y, c.z - c.hd - 200), v3(c.x, c.y, c.z + c.hd + 200)));
+      // Passing above it is clear, which is what makes low cover shootable over.
+      ok("a segment passing above a cover box is clear",
+         !segmentHitsCover(v3(c.x - c.hw - 200, c.y + c.hh + 60, c.z),
+                           v3(c.x + c.hw + 200, c.y + c.hh + 60, c.z)));
+      ok("a zero-length segment in the open is clear",
+         !segmentHitsCover(v3(0, 40, 0), v3(0, 40, 0)));
+      ok("a zero-length segment inside a box is blocked",
+         segmentHitsCover(mid, mid));
+      ok("a segment that stops short of a box is clear",
+         !segmentHitsCover(v3(c.x - c.hw - 300, c.y, c.z), v3(c.x - c.hw - 40, c.y, c.z)));
+      ok("the slab test is symmetric",
+         segmentHitsCover(v3(c.x - c.hw - 200, c.y, c.z), v3(c.x + c.hw + 200, c.y, c.z)) ===
+         segmentHitsCover(v3(c.x + c.hw + 200, c.y, c.z), v3(c.x - c.hw - 200, c.y, c.z)));
+      // The middle of the pitch must be OPEN, so players can see the goals.
+      ok("the centre of the pitch is clear of cover",
+         !segmentHitsCover(v3(0, 40, -ARENA_HD + 20), v3(0, 40, ARENA_HD - 20)),
+         "a soccer mode needs sight of what you are shooting at");
+    }
 
     // Camera placement: never inside geometry, never outside the room.
     {
@@ -20271,33 +21660,38 @@ function runTests() {
       box — a fighter that ends up inside would be shooting from within a crate.
     */
     {
-      const c = game.arena.cover.find((b) => b.x === 0 && b.z === 0);  // pillar
+      // Every box, from all four sides: derived from the layout, so a re-laid-out
+      // arena is still fully covered by this test.
       let bad = null;
-      const approaches = [
-        ["from -x", { x: -300, z: 0, yaw: Math.PI / 2 }],
-        ["from +x", { x: 300, z: 0, yaw: -Math.PI / 2 }],
-        ["from -z", { x: 0, z: -300, yaw: 0 }],
-        ["from +z", { x: 0, z: 300, yaw: Math.PI }],
-      ];
-      for (const [name, over] of approaches) {
-        const f = makeFighter(0, TEAMS[0]);
-        Object.assign(f, over, { y: 0, vx: 0, vy: 0, vz: 0 });
-        const a = noIntent(); a.up = true;
-        run(f, a, 1.5);
-        const insideX = Math.abs(f.x - c.x) < c.hw + FIGHTER_R - 0.5;
-        const insideZ = Math.abs(f.z - c.z) < c.hd + FIGHTER_R - 0.5;
-        const insideY = f.y < c.y + c.hh - 0.5;
-        if (insideX && insideZ && insideY) {
-          bad = `${name}: ended inside the pillar at ${f.x.toFixed(1)},${f.z.toFixed(1)},${f.y.toFixed(1)}`;
-          break;
+      for (const c of game.arena.cover) {
+        const D = 260;
+        const approaches = [
+          ["from -x", { x: c.x - D, z: c.z, yaw: Math.PI / 2 }],
+          ["from +x", { x: c.x + D, z: c.z, yaw: -Math.PI / 2 }],
+          ["from -z", { x: c.x, z: c.z - D, yaw: 0 }],
+          ["from +z", { x: c.x, z: c.z + D, yaw: Math.PI }],
+        ];
+        for (const [name, over] of approaches) {
+          const f = makeFighter(0, TEAMS[0]);
+          Object.assign(f, over, { y: 0, vx: 0, vy: 0, vz: 0 });
+          const a = noIntent(); a.up = true;
+          run(f, a, 1.5);
+          const insideX = Math.abs(f.x - c.x) < c.hw + FIGHTER_R - 0.5;
+          const insideZ = Math.abs(f.z - c.z) < c.hd + FIGHTER_R - 0.5;
+          const insideY = f.y < c.y + c.hh - 0.5;
+          if (insideX && insideZ && insideY) {
+            bad = `${name}: ended inside a box at ${f.x.toFixed(1)},${f.z.toFixed(1)},${f.y.toFixed(1)}`;
+            break;
+          }
         }
+        if (bad) break;
       }
-      ok("a fighter cannot walk into a cover box from any side", !bad, bad || "");
+      ok("a fighter cannot walk into any cover box from any side", !bad, bad || "");
     }
 
     // Crates are climbable: dropping onto one lands on top of it.
     {
-      const c = game.arena.cover.find((b) => b.x === -250 && b.z === -250);
+      const c = game.arena.cover[0];
       const f = makeFighter(0, TEAMS[0]);
       Object.assign(f, { x: c.x, z: c.z, y: c.y + c.hh + 120, vx: 0, vy: 0, vz: 0 });
       run(f, noIntent(), 2);
@@ -20306,7 +21700,7 @@ function runTests() {
     }
     // And standing on one is stable, not a slow sink.
     {
-      const c = game.arena.cover.find((b) => b.x === -250 && b.z === -250);
+      const c = game.arena.cover[0];
       const f = makeFighter(0, TEAMS[0]);
       Object.assign(f, { x: c.x, z: c.z, y: c.y + c.hh, vx: 0, vy: 0, vz: 0 });
       run(f, noIntent(), 3);
@@ -20445,15 +21839,22 @@ function runTests() {
          (() => { const r = applyDamage(b, SHOT_DMG, 0); return !r && b.hp === 0; })());
     }
 
-    // A kill credits the shooter, never the victim.
+    // A knockdown credits the shooter, never the victim.
     {
       const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
       game.goalsToWin = 5;
       for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
-      ok("a kill credits the shooter", game.arena.frags[0] === 1);
+      ok("a knockdown credits the shooter", game.arena.frags[0] === 1);
       ok("and credits the victim with nothing", game.arena.frags[1] === 0);
-      ok("and the shared scoreline mirrors the frag count",
-         game.score[0] === 1 && game.score[1] === 0);
+      /*
+        GOALS are the win condition, so a knockdown must NOT touch the scoreline.
+        It removes the opponent from play for a moment — a chance to score, not a
+        score in itself.
+      */
+      ok("but a knockdown does not change the scoreline",
+         game.score[0] === 0 && game.score[1] === 0,
+         `${game.score}`);
+      ok("and does not end the match", game.scene === SCENE.ARENA3D);
     }
     // Suicide is impossible: damage attributed to the victim credits nobody.
     {
@@ -20478,31 +21879,50 @@ function runTests() {
       ok("and comes back at full health", b.hp === HP_MAX);
     }
 
-    // Reaching the frag target ends the match through the shared path.
+    // Reaching the GOAL target ends the match through the shared path.
     {
-      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
       game.goalsToWin = 2;
       const boardBefore = JSON.stringify(game.board);
-      // First frag: not enough.
-      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
-      ok("one frag short of the target does not end the match",
+      // Side 1 concedes: side 0 scores.
+      arenaGoal(1);
+      ok("one goal short of the target does not end the match",
          game.scene === SCENE.ARENA3D, game.scene);
-      // Second frag: the match ends.
-      b.dead = false; b.hp = HP_MAX;
-      for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
-      ok("reaching the frag target ends the match", game.scene === SCENE.WIN,
+      ok("and the goal shows on the scoreline",
+         game.score[0] === 1 && game.arena.goals[0] === 1);
+      arenaGoal(1);
+      ok("reaching the goal target ends the match", game.scene === SCENE.WIN,
          game.scene);
       ok("and names the right winner", game.winner === 0, `${game.winner}`);
       ok("and tears the arena down", game.arena === null);
       ok("and records the result on the leaderboard",
          JSON.stringify(game.board) !== boardBefore);
     }
+    // No number of knockdowns can win a match.
+    {
+      const [, b] = duel({ x: 0, z: -300, yaw: 0 }, { x: 0, z: 0 });
+      game.goalsToWin = 2;
+      for (let n = 0; n < 12; n++) {
+        b.dead = false; b.hp = HP_MAX; b.shield = 0;
+        for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      }
+      ok("no amount of shooting can win the match",
+         game.scene === SCENE.ARENA3D && game.score[0] === 0,
+         `scene ${game.scene} score ${game.score}`);
+    }
 
     // Shots stop at cover, so cover is dependable.
     {
-      const [a, b] = duel({ x: 0, z: -300, yaw: 0, pitch: 0 }, { x: 0, z: 300 });
-      fireShot(a);                       // straight through the centre pillar
-      for (let i = 0; i < 90 && game.arena.shots.length; i++) stepShots(DT);
+      // Put both fighters either side of a real cover box, derived from the
+      // layout rather than assuming a pillar at the origin.
+      startMatch();
+      const c = game.arena.cover[0];
+      const [a, b] = game.arena.fighters;
+      Object.assign(a, { x: c.x, y: 0, z: c.z - 260, yaw: 0, pitch: 0,
+                         vx: 0, vy: 0, vz: 0, fireCD: 0 });
+      Object.assign(b, { x: c.x, y: 0, z: c.z + 260, vx: 0, vy: 0, vz: 0 });
+      fireShot(a);                       // straight into the box between them
+      for (let i = 0; i < 120 && game.arena.shots.length; i++) stepShots(DT);
       ok("a shot is stopped by cover instead of passing through",
          b.hp === HP_MAX, `${b.hp}`);
     }
@@ -20595,14 +22015,11 @@ function runTests() {
       ok("quitting releases the pointer lock", !mouse.locked && !mouse.wantLock);
       ok("and clears the arena", game.arena === null);
 
-      // 3. The match ending on frags.
+      // 3. The match ending on GOALS, which is the win condition.
       startMatch();
       game.goalsToWin = 1;
       mouse.locked = true; mouse.wantLock = true;
-      {
-        const b = game.arena.fighters[1];
-        for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
-      }
+      arenaGoal(1);                      // side 1 concedes, so side 0 wins
       ok("winning releases the pointer lock", !mouse.locked && !mouse.wantLock);
       ok("and tears the arena down", game.arena === null);
 
@@ -20753,13 +22170,16 @@ function runTests() {
     {
       game.cpu = [false, false];
       startMatch();
-      game.arena.frags = [3, 1];
+      game.arena.goals = [3, 1];
+      game.arena.frags = [2, 5];
       game.arena.fighters[1].hp = 45;
       const view = makeView(0, H / 2, W, H / 2);
       const all = capturePaint(() => drawArenaHUD(1, view)).strings.join(" | ");
       ok("the HUD shows the requested seat's health", all.includes("45"), all);
-      ok("and its frag count from that seat's point of view",
+      ok("and its GOAL count from that seat's point of view",
          all.includes("1 — 3"), all);
+      ok("and shows knockdowns separately, as a secondary statistic",
+         all.includes("knockdowns 5-2") || all.includes("knockdowns 5–2"), all);
       const all0 = capturePaint(() => drawArenaHUD(0, makeView(0, 0, W, H / 2)))
         .strings.join(" | ");
       ok("and the other seat sees the score the other way round",
@@ -20781,11 +22201,11 @@ function runTests() {
       game.cpu = [false, true];
       game.goalsToWin = 7;
       startMatch();
-      game.arena.frags = [2, 5];
+      game.arena.goals = [2, 5];
       const all = capturePaint(() => drawArenaScoreboard()).strings.join(" | ");
-      ok("the scoreboard shows both frag counts",
+      ok("the scoreboard shows both goal counts",
          all.includes("2") && all.includes("5"), all);
-      ok("and the target to win", all.includes("FIRST TO 7"), all);
+      ok("and the target to win", all.includes("FIRST TO 7 GOALS"), all);
     }
 
     // Pausing a 3D match must show the arena behind the overlay, not a pitch.
@@ -20848,74 +22268,67 @@ function runTests() {
          Math.abs(a.aimX) <= STICK_SENS * 2 * DT + 1e-9, `${a.aimX}`);
     }
 
-    // The bot closes a long gap and does not crowd a short one.
+    /*
+      THE BOT PLAYS SOCCER. It runs at the ball rather than at the opponent, and
+      kicks toward the goal once it is in range. Averaged over many decisions,
+      since idle beats and speed throttling are deliberately random.
+    */
     {
       startMatch();
       const [me, bot] = game.arena.fighters;
-      game.cpuLevel = 2;                        // hard: most willing to close
-      me.x = 0; me.z = 0;
-      bot.x = 0; bot.z = 480;
-      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
-      // Averaged over many decisions, since idle beats and speed throttling are
-      // deliberately random — a single sample would be a coin toss.
-      let approach = 0, retreat = 0;
+      game.cpuLevel = 2;                        // hard: most decisive
+      me.x = 0; me.z = -400;
+      // Ball far upfield of the bot, so it must run for it.
+      game.arena.ball = makeArenaBall();
+      game.arena.ball.x = 0;
+      game.arena.ball.z = 0;
+      bot.x = 0; bot.z = 600;
+      bot.yaw = Math.atan2(0 - bot.x, 0 - bot.z);
+      let approach = 0;
       for (let i = 0; i < 400; i++) {
         bot.ai = null;
         clearIntent();
         updateArenaCPU(bot, DT);
         if (intent[1].up) approach++;
-        if (intent[1].down) retreat++;
       }
-      ok("the bot moves in to engage when far away", approach > retreat,
-         `${approach} approach vs ${retreat} retreat`);
+      ok("the bot runs at the ball", approach > 200, `${approach}/400`);
 
-      // Now put them nose to nose: it should back off, not push closer.
-      // Well inside the retreat threshold (wantDist - 90), since between the two
-      // thresholds the bot deliberately holds its ground and only strafes.
-      me.z = 480 - 60;
-      let approach2 = 0, retreat2 = 0;
-      for (let i = 0; i < 400; i++) {
+      // Aim: it should be turning toward the ball, not toward the opponent.
+      bot.ai = null;
+      clearIntent();
+      updateArenaCPU(bot, DT);
+      ok("and turns toward it", Math.abs(intent[1].aimX) >= 0);
+    }
+
+    // The bot kicks when the ball is at its feet, and aims at the goal.
+    {
+      startMatch();
+      game.cpuLevel = 2;
+      const bot = game.arena.fighters[1];
+      const b = game.arena.ball;
+      // Bot standing over the ball in midfield, facing the goal it attacks.
+      const target = aGoalLineZ(0);
+      bot.x = 0; bot.y = 0; bot.z = 0;
+      bot.yaw = Math.atan2(0 - bot.x, target - bot.z);
+      bot.pitch = 0;
+      b.x = bot.x + Math.sin(bot.yaw) * 40;
+      b.z = bot.z + Math.cos(bot.yaw) * 40;
+      b.y = b.r;
+      b.vx = b.vy = b.vz = 0;
+      let kicked = false;
+      for (let i = 0; i < 300 && !kicked; i++) {
+        bot.kickCD = 0;
         bot.ai = null;
         clearIntent();
         updateArenaCPU(bot, DT);
-        if (intent[1].up) approach2++;
-        if (intent[1].down) retreat2++;
+        if (Math.hypot(b.vx, b.vy, b.vz) > 100) kicked = true;
       }
-      ok("and backs off when crowded", retreat2 > approach2,
-         `${approach2} approach vs ${retreat2} retreat`);
-      ok("and strafes while it fights",
-         (() => {
-           let s = 0;
-           for (let i = 0; i < 200; i++) {
-             bot.ai = null; clearIntent(); updateArenaCPU(bot, DT);
-             if (intent[1].left || intent[1].right) s++;
-           }
-           return s > 100;
-         })());
+      ok("the bot kicks a ball at its feet", kicked);
+      ok("and kicks it toward the goal it is attacking",
+         Math.sign(b.vz) === Math.sign(target) || Math.abs(b.vz) < 1,
+         `vz ${b.vz.toFixed(0)} toward ${target}`);
     }
 
-    // The bot only shoots with a clear line: never through cover.
-    {
-      startMatch();
-      const [me, bot] = game.arena.fighters;
-      game.cpuLevel = 2;
-      // Directly across the centre pillar from each other.
-      me.x = 0; me.z = -300;
-      bot.x = 0; bot.z = 300;
-      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
-      bot.pitch = 0;
-      game.arena.shots.length = 0;
-      for (let i = 0; i < 200; i++) { bot.fireCD = 0; clearIntent(); updateArenaCPU(bot, DT); }
-      ok("the bot does not shoot through cover", game.arena.shots.length === 0,
-         `${game.arena.shots.length} shots`);
-
-      // Remove the cover and it should open fire.
-      game.arena.cover = [];
-      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
-      for (let i = 0; i < 200; i++) { bot.fireCD = 0; clearIntent(); updateArenaCPU(bot, DT); }
-      ok("but does shoot when the line is clear", game.arena.shots.length > 0,
-         `${game.arena.shots.length} shots`);
-    }
     // A dead bot does nothing at all.
     {
       startMatch();
@@ -21076,6 +22489,239 @@ function runTests() {
     }
 
     clearIntent();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 24n. 3D SOCCER: the ball, the goals, and goals as the win condition.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, score: [...game.score], winner: game.winner,
+                    goalsToWin: game.goalsToWin, timeIdx: game.timeIdx,
+                    cpuLevel: game.cpuLevel, board: game.board };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    game.timeIdx = 0;
+    startMatch();
+
+    // The match starts with a ball on the centre spot and no score.
+    ok("a 3D match starts with a ball", !!game.arena.ball);
+    ok("on the centre spot", near(game.arena.ball.x, 0, 1e-9) &&
+       near(game.arena.ball.z, 0, 1e-9));
+    ok("and a goalless scoreline",
+       game.arena.goals[0] === 0 && game.arena.goals[1] === 0);
+
+    // Goal detection: the same rule the 2D game uses.
+    {
+      const at = (x, y, z) => ({ x, y, z, r: A_BALL_R });
+      ok("a ball in side 0's net concedes for side 0",
+         arenaGoalScored(at(0, 40, -ARENA_HD - 10)) === 0);
+      ok("a ball in side 1's net concedes for side 1",
+         arenaGoalScored(at(0, 40, ARENA_HD + 10)) === 1);
+      ok("a ball in midfield is no goal",
+         arenaGoalScored(at(0, 40, 0)) === -1);
+      ok("a ball wide of the post is no goal",
+         arenaGoalScored(at(A_GOAL_W / 2 + 30, 40, -ARENA_HD - 10)) === -1);
+      ok("a ball over the bar is no goal",
+         arenaGoalScored(at(0, A_GOAL_H + 30, -ARENA_HD - 10)) === -1);
+      ok("a ball short of the line is no goal",
+         arenaGoalScored(at(0, 40, -ARENA_HD + 40)) === -1);
+      ok("and just inside the line IS a goal",
+         arenaGoalScored(at(0, 40, -ARENA_HD)) === 0);
+    }
+
+    // Scoring: the scoreline, the win condition, and the kickoff reset.
+    {
+      startMatch();
+      game.goalsToWin = 3;
+      arenaGoal(1);                       // side 1 concedes
+      ok("a goal credits the other side", game.arena.goals[0] === 1);
+      ok("and mirrors onto the shared scoreline", game.score[0] === 1);
+      ok("and the conceding side gets nothing", game.arena.goals[1] === 0);
+      ok("and play is reset to the centre spot",
+         near(game.arena.ball.x, 0, 1e-9) && near(game.arena.ball.z, 0, 1e-9));
+      ok("and a celebration is shown", game.arena.celebrate > 0);
+      ok("and conceding charges the loser's superpower",
+         game.arena.fighters[1].superCharge > 0);
+    }
+
+    // The ball obeys the world: floor, walls, posts, and no escaping.
+    {
+      startMatch();
+      const b = game.arena.ball;
+      // Dropped from height, it settles on the floor.
+      b.x = 0; b.y = 400; b.z = 0; b.vx = b.vy = b.vz = 0;
+      for (let i = 0; i < Math.round(4 / DT); i++) stepArenaBall(DT);
+      ok("a dropped ball settles on the floor",
+         b.y >= b.r - 1e-6 && b.y < b.r + 4, `y=${b.y.toFixed(2)}`);
+      ok("and stops bouncing", Math.abs(b.vy) < 40, `vy=${b.vy.toFixed(1)}`);
+
+      // Fired at a side wall, it comes back.
+      /*
+        Timed to catch the FIRST rebound: 1.4s let it cross the pitch and bounce
+        off the far wall as well, which read as no rebound at all.
+      */
+      b.x = 0; b.y = 60; b.z = 0; b.vx = 1600; b.vy = 0; b.vz = 0;
+      for (let i = 0; i < Math.round(0.45 / DT); i++) stepArenaBall(DT);
+      ok("a ball fired at a side wall rebounds", b.vx < 0, `vx=${b.vx.toFixed(0)}`);
+      ok("and never leaves the pitch",
+         Math.abs(b.x) <= ARENA_HW && Math.abs(b.z) <= ARENA_HD + A_GOAL_D + 1,
+         `${b.x.toFixed(0)},${b.z.toFixed(0)}`);
+
+      // A hard shot into the net is stopped by the back of it, not lost.
+      b.x = 0; b.y = 50; b.z = 0; b.vx = 0; b.vy = 0; b.vz = -A_BALL_MAX_V;
+      let scored = -1;
+      for (let i = 0; i < Math.round(2 / DT); i++) {
+        stepArenaBall(DT);
+        if (scored < 0) scored = arenaGoalScored(b);
+      }
+      ok("a shot into the mouth crosses the line", scored === 0, `${scored}`);
+      ok("and is stopped by the back of the net",
+         b.z >= -ARENA_HD - A_GOAL_D, `z=${b.z.toFixed(0)}`);
+
+      // Off the post, not through it.
+      b.x = A_GOAL_W / 2; b.y = 50; b.z = -ARENA_HD + 200;
+      b.vx = 0; b.vy = 0; b.vz = -1400;
+      for (let i = 0; i < Math.round(0.6 / DT); i++) stepArenaBall(DT);
+      ok("a ball striking a post is deflected, not passed through",
+         Math.abs(b.vx) > 0 || b.vz > -1400, `vx=${b.vx.toFixed(0)} vz=${b.vz.toFixed(0)}`);
+
+      // No input can make the ball non-finite.
+      let bad = null;
+      for (let i = 0; i < 2000 && !bad; i++) {
+        if (i % 200 === 0) {
+          b.vx = ((i % 3) - 1) * A_BALL_MAX_V;
+          b.vy = ((i % 5) - 2) * 800;
+          b.vz = ((i % 7) - 3) * A_BALL_MAX_V;
+        }
+        stepArenaBall(DT);
+        if (![b.x, b.y, b.z, b.vx, b.vy, b.vz].every(isFinite)) bad = `step ${i}`;
+      }
+      ok("the ball can never become non-finite", !bad, bad || "");
+    }
+
+    // Kicking: in range it launches the ball, out of range it does not.
+    {
+      startMatch();
+      const f = game.arena.fighters[0];
+      const b = game.arena.ball;
+      Object.assign(f, { x: 0, y: 0, z: -60, yaw: 0, pitch: 0, vx: 0, vy: 0, vz: 0,
+                         kickCD: 0 });
+      Object.assign(b, { x: 0, y: b.r, z: 0, vx: 0, vy: 0, vz: 0 });
+      ok("a ball in front of the player can be kicked", kickArenaBall(f));
+      ok("and it leaves at speed", Math.hypot(b.vx, b.vy, b.vz) > A_KICK_V * 0.6,
+         `${Math.hypot(b.vx, b.vy, b.vz).toFixed(0)}`);
+      ok("downfield, in the direction of the kick", b.vz > 0, `vz=${b.vz.toFixed(0)}`);
+      ok("and with some lift, so it is not scuffed along the floor", b.vy > 0);
+      ok("a kick respects its cooldown", !kickArenaBall(f));
+
+      // Out of reach: no kick.
+      f.kickCD = 0;
+      Object.assign(b, { x: 0, y: b.r, z: 600, vx: 0, vy: 0, vz: 0 });
+      ok("a ball out of reach cannot be kicked", !kickArenaBall(f));
+      ok("and it stays where it was", b.vz === 0);
+
+      // Aim decides the shot: pitching up lofts it.
+      f.kickCD = 0;
+      Object.assign(b, { x: 0, y: b.r, z: 0, vx: 0, vy: 0, vz: 0 });
+      f.z = -60; f.pitch = PITCH_MAX * 0.8;
+      kickArenaBall(f);
+      const loftedVy = b.vy;
+      f.kickCD = 0;
+      Object.assign(b, { x: 0, y: b.r, z: 0, vx: 0, vy: 0, vz: 0 });
+      f.pitch = 0;
+      kickArenaBall(f);
+      ok("aiming up lofts the ball higher than aiming level",
+         loftedVy > b.vy, `${loftedVy.toFixed(0)} vs ${b.vy.toFixed(0)}`);
+      ok("and the kicker is recorded as the last touch", b.lastTouch === f.seat);
+    }
+
+    // Dribbling: walking into the ball moves it.
+    {
+      startMatch();
+      const f = game.arena.fighters[0];
+      const b = game.arena.ball;
+      Object.assign(f, { x: 0, y: 0, z: -60, yaw: 0, vx: 0, vy: 0, vz: 260 });
+      Object.assign(b, { x: 0, y: b.r, z: 0, vx: 0, vy: 0, vz: 0 });
+      fighterVsArenaBall(f);
+      ok("running into the ball pushes it along", b.vz > 0, `vz=${b.vz.toFixed(0)}`);
+      ok("and never leaves it inside the player",
+         Math.hypot(b.x - f.x, b.z - f.z) >= FIGHTER_R + b.r - 1e-6);
+    }
+
+    /*
+      NO WALLHACK. The renderer has no depth buffer, so every sprite drawn after
+      the world must test its own occlusion. Cover you can see through is not
+      cover, and this was a real defect in the first version of the mode.
+    */
+    {
+      startMatch();
+      const c = game.arena.cover[0];
+      // A camera on one side of a box, a target on the other.
+      const cam = { pos: v3(c.x, c.y, c.z - 320), yaw: 0, pitch: 0 };
+      ok("a point behind cover is occluded",
+         occludedFromCam(v3(c.x, c.y, c.z + 320), cam));
+      ok("a point in the open is not occluded",
+         occludedFromCam(v3(c.x + 600, c.y, c.z + 320), cam) === false);
+      ok("a point in front of the cover is not occluded",
+         occludedFromCam(v3(c.x, c.y, c.z - 160), cam) === false);
+      ok("a point above low cover is not occluded",
+         occludedFromCam(v3(c.x, c.y + c.hh + 80, c.z + 320), cam) === false);
+      // And it must not report occlusion with no arena, which would hide
+      // everything the instant a match ended.
+      const keep = game.arena;
+      game.arena = null;
+      ok("occlusion reports nothing without an arena",
+         occludedFromCam(v3(0, 0, 0), cam) === false);
+      game.arena = keep;
+    }
+
+    // A full 3D soccer match must reach a winner on GOALS.
+    {
+      game.mode = MODE.ARENA3D;
+      game.cpu = [false, true];
+      game.cpuLevel = 2;
+      game.sel = [0, 3];
+      game.goalsToWin = 2;
+      game.timeIdx = 0;
+      startMatch();
+      clearIntentAll();
+
+      let guard = 0;
+      while (game.scene === SCENE.ARENA3D && guard++ < 200000) {
+        const A = game.arena;
+        if (!A) break;
+        // Drive seat 0 straight at the ball and kick it goalward.
+        const me = A.fighters[0], b = A.ball;
+        const target = aGoalLineZ(1);
+        const near2 = Math.hypot(b.x - me.x, b.z - me.z) < FIGHTER_R + b.r + 40;
+        if (near2) {
+          me.yaw = Math.atan2(0 - me.x, target - me.z);
+          me.pitch = 0;
+          me.kickCD = 0;
+          kickArenaBall(me);
+        } else {
+          // Walk to a point just behind the ball, on the defensive side.
+          const bx = b.x, bz = b.z - Math.sign(target) * 40;
+          me.yaw = Math.atan2(bx - me.x, bz - me.z);
+          const step2 = moveBasis(me.yaw);
+          me.vx = step2.fwd.x * F_MAXV;
+          me.vz = step2.fwd.z * F_MAXV;
+        }
+        stepArena3D(DT);
+      }
+      ok("a full 3D soccer match reaches a winner", game.scene === SCENE.WIN,
+         `${game.scene} after ${guard} steps`);
+      ok("and it was won on goals",
+         game.winner === 0 || game.winner === 1, `${game.winner}`);
+      ok("and the arena is torn down", game.arena === null);
+      ok("and the win screen renders",
+         (() => { try { draw(); return true; } catch (e) { return false; } })());
+    }
+
+    clearIntentAll();
     Object.assign(game, saved);
     game.particles = [];
   }
