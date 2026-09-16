@@ -1673,6 +1673,109 @@ function limitSpeed(v, max) {
   return v;
 }
 
+/* ------------------------------------------------------- 2b. 3D MATH
+
+   Pure vector and camera maths for the 3D arena mode. Everything here is a
+   function of its arguments only — no globals, no canvas — so the self-test
+   suite can drive it directly, exactly like the 2D physics kernel below.
+
+   Coordinate system: right-handed, y UP. The arena floor is y = 0. This is
+   deliberately NOT the canvas convention (where y grows downward): the flip
+   happens once, inside project(), so every other piece of 3D code can think
+   in ordinary world terms.
+*/
+
+const v3 = (x = 0, y = 0, z = 0) => ({ x, y, z });
+const v3add = (a, b) => v3(a.x + b.x, a.y + b.y, a.z + b.z);
+const v3sub = (a, b) => v3(a.x - b.x, a.y - b.y, a.z - b.z);
+const v3scale = (a, k) => v3(a.x * k, a.y * k, a.z * k);
+const v3dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+const v3cross = (a, b) => v3(a.y * b.z - a.z * b.y,
+                             a.z * b.x - a.x * b.z,
+                             a.x * b.y - a.y * b.x);
+const v3len = (a) => Math.hypot(a.x, a.y, a.z);
+
+/** Unit vector. A zero vector returns itself rather than NaN. */
+function v3norm(a) {
+  const l = v3len(a);
+  return l > 1e-9 ? v3scale(a, 1 / l) : v3(0, 0, 0);
+}
+
+/*
+  Anything nearer than this is treated as behind the camera. A perspective
+  divide by a near-zero depth would fling a vertex thousands of pixels off
+  screen, and a quad with one such corner smears across the whole viewport —
+  so project() reports null instead and the renderer drops the face.
+*/
+const NEAR = 12;
+
+/** Clamp for pitch: ±55°, so the camera can never tumble over the top. */
+const PITCH_MAX = 0.96;
+
+/**
+ * The camera's orthonormal basis from its yaw and pitch.
+ *
+ * `fwd` is where the camera looks, `right` is screen-right, `up` is screen-up.
+ * Computed once per viewport per frame and passed into every projection, since
+ * recomputing six trig calls per vertex measurably dominated the frame.
+ */
+function camBasis(cam) {
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const fwd = v3(sy * cp, sp, cy * cp);
+  // Right is horizontal by construction: yaw only. This keeps the horizon
+  // level no matter how far the camera pitches, which is what stops the world
+  // appearing to roll when you look up.
+  const right = v3(cy, 0, -sy);
+  /*
+    Order matters: cross(fwd, right) points UP, and cross(right, fwd) points
+    down. Getting it backwards flips the whole world vertically while leaving
+    every orthonormality check passing, so the two directional assertions in
+    the suite are the only thing that catches it.
+  */
+  const up = v3cross(fwd, right);
+  return { fwd, right, up };
+}
+
+/**
+ * World point -> camera space. `z` is depth along the view direction.
+ * Pass the basis from camBasis(); it is not recomputed here.
+ */
+function worldToCam(p, cam, basis) {
+  const d = v3sub(p, cam.pos);
+  return v3(v3dot(d, basis.right), v3dot(d, basis.up), v3dot(d, basis.fwd));
+}
+
+/**
+ * A viewport: where on the canvas it sits, and how strongly it foreshortens.
+ * `focal` is derived from the vertical field of view so a taller viewport does
+ * not silently widen the lens — split-screen halves the height, and without
+ * this the two views would show different amounts of the world.
+ */
+function makeView(x, y, w, h, fov = 1.15) {
+  return {
+    x, y, w, h,
+    cx: x + w / 2,
+    cy: y + h / 2,
+    focal: (h / 2) / Math.tan(fov / 2),
+  };
+}
+
+/**
+ * Project a world point into a viewport.
+ *
+ * Returns {x, y, s, z} where `s` is the scale factor at that depth (so a
+ * sphere of radius r covers r*s pixels) and `z` is camera depth for sorting.
+ * Returns null when the point is at or behind the near plane — see NEAR.
+ */
+function project(p, cam, view, basis) {
+  const c = worldToCam(p, cam, basis);
+  if (c.z < NEAR) return null;
+  const s = view.focal / c.z;
+  // Canvas y grows downward, world y grows upward: the single flip lives here.
+  return { x: view.cx + c.x * s, y: view.cy - c.y * s, s, z: c.z };
+}
+
 /* -------------------------------------------------- 3. PURE PHYSICS KERNEL
 
    Everything here is a pure function of its arguments (bodies are plain
@@ -9607,6 +9710,9 @@ const PHYS = {
   getTunables: () => ({ ballRest, ballDrag, playerSpeedMul, playerJumpMul,
                         playerSizeMul, goalTravel, goalSpeedL, goalSpeedR, goalScale }),
   setGoalPhase: (v) => { goalPhase = v; },
+  // 3D arena: pure maths first, so the suite can drive the projector directly.
+  v3, v3add, v3sub, v3scale, v3dot, v3cross, v3len, v3norm,
+  camBasis, worldToCam, project, makeView, NEAR, PITCH_MAX,
   consts: { W, H, GROUND_Y, WALL, GOAL_BASE_TOP, GOAL_H, GRAVITY, DT, BALL_R, BALL_MAX_V, BALL_REST },
 };
 if (typeof window !== "undefined") window.PHYS = PHYS;
@@ -17806,6 +17912,136 @@ function runTests() {
     Object.assign(net, savedNet);
     Object.assign(game, saved);
     game.particles = [];
+  }
+
+  /* ---------------------------------------------------------------------
+     3D ARENA MODE
+
+     The projector is a pure function, so it is tested the way the 2D physics
+     kernel is: by driving it directly and checking the numbers, not by
+     calling a draw routine and hoping it did not throw.
+     ------------------------------------------------------------------- */
+
+  // 24a. Projection: the core perspective contract.
+  {
+    const view = makeView(0, 0, W, H);
+    // Camera at the origin looking down +z (yaw 0, pitch 0).
+    const cam = { pos: v3(0, 0, 0), yaw: 0, pitch: 0 };
+    const basis = camBasis(cam);
+
+    const ahead = project(v3(0, 0, 300), cam, view, basis);
+    ok("a point straight ahead lands at viewport centre",
+       ahead && near(ahead.x, view.cx, 1e-9) && near(ahead.y, view.cy, 1e-9),
+       ahead ? `${ahead.x},${ahead.y}` : "null");
+
+    ok("a point behind the camera is refused",
+       project(v3(0, 0, -300), cam, view, basis) === null);
+    ok("a point at the camera itself is refused",
+       project(v3(0, 0, 0), cam, view, basis) === null);
+    ok("a point just inside the near plane is refused",
+       project(v3(0, 0, NEAR - 0.01), cam, view, basis) === null);
+    ok("a point just beyond the near plane is accepted",
+       project(v3(0, 0, NEAR + 0.01), cam, view, basis) !== null);
+
+    // Perspective: twice as far is half the size.
+    const nearP = project(v3(50, 0, 200), cam, view, basis);
+    const farP = project(v3(50, 0, 400), cam, view, basis);
+    ok("twice the distance is half the scale",
+       near(nearP.s, farP.s * 2, 1e-9), `${nearP.s} vs ${farP.s}`);
+    ok("and twice as close is twice as far from centre",
+       near(nearP.x - view.cx, (farP.x - view.cx) * 2, 1e-9));
+
+    // World y is UP, canvas y is DOWN: a point above the axis draws higher.
+    const above = project(v3(0, 80, 300), cam, view, basis);
+    ok("a point above the camera draws above centre", above.y < view.cy,
+       `${above.y} vs ${view.cy}`);
+
+    // A point to the world +x draws to screen right when looking down +z.
+    const rightP = project(v3(80, 0, 300), cam, view, basis);
+    ok("a point to the right draws right of centre", rightP.x > view.cx);
+  }
+
+  // 24b. Rotation: yaw and pitch move the image the way a player expects.
+  {
+    const view = makeView(0, 0, W, H);
+    const target = v3(0, 0, 300);
+
+    // Yawing right should slide a fixed point to the LEFT of the screen.
+    const straight = { pos: v3(0, 0, 0), yaw: 0, pitch: 0 };
+    const turned = { pos: v3(0, 0, 0), yaw: 0.3, pitch: 0 };
+    const a = project(target, straight, view, camBasis(straight));
+    const b = project(target, turned, view, camBasis(turned));
+    ok("yawing right slides the world left", b.x < a.x, `${a.x} -> ${b.x}`);
+
+    // Pitching up should slide a fixed point DOWN the screen.
+    const up = { pos: v3(0, 0, 0), yaw: 0, pitch: 0.3 };
+    const c = project(target, up, view, camBasis(up));
+    ok("pitching up slides the world down", c.y > a.y, `${a.y} -> ${c.y}`);
+
+    // A full sweep must never produce NaN or lose the horizon.
+    let bad = null;
+    for (let i = 0; i < 360; i += 3) {
+      const cam = { pos: v3(0, 40, 0), yaw: (i * Math.PI) / 180, pitch: 0 };
+      const bs = camBasis(cam);
+      if (Math.abs(v3len(bs.fwd) - 1) > 1e-9) { bad = `fwd not unit at ${i}°`; break; }
+      if (Math.abs(v3len(bs.right) - 1) > 1e-9) { bad = `right not unit at ${i}°`; break; }
+      if (Math.abs(v3dot(bs.fwd, bs.right)) > 1e-9) { bad = `not orthogonal at ${i}°`; break; }
+      if (Math.abs(bs.right.y) > 1e-9) { bad = `horizon rolled at ${i}°`; break; }
+      const p = project(v3(0, 0, 300), cam, view, bs);
+      if (p && (!isFinite(p.x) || !isFinite(p.y) || !isFinite(p.s))) {
+        bad = `non-finite at ${i}°`; break;
+      }
+    }
+    ok("a full yaw sweep keeps an orthonormal, level basis", !bad, bad || "");
+
+    // Pitch too: the basis must stay orthonormal all the way to the clamp.
+    let badP = null;
+    for (let p = -PITCH_MAX; p <= PITCH_MAX; p += 0.08) {
+      const cam = { pos: v3(0, 40, 0), yaw: 0.7, pitch: p };
+      const bs = camBasis(cam);
+      if (Math.abs(v3len(bs.up) - 1) > 1e-9) { badP = `up not unit at ${p.toFixed(2)}`; break; }
+      if (Math.abs(v3dot(bs.up, bs.fwd)) > 1e-9) { badP = `up·fwd at ${p.toFixed(2)}`; break; }
+      if (Math.abs(bs.right.y) > 1e-9) { badP = `horizon rolled at ${p.toFixed(2)}`; break; }
+    }
+    ok("pitching keeps the basis orthonormal and the horizon level", !badP, badP || "");
+  }
+
+  // 24c. Vector helpers, including the degenerate cases.
+  {
+    ok("v3 arithmetic is componentwise",
+       (() => { const r = v3add(v3(1, 2, 3), v3(10, 20, 30));
+                return r.x === 11 && r.y === 22 && r.z === 33; })());
+    ok("v3sub is componentwise",
+       (() => { const r = v3sub(v3(10, 20, 30), v3(1, 2, 3));
+                return r.x === 9 && r.y === 18 && r.z === 27; })());
+    ok("v3dot matches the definition", v3dot(v3(1, 2, 3), v3(4, 5, 6)) === 32);
+    ok("v3len is the euclidean norm", near(v3len(v3(3, 4, 0)), 5, 1e-12));
+    ok("v3norm returns a unit vector", near(v3len(v3norm(v3(3, 4, 5))), 1, 1e-12));
+    // The degenerate case: a zero vector must not become NaN. Two fighters at
+    // exactly the same spot would otherwise poison every later calculation.
+    ok("v3norm of a zero vector is zero, not NaN",
+       (() => { const r = v3norm(v3(0, 0, 0));
+                return r.x === 0 && r.y === 0 && r.z === 0; })());
+    ok("v3cross is perpendicular to both inputs",
+       (() => { const a = v3(1, 2, 3), b = v3(-4, 5, 6), c = v3cross(a, b);
+                return near(v3dot(c, a), 0, 1e-9) && near(v3dot(c, b), 0, 1e-9); })());
+  }
+
+  // 24d. Viewports: split-screen must not secretly change the lens.
+  {
+    const full = makeView(0, 0, W, H);
+    const top = makeView(0, 0, W, H / 2);
+    ok("a viewport centres on itself",
+       full.cx === W / 2 && full.cy === H / 2);
+    ok("a half-height viewport centres on its own half",
+       top.cx === W / 2 && top.cy === H / 4);
+    /*
+      focal scales with height, so both views show the same VERTICAL angle.
+      Were focal fixed instead, the split-screen halves would appear zoomed in
+      relative to the full view — the bug this assertion exists to prevent.
+    */
+    ok("focal length scales with viewport height",
+       near(full.focal, top.focal * 2, 1e-9), `${full.focal} vs ${top.focal}`);
   }
 
   // 23. Determinism: identical initial conditions give identical results.
