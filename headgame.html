@@ -6574,6 +6574,173 @@ function takeMouseDelta() {
   return d;
 }
 
+/* ---- movement -------------------------------------------------------- */
+
+/**
+ * The horizontal movement basis for a camera yaw.
+ *
+ * `fwd` is where the camera looks, flattened onto the floor; `right` is
+ * screen-right. WASD is expressed in these, which is what makes W mean "away
+ * from the camera" rather than "toward world north" — the third-person
+ * convention every player already expects.
+ */
+function moveBasis(yaw) {
+  return {
+    fwd: v3(Math.sin(yaw), 0, Math.cos(yaw)),
+    right: v3(Math.cos(yaw), 0, -Math.sin(yaw)),
+  };
+}
+
+/**
+ * Clamp a fighter inside the arena walls.
+ *
+ * Position only, plus killing the velocity into the wall: letting the velocity
+ * survive means a player holding a direction against a wall accumulates speed
+ * they then carry away from it, which feels like the wall spat them out.
+ */
+function arenaBounds(f) {
+  const lim = ARENA_HW - FIGHTER_R;
+  const limZ = ARENA_HD - FIGHTER_R;
+  if (f.x < -lim) { f.x = -lim; if (f.vx < 0) f.vx = 0; }
+  if (f.x > lim) { f.x = lim; if (f.vx > 0) f.vx = 0; }
+  if (f.z < -limZ) { f.z = -limZ; if (f.vz < 0) f.vz = 0; }
+  if (f.z > limZ) { f.z = limZ; if (f.vz > 0) f.vz = 0; }
+  if (f.y < 0) { f.y = 0; f.vy = 0; f.onGround = true; }
+  // A ceiling, so a dash up a wall cannot escape the room.
+  const ceil = ARENA_WALL_H - FIGHTER_H;
+  if (f.y > ceil) { f.y = ceil; if (f.vy > 0) f.vy = 0; }
+}
+
+/**
+ * Push a fighter out of any cover box it has entered.
+ *
+ * Resolved along the axis of LEAST penetration, which for axis-aligned boxes is
+ * both correct and stable: it is the shortest way out, so a fighter pressed
+ * into a corner slides along the box rather than popping through it.
+ *
+ * The vertical case is handled first and separately, because landing on top of
+ * a crate is a distinct outcome from bumping into its side — it grounds the
+ * fighter, which is what makes crates climbable and worth using as cover.
+ */
+function fighterVsCover(f) {
+  for (const c of game.arena.cover) {
+    // The fighter is a box for this test: a capsule would be more accurate but
+    // reads no differently at this speed, and this is exact and cheap.
+    const dx = f.x - c.x;
+    const dz = f.z - c.z;
+    const fy0 = f.y, fy1 = f.y + FIGHTER_H;
+    const cy0 = c.y - c.hh, cy1 = c.y + c.hh;
+
+    const ox = c.hw + FIGHTER_R - Math.abs(dx);
+    const oz = c.hd + FIGHTER_R - Math.abs(dz);
+    if (ox <= 0 || oz <= 0) continue;              // clear horizontally
+    if (fy0 >= cy1 || fy1 <= cy0) continue;        // clear vertically
+
+    const oyTop = cy1 - fy0;                        // to stand on top
+    const oyBot = fy1 - cy0;                        // to duck underneath
+
+    /*
+      Landing: falling, and the feet are near the top face. Checked before the
+      horizontal push so a fighter descending onto a crate lands on it instead
+      of being shoved out sideways at the last moment.
+    */
+    if (f.vy <= 0 && oyTop <= Math.min(ox, oz) && oyTop <= FIGHTER_H * 0.6) {
+      f.y = cy1;
+      f.vy = 0;
+      f.onGround = true;
+      continue;
+    }
+    // Hitting the underside while rising.
+    if (f.vy > 0 && oyBot <= Math.min(ox, oz)) {
+      f.y = cy0 - FIGHTER_H;
+      f.vy = 0;
+      continue;
+    }
+    // Otherwise push out along whichever horizontal axis is shallower.
+    if (ox < oz) {
+      f.x += dx >= 0 ? ox : -ox;
+      if ((dx >= 0 && f.vx < 0) || (dx < 0 && f.vx > 0)) f.vx = 0;
+    } else {
+      f.z += dz >= 0 ? oz : -oz;
+      if ((dz >= 0 && f.vz < 0) || (dz < 0 && f.vz > 0)) f.vz = 0;
+    }
+  }
+}
+
+/**
+ * Advance one fighter by `dt` under its intent.
+ *
+ * `a` is the seat's intent record: left/right/up/down for movement, plus the
+ * aim, jump and dash fields the 3D mode adds.
+ */
+function stepFighter(f, a, dt) {
+  if (f.dead) {
+    f.respawn -= dt;
+    if (f.respawn <= 0) respawnFighter(f);
+    return;
+  }
+
+  if (f.fireCD > 0) f.fireCD -= dt;
+  if (f.dashCD > 0) f.dashCD -= dt;
+  if (f.hurt > 0) f.hurt -= dt;
+
+  // Aim. Yaw wraps freely; pitch is clamped so the camera cannot tumble.
+  f.yaw += a.aimX || 0;
+  f.pitch = clamp(f.pitch + (a.aimY || 0), -PITCH_MAX, PITCH_MAX);
+
+  // Movement, in the camera's frame rather than the world's.
+  const b = moveBasis(f.yaw);
+  let wx = 0, wz = 0;
+  if (a.up) { wx += b.fwd.x; wz += b.fwd.z; }
+  if (a.down) { wx -= b.fwd.x; wz -= b.fwd.z; }
+  if (a.right) { wx += b.right.x; wz += b.right.z; }
+  if (a.left) { wx -= b.right.x; wz -= b.right.z; }
+
+  const wl = Math.hypot(wx, wz);
+  if (wl > 1e-6) {
+    // Normalised, so pressing two keys is not faster than pressing one.
+    wx /= wl; wz /= wl;
+    const acc = (f.onGround ? F_ACCEL : F_AIRACCEL) * dt;
+    f.vx += wx * acc;
+    f.vz += wz * acc;
+  } else if (f.onGround) {
+    // Friction only on the ground: air control should not brake you.
+    const k = Math.max(0, 1 - F_FRICTION * dt);
+    f.vx *= k;
+    f.vz *= k;
+  }
+
+  // Ground speed cap. Applied to the horizontal plane only, so a jump's
+  // vertical speed is never clipped by it.
+  const sp = Math.hypot(f.vx, f.vz);
+  if (sp > F_MAXV) { const k = F_MAXV / sp; f.vx *= k; f.vz *= k; }
+
+  if (a.jump && f.onGround) {
+    f.vy = F_JUMP;
+    f.onGround = false;
+  }
+
+  // Dash: a burst along the current facing, on a cooldown. Deliberately
+  // horizontal — a dash that also launched you would replace jumping.
+  if (a.dashEdge && f.dashCD <= 0) {
+    f.vx += b.fwd.x * F_DASH;
+    f.vz += b.fwd.z * F_DASH;
+    f.dashCD = F_DASH_CD;
+  }
+
+  f.vy -= F_GRAV * dt;
+
+  f.x += f.vx * dt;
+  f.y += f.vy * dt;
+  f.z += f.vz * dt;
+
+  // onGround is recomputed every step: it is only true if something is holding
+  // the fighter up right now, which bounds and cover decide below.
+  f.onGround = false;
+  fighterVsCover(f);
+  arenaBounds(f);
+}
+
 function step(dt) {
   /*
     A GUEST runs no simulation at all — the host owns the world and streams it.
@@ -10243,6 +10410,7 @@ const PHYS = {
   startArena3D, endArena3D, makeFighter, respawnFighter, arenaSpawns, arenaCover,
   isArena3D, segmentHitsCover, updateArenaCameras, outsideArena,
   mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
+  stepFighter, moveBasis, arenaBounds, fighterVsCover,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
@@ -18986,6 +19154,259 @@ function runTests() {
 
     endArena3D();
     Object.assign(game, saved);
+  }
+
+  // 24i. Movement, gravity and collision.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    startMatch();
+
+    const noIntent = () => ({ left: false, right: false, up: false, down: false,
+                              aimX: 0, aimY: 0, jump: false, dashEdge: false });
+    /** A lone fighter in a clear corner of the room, for isolated tests. */
+    const lone = (over = {}) => {
+      const f = makeFighter(0, TEAMS[0]);
+      f.x = -460; f.z = -460; f.y = 0;
+      Object.assign(f, over);
+      return f;
+    };
+    const run = (f, a, secs) => {
+      const n = Math.round(secs / DT);
+      for (let i = 0; i < n; i++) stepFighter(f, a, DT);
+      return f;
+    };
+
+    // Gravity: a dropped fighter settles ON the floor, never through it.
+    {
+      const f = lone({ y: 300 });
+      run(f, noIntent(), 2);
+      ok("a falling fighter comes to rest exactly on the floor",
+         near(f.y, 0, 1e-9) && near(f.vy, 0, 1e-9), `y=${f.y} vy=${f.vy}`);
+      ok("and is reported as grounded", f.onGround);
+    }
+    // A very long fall must not tunnel: the floor is a clamp, not a test.
+    {
+      const f = lone({ y: 5000, vy: -8000 });
+      run(f, noIntent(), 1);
+      ok("even a fast fall cannot tunnel through the floor", f.y >= 0, `${f.y}`);
+    }
+
+    // Jump: rises, then returns to the floor.
+    {
+      const f = lone();
+      const a = noIntent(); a.jump = true;
+      stepFighter(f, a, DT);
+      ok("jumping leaves the ground", f.vy > 0 && !f.onGround);
+      const peak = (() => { let p = 0; for (let i = 0; i < 200; i++)
+        { stepFighter(f, noIntent(), DT); p = Math.max(p, f.y); } return p; })();
+      ok("a jump gets meaningfully off the floor", peak > 40, `${peak.toFixed(0)}`);
+      run(f, noIntent(), 2);
+      ok("and lands again", near(f.y, 0, 1e-9) && f.onGround);
+    }
+    // A second jump in mid-air must be refused, or the fighter can fly.
+    {
+      const f = lone();
+      const a = noIntent(); a.jump = true;
+      stepFighter(f, a, DT);
+      const vyAfterFirst = f.vy;
+      stepFighter(f, a, DT);       // still held, still airborne
+      ok("jump cannot be repeated in mid-air", f.vy < vyAfterFirst,
+         `${vyAfterFirst} -> ${f.vy}`);
+    }
+
+    // WASD is camera-relative: the same key with a different yaw goes elsewhere.
+    {
+      const north = lone({ yaw: 0 });
+      const east = lone({ yaw: Math.PI / 2 });
+      const a = noIntent(); a.up = true;
+      run(north, a, 0.3);
+      run(east, a, 0.3);
+      ok("forward with yaw 0 moves along +z",
+         north.z > -460 + 10 && near(north.x, -460, 1e-6),
+         `x=${north.x.toFixed(1)} z=${north.z.toFixed(1)}`);
+      ok("forward with yaw 90° moves along +x instead",
+         east.x > -460 + 10 && near(east.z, -460, 1e-6),
+         `x=${east.x.toFixed(1)} z=${east.z.toFixed(1)}`);
+      ok("so movement is camera-relative, not world-relative",
+         Math.abs(north.z - (-460)) > 10 && Math.abs(east.x - (-460)) > 10);
+    }
+    // Strafing must be perpendicular to forward, not parallel.
+    {
+      const f = lone({ yaw: 0 });
+      const a = noIntent(); a.right = true;
+      run(f, a, 0.3);
+      ok("strafing right with yaw 0 moves along +x",
+         f.x > -460 + 10 && near(f.z, -460, 1e-6),
+         `x=${f.x.toFixed(1)} z=${f.z.toFixed(1)}`);
+    }
+    // Diagonals must not be faster than cardinals.
+    {
+      const straight = lone({ yaw: 0 });
+      const diag = lone({ yaw: 0 });
+      const a1 = noIntent(); a1.up = true;
+      const a2 = noIntent(); a2.up = true; a2.right = true;
+      run(straight, a1, 1.5);
+      run(diag, a2, 1.5);
+      const d1 = Math.hypot(straight.x + 460, straight.z + 460);
+      const d2 = Math.hypot(diag.x + 460, diag.z + 460);
+      ok("moving diagonally is no faster than moving straight",
+         d2 <= d1 + 1, `straight ${d1.toFixed(1)} vs diagonal ${d2.toFixed(1)}`);
+    }
+
+    // Top speed is capped horizontally, whatever the input.
+    {
+      const f = lone({ yaw: 0.7 });
+      const a = noIntent(); a.up = true; a.right = true;
+      run(f, a, 4);
+      ok("horizontal speed is capped", Math.hypot(f.vx, f.vz) <= F_MAXV + 1e-6,
+         `${Math.hypot(f.vx, f.vz).toFixed(1)} vs ${F_MAXV}`);
+    }
+    // Releasing the keys brings a grounded fighter to a stop.
+    {
+      const f = lone({ yaw: 0 });
+      const a = noIntent(); a.up = true;
+      run(f, a, 1);
+      run(f, noIntent(), 3);
+      ok("letting go stops a grounded fighter",
+         Math.hypot(f.vx, f.vz) < 1, `${Math.hypot(f.vx, f.vz).toFixed(3)}`);
+    }
+
+    // Dash: adds speed, then refuses until the cooldown expires.
+    {
+      const f = lone({ yaw: 0 });
+      const a = noIntent(); a.dashEdge = true;
+      stepFighter(f, a, DT);
+      const after = Math.hypot(f.vx, f.vz);
+      ok("dashing adds a burst of speed", after > 200, `${after.toFixed(0)}`);
+      ok("and starts its cooldown", f.dashCD > 0);
+      const before2 = Math.hypot(f.vx, f.vz);
+      stepFighter(f, a, DT);
+      ok("a second dash is refused while cooling down",
+         Math.hypot(f.vx, f.vz) <= before2 + 1e-6);
+      run(f, noIntent(), F_DASH_CD + 0.1);
+      ok("and allowed again once the cooldown expires", f.dashCD <= 0);
+    }
+
+    // Pitch clamp, held hard in both directions.
+    {
+      const f = lone();
+      const up = noIntent(); up.aimY = 0.3;
+      run(f, up, 1);
+      ok("pitch is clamped looking up", near(f.pitch, PITCH_MAX, 1e-9), `${f.pitch}`);
+      const dn = noIntent(); dn.aimY = -0.3;
+      run(f, dn, 2);
+      ok("and clamped looking down", near(f.pitch, -PITCH_MAX, 1e-9), `${f.pitch}`);
+    }
+    // Yaw, by contrast, must wrap freely rather than clamp.
+    {
+      const f = lone();
+      const a = noIntent(); a.aimX = 0.2;
+      run(f, a, 3);
+      ok("yaw turns without limit", Math.abs(f.yaw) > Math.PI, `${f.yaw.toFixed(2)}`);
+    }
+
+    // The walls hold, from every direction, under sustained pressure.
+    {
+      const dirs = [["west", { yaw: -Math.PI / 2 }], ["east", { yaw: Math.PI / 2 }],
+                    ["north", { yaw: Math.PI }], ["south", { yaw: 0 }]];
+      let bad = null;
+      for (const [name, over] of dirs) {
+        const f = makeFighter(0, TEAMS[0]);
+        f.x = 0; f.z = 0; f.y = 0;
+        Object.assign(f, over);
+        const a = noIntent(); a.up = true;
+        run(f, a, 6);
+        if (Math.abs(f.x) > ARENA_HW - FIGHTER_R + 1e-6 ||
+            Math.abs(f.z) > ARENA_HD - FIGHTER_R + 1e-6) {
+          bad = `escaped ${name}: ${f.x.toFixed(1)},${f.z.toFixed(1)}`; break;
+        }
+      }
+      ok("a fighter cannot walk out of the arena in any direction", !bad, bad || "");
+    }
+    // Nor escape upward.
+    {
+      const f = lone({ vy: 9000 });
+      run(f, noIntent(), 0.6);
+      ok("a fighter cannot escape through the ceiling",
+         f.y <= ARENA_WALL_H - FIGHTER_H + 1e-6, `${f.y.toFixed(1)}`);
+    }
+
+    /*
+      Cover must be solid from every horizontal direction. Walked into hard for
+      a full second from each of four sides, the fighter must end up outside the
+      box — a fighter that ends up inside would be shooting from within a crate.
+    */
+    {
+      const c = game.arena.cover.find((b) => b.x === 0 && b.z === 0);  // pillar
+      let bad = null;
+      const approaches = [
+        ["from -x", { x: -300, z: 0, yaw: Math.PI / 2 }],
+        ["from +x", { x: 300, z: 0, yaw: -Math.PI / 2 }],
+        ["from -z", { x: 0, z: -300, yaw: 0 }],
+        ["from +z", { x: 0, z: 300, yaw: Math.PI }],
+      ];
+      for (const [name, over] of approaches) {
+        const f = makeFighter(0, TEAMS[0]);
+        Object.assign(f, over, { y: 0, vx: 0, vy: 0, vz: 0 });
+        const a = noIntent(); a.up = true;
+        run(f, a, 1.5);
+        const insideX = Math.abs(f.x - c.x) < c.hw + FIGHTER_R - 0.5;
+        const insideZ = Math.abs(f.z - c.z) < c.hd + FIGHTER_R - 0.5;
+        const insideY = f.y < c.y + c.hh - 0.5;
+        if (insideX && insideZ && insideY) {
+          bad = `${name}: ended inside the pillar at ${f.x.toFixed(1)},${f.z.toFixed(1)},${f.y.toFixed(1)}`;
+          break;
+        }
+      }
+      ok("a fighter cannot walk into a cover box from any side", !bad, bad || "");
+    }
+
+    // Crates are climbable: dropping onto one lands on top of it.
+    {
+      const c = game.arena.cover.find((b) => b.x === -250 && b.z === -250);
+      const f = makeFighter(0, TEAMS[0]);
+      Object.assign(f, { x: c.x, z: c.z, y: c.y + c.hh + 120, vx: 0, vy: 0, vz: 0 });
+      run(f, noIntent(), 2);
+      ok("a fighter lands on top of a crate rather than inside it",
+         near(f.y, c.y + c.hh, 1e-6) && f.onGround, `y=${f.y.toFixed(2)}`);
+    }
+    // And standing on one is stable, not a slow sink.
+    {
+      const c = game.arena.cover.find((b) => b.x === -250 && b.z === -250);
+      const f = makeFighter(0, TEAMS[0]);
+      Object.assign(f, { x: c.x, z: c.z, y: c.y + c.hh, vx: 0, vy: 0, vz: 0 });
+      run(f, noIntent(), 3);
+      ok("and stays there instead of sinking",
+         near(f.y, c.y + c.hh, 1e-6), `y=${f.y.toFixed(3)}`);
+    }
+
+    // No input can ever produce a non-finite fighter.
+    {
+      let bad = null;
+      const f = lone();
+      for (let i = 0; i < 600 && !bad; i++) {
+        const a = noIntent();
+        a.up = i % 3 === 0; a.down = i % 7 === 0;
+        a.left = i % 5 === 0; a.right = i % 4 === 0;
+        a.jump = i % 23 === 0; a.dashEdge = i % 61 === 0;
+        a.aimX = ((i % 11) - 5) * 0.05;
+        a.aimY = ((i % 9) - 4) * 0.05;
+        stepFighter(f, a, DT);
+        if (![f.x, f.y, f.z, f.vx, f.vy, f.vz, f.yaw, f.pitch].every(isFinite)) {
+          bad = `non-finite at step ${i}`;
+        }
+      }
+      ok("no sequence of inputs produces a non-finite fighter", !bad, bad || "");
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
   }
 
   // 23. Determinism: identical initial conditions give identical results.
