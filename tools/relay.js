@@ -210,6 +210,24 @@ server.on("upgrade", (req, sock) => {
   if (!key) { sock.destroy(); return; }
 
   const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+  /*
+    A PROXY THAT REWRITES THE HANDSHAKE cannot be made to work from here.
+    Cloudflare's free quick tunnels (trycloudflare.com) generate their own
+    Sec-WebSocket-Key toward the origin but then validate the origin's
+    Sec-WebSocket-Accept against the CLIENT's key, so the two can never agree and
+    every upgrade fails with a 500 no matter what this server replies.
+
+    Detected and logged rather than worked around, because there is no correct
+    reply available: whatever hash we send is checked against a key we were never
+    told. The operator needs to know to use a different tunnel, and a silent 500
+    from Cloudflare tells them nothing.
+  */
+  if (/^cloudflare/i.test(req.headers["cf-worker"] || "") ||
+      /trycloudflare\.com/i.test(req.headers.host || "")) {
+    log("WARNING: this request came through a Cloudflare quick tunnel, which " +
+        "rewrites the WebSocket handshake key. The upgrade will fail no matter " +
+        "what we reply. Use a NAMED cloudflare tunnel, or a different tunnel.");
+  }
   sock.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
     "Upgrade: websocket\r\n" +
@@ -326,8 +344,16 @@ function start() {
   for (const a of addrs) console.log(`    ${a}:${PORT}`);
   if (!addrs.length) console.log(`    localhost:${PORT}  (this machine only)`);
   console.log("");
-  console.log("  For players outside your network, run a tunnel and share its URL:");
-  console.log(`    cloudflared tunnel --url http://localhost:${PORT}`);
+  console.log("  For players outside your network, run a tunnel and share its URL.");
+  console.log("");
+  console.log("  NOT cloudflared's free quick tunnel (trycloudflare.com): it");
+  console.log("  rewrites the WebSocket handshake key and every connection fails.");
+  console.log("  These do work:");
+  console.log(`    ssh -R 80:localhost:${PORT} serveo.net`);
+  console.log(`    ngrok http ${PORT}`);
+  console.log(`    cloudflared tunnel run <named-tunnel>   # named, not 'quick'`);
+  console.log("");
+  console.log(`  Change the port with:  node tools/relay.js --port <n>`);
   console.log("");
   });
 }

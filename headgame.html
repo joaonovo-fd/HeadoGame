@@ -536,7 +536,18 @@ function loadOpts(into) {
     const raw = localStorage.getItem("headgame.opts");
     if (!raw) return into;
     const o = JSON.parse(raw);
-    for (const k of Object.keys(into)) if (typeof o[k] === "boolean") into[k] = o[k];
+    for (const k of Object.keys(into)) {
+      if (typeof o[k] === "boolean") into[k] = o[k];
+      /*
+        Numbers too, since the relay port lives here. Range-checked on the way in:
+        a corrupt or absurd stored value must not leave the game unable to connect
+        to anything, so it falls back to the authored default.
+      */
+      else if (typeof into[k] === "number" && typeof o[k] === "number" &&
+               isFinite(o[k])) {
+        into[k] = k === "relayPort" ? clamp(Math.round(o[k]), 1, 65535) : o[k];
+      }
+    }
   } catch (e) {
     // Blocked or corrupt storage — the authored defaults are fine.
   }
@@ -2477,8 +2488,10 @@ addEventListener("keydown", (e) => {
     is not also read as menu navigation.
   */
   if (net.editing) {
-    const field = net.editing;                 // "addr" | "code"
-    const cur = field === "addr" ? net.relayAddr : net.relayCode;
+    const field = net.editing;                 // "addr" | "code" | "port"
+    const cur = field === "addr" ? net.relayAddr
+              : field === "port" ? net.portText
+              : net.relayCode;
     if (e.key === "Enter") {
       net.editing = null;
       net.relayGo = field;                     // consumed by updateOnline
@@ -2489,14 +2502,22 @@ addEventListener("keydown", (e) => {
       net.editing = field === "addr" ? "code" : "addr";
     } else if (e.key === "Backspace") {
       const next = cur.slice(0, -1);
-      if (field === "addr") net.relayAddr = next; else net.relayCode = next;
+      if (field === "addr") net.relayAddr = next;
+      else if (field === "port") net.portText = next;
+      else net.relayCode = next;
     } else if (e.key.length === 1 && cur.length < 120) {
-      // A code is four letters; an address may contain URL punctuation.
-      const ok2 = field === "code" ? /^[A-Za-z0-9]$/.test(e.key)
-                                   : /^[\w.:/\-[\]@]$/.test(e.key);
+      /*
+        Each field accepts only what it can hold: a port is digits, a code is four
+        alphanumerics, and an address may contain the punctuation a URL needs —
+        including ? and & and % so a pasted link with a query survives editing.
+      */
+      const ok2 = field === "port" ? /^\d$/.test(e.key)
+                : field === "code" ? /^[A-Za-z0-9]$/.test(e.key)
+                : /^[\w.:/\-[\]@?&=%~+]$/.test(e.key);
       if (ok2) {
         const ch = field === "code" ? e.key.toUpperCase() : e.key;
         if (field === "addr") net.relayAddr += ch;
+        else if (field === "port") { if (net.portText.length < 5) net.portText += ch; }
         else if (net.relayCode.length < 4) net.relayCode += ch;
       }
     }
@@ -2551,7 +2572,35 @@ addEventListener("pointerdown", kickAudio);
 addEventListener("paste", (e) => {
   if (game.scene !== SCENE.ONLINE) return;
   const txt = (e.clipboardData && e.clipboardData.getData("text")) || "";
-  if (txt) { net.paste = txt.trim(); net.error = ""; }
+  if (!txt) { e.preventDefault(); return; }
+  /*
+    A paste while a relay field has the keyboard goes INTO THAT FIELD. Typing a
+    tunnel URL by hand is miserable and error-prone, and the whole point of the
+    address flow is that someone sends you the address — so it has to be pastable.
+
+    A pasted address may carry its own room code, either as a fragment or after a
+    slash (the host can share one string rather than two things to read out), so
+    that is split off here rather than making the player pick it apart.
+  */
+  if (net.editing) {
+    const clean = txt.trim();
+    if (net.editing === "code") {
+      net.relayCode = clean.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4);
+    } else {
+      const m = clean.match(/[#/]([A-Za-z0-9]{4})\s*$/);
+      if (m) {
+        net.relayAddr = clean.slice(0, m.index).replace(/[#/]+$/, "");
+        net.relayCode = m[1].toUpperCase();
+      } else {
+        net.relayAddr = clean;
+      }
+    }
+    net.error = "";
+    e.preventDefault();
+    return;
+  }
+  net.paste = txt.trim();
+  net.error = "";
   e.preventDefault();
 });
 
@@ -3924,6 +3973,11 @@ const game = {
     hints: true,        // on-screen control reminders during play
     music: true,        // background music
     gamepad: true,      // read connected controllers
+    /*
+      The port to assume for a relay address that does not name one. Numeric, not
+      a flag, so loadOpts has to accept more than booleans — see below.
+    */
+    relayPort: 8787,
   },
   particles: [],
   lastScorer: 0,
@@ -5019,33 +5073,67 @@ const RELAY_PORT_DEFAULT = 8787;
 const RELAY_TIMEOUT = 10;        // seconds to wait for a room before giving up
 
 /**
- * Turn whatever the player typed into a WebSocket URL.
+ * Turn whatever the player typed or pasted into a WebSocket URL.
  *
- * Accepts `1.2.3.4`, `1.2.3.4:9000`, `host:port`, or a full http(s)/ws(s) URL —
- * because people will paste all of those, and refusing four of the five would
- * read as the feature being broken.
+ * People paste whatever they were given, so this accepts all of it: a bare IP, a
+ * host:port, a full http(s) or ws(s) URL, a URL with a path or query, one wrapped
+ * in angle brackets by a chat client, or one with the scheme half-typed. Refusing
+ * any of those would read as the feature being broken rather than the input being
+ * unusual.
  */
 function relayUrl(input) {
   let s = String(input || "").trim();
   if (!s) return "";
-  // A full URL: swap the scheme for its WebSocket equivalent.
-  if (/^wss?:\/\//i.test(s)) return s;
-  if (/^https:\/\//i.test(s)) return s.replace(/^https:/i, "wss:");
-  if (/^http:\/\//i.test(s)) return s.replace(/^http:/i, "ws:");
-  // A bare host, with or without a port.
+
+  /*
+    Strip what a paste tends to bring with it: surrounding whitespace and quotes,
+    the angle brackets some chat clients add, a trailing full stop from prose, and
+    zero-width characters that survive a copy from a web page.
+  */
+  s = s.replace(/[​-‍﻿]/g, "");
+  s = s.replace(/^[<"'\s]+|[>"'\s]+$/g, "");
+  s = s.replace(/[.,;]+$/, "");
+  if (!s) return "";
+
+  // A full URL: swap the scheme for its WebSocket equivalent, keeping any path.
+  if (/^wss?:\/\//i.test(s)) return s.replace(/\/+$/, "");
+  if (/^https:\/\//i.test(s)) return s.replace(/^https:/i, "wss:").replace(/\/+$/, "");
+  if (/^http:\/\//i.test(s)) return s.replace(/^http:/i, "ws:").replace(/\/+$/, "");
+  // A half-typed scheme, which a paste often leaves behind.
+  if (/^\/\//.test(s)) return relayUrl("https:" + s);
+
+  // A bare host, with or without a port and path.
   s = s.replace(/^\/+/, "").replace(/\/+$/, "");
   /*
-    A hostname with no port gets the default. An address WITH a port keeps it.
-    Checked by counting colons so an IPv6 literal is not mangled — it is passed
-    through untouched and the player can bracket it themselves.
+    An IPv6 literal is passed through untouched — it is full of colons, so the
+    port sniffing below cannot apply to it.
   */
-  if (s.includes("[") || (s.match(/:/g) || []).length > 1) return `ws://${s}`;
-  if (/:\d+$/.test(s)) return `ws://${s}`;
-  // A tunnel hostname is almost certainly https, and plain ws to it would fail.
-  if (/\.(com|net|org|io|dev|app|sh|xyz|me|link|live|cloud|trycloudflare\.com)$/i.test(s)) {
-    return `wss://${s}`;
-  }
-  return `ws://${s}:${RELAY_PORT_DEFAULT}`;
+  if (s.includes("[")) return `ws://${s}`;
+
+  const hostPart = s.split(/[/?#]/)[0];
+  const hasPort = /:\d+$/.test(hostPart);
+  /*
+    A DOTTED PUBLIC HOSTNAME with no port is almost certainly a tunnel, which
+    means https — plain ws:// to it is refused by the browser and looks like the
+    game failing. An IP address, or anything with a port, is treated as a direct
+    connection on the local network.
+  */
+  const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(hostPart);
+  const isLocal = /^(localhost|[\w-]+\.local)$/i.test(hostPart);
+  if (hasPort) return `ws://${s}`;
+  if (!isIp && !isLocal && hostPart.includes(".")) return `wss://${s}`;
+  return `ws://${s}:${relayPort()}`;
+}
+
+/**
+ * The port to assume when an address does not name one.
+ *
+ * Remembered in localStorage, so someone running the relay on a different port
+ * sets it once rather than typing it into every address.
+ */
+function relayPort() {
+  const v = parseInt(game.opt.relayPort, 10);
+  return v >= 1 && v <= 65535 ? v : RELAY_PORT_DEFAULT;
 }
 
 /**
@@ -5084,6 +5172,17 @@ function relayChannelShim(ws) {
   ws.onclose = () => { if (shim.onclose) shim.onclose(); };
   ws.onerror = () => { if (shim.onerror) shim.onerror(); };
   return shim;
+}
+
+/*
+  A relay socket that dies BEFORE the room is established is a connection failure,
+  not a peer leaving — the two need different messages, since one is "check your
+  address" and the other is "they went away".
+*/
+function relayFail(url) {
+  net.error = relayFailureHint(url);
+  net.state = "failed";
+  net.active = false;
 }
 
 /** Message names the relay itself uses. Everything else is game traffic. */
@@ -5158,6 +5257,16 @@ function relayConnect(address, onOpen) {
   net.ws = ws;
   net.transport = "relay";
   const shim = relayChannelShim(ws);
+  /*
+    An error or a close before the room exists means the connection never worked.
+    Installed here rather than relying on the shim's handlers, which report a lost
+    peer — a different situation with a different remedy.
+  */
+  ws.onerror = () => { if (!net.relayCode) relayFail(url); };
+  ws.onclose = () => {
+    if (!net.relayCode) { relayFail(url); return; }
+    if (net.state === "live") { net.state = "closed"; net.active = false; }
+  };
   ws.onopen = () => {
     /*
       The socket is up, but the GAME is not connected until a peer joins the room.
@@ -5237,6 +5346,7 @@ const net = {
   editing: null,         // "addr" | "code" while a relay field has the keyboard
   relayGo: null,         // set by ENTER in a field, consumed by updateOnline
   relayIntent: null,     // "host" | "join" — what the typed address is for
+  portText: "",          // the port field while it is being edited
 
   /*
     THE HUB. A tournament can seat up to TOURN_MAX humans, each on their own
@@ -6837,6 +6947,29 @@ function updateOnline(dt) {
       relayJoin(net.relayAddr, net.relayCode);
       return;
     }
+  }
+  /*
+    P changes the default port, for anyone not running the relay on 8787. Handled
+    before the field check below returns, but only when no field is active — while
+    typing an address, "p" is just a letter.
+  */
+  if (net.relayIntent && !net.editing && hit("KeyP")) {
+    net.editing = "port";
+    net.portText = String(relayPort());
+    return;
+  }
+  if (net.relayGo === "port") {
+    net.relayGo = null;
+    const v = parseInt(net.portText, 10);
+    if (v >= 1 && v <= 65535) {
+      game.opt.relayPort = v;
+      saveOpts(game.opt);
+      net.error = "";
+    } else {
+      net.error = "a port must be between 1 and 65535";
+    }
+    net.editing = "addr";
+    return;
   }
   if (net.editing) return;               // the keyboard belongs to the field
 
@@ -9638,6 +9771,43 @@ document.addEventListener("pointerlockchange", () => {
   }
 });
 
+/**
+ * Explain a failed relay connection in terms the player can act on.
+ *
+ * A browser deliberately tells a page almost nothing about why a WebSocket
+ * failed, so this reasons from the URL instead. Getting "connection failed" with
+ * no idea whether the relay is down, the address is wrong, or the tunnel is
+ * incompatible is the difference between a fixable problem and giving up.
+ */
+function relayFailureHint(url) {
+  const u = String(url || "");
+  if (/trycloudflare\.com/i.test(u)) {
+    /*
+      MEASURED, not guessed: a quick tunnel rewrites Sec-WebSocket-Key on the way
+      to the origin but validates the origin's Sec-WebSocket-Accept against the
+      ORIGINAL key, so the handshake can never match and every WebSocket through
+      it fails with a 500. It is a limitation of the free quick tunnel, not of the
+      relay — a named tunnel, or any other tunnel, works.
+    */
+    return "Cloudflare quick tunnels (trycloudflare.com) break WebSockets — " +
+           "they rewrite the handshake key. Use a named Cloudflare tunnel, or " +
+           "another tunnel, or play on the same network.";
+  }
+  if (/^ws:\/\//i.test(u) && typeof location !== "undefined" &&
+      location.protocol === "https:") {
+    // A page served over https cannot open an insecure socket; the browser blocks
+    // it before it reaches the network, which looks identical to a refusal.
+    return "This page is on https, so it cannot open an insecure ws:// " +
+           "connection. Use a wss:// address, or open this file over http.";
+  }
+  if (/^wss:\/\//i.test(u) && /^\d{1,3}(\.\d{1,3}){3}/.test(u.replace(/^wss:\/\//i, ""))) {
+    return "wss:// to a bare IP needs a certificate for that IP. " +
+           "Try the address without https, or use a hostname.";
+  }
+  return "could not reach the relay — check the address, and that " +
+         "'node tools/relay.js' is running on that machine";
+}
+
 document.addEventListener("pointerlockerror", () => {
   // Refused. The mode stays playable on the aim keys, so this is not fatal.
   mouse.locked = false;
@@ -12032,20 +12202,31 @@ function drawOnline() {
         text(shown + (on ? "▌" : ""), bx + 44, y + 28, 13,
              value ? "#ffffff" : "#5f7391", "left", 700);
       };
-      field(152, "HOST ADDRESS", net.relayAddr, "addr", `localhost:${RELAY_PORT_DEFAULT}`);
+      field(152, "HOST ADDRESS", net.relayAddr, "addr", `localhost:${relayPort()}`);
       if (joining) field(202, "GAME CODE", net.relayCode, "code", "ABCD");
+      if (net.editing === "port") {
+        field(joining ? 252 : 202, "DEFAULT PORT", net.portText, "port",
+              String(RELAY_PORT_DEFAULT));
+      }
+      // Paste is the expected way to fill this in, so say so.
+      text("⌘V / Ctrl-V pastes  ·  a pasted link may carry the code too",
+           W / 2, joining ? 246 : 198, 9, "#6b819e", "center", 600);
 
-      const iy = joining ? 254 : 210;
+      const iy = joining ? 266 : 222;
       if (!joining) {
         text("start the relay first:", W / 2, iy, 11, "#cddcf2", "center", 700);
-        text("node tools/relay.js", W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
+        text(`node tools/relay.js --port ${relayPort()}`,
+             W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
         text("it prints the address to share", W / 2, iy + 36, 10, "#6b819e", "center", 600);
       } else {
         text("ask the host for their address and 4-letter code",
              W / 2, iy, 11, "#cddcf2", "center", 700);
       }
+      // The default port, changeable here, for anyone not running 8787.
+      text(`default port ${relayPort()} — P to change`,
+           W / 2, 322, 9, "#7dd3fc", "center", 700);
       text("TAB switches field  ·  ENTER confirms  ·  ESC cancels",
-           W / 2, 336, 10, "#6b819e", "center", 600);
+           W / 2, 338, 10, "#6b819e", "center", 600);
     } else {
       card(104, 292, "#7dd3fc");
       text("How do you want to connect?", W / 2, 126, 16, "#e8f1ff", "center", 800);
@@ -12081,6 +12262,32 @@ function drawOnline() {
       text(net.relayUrl || net.relayAddr, W / 2, 256, 11, "#6b819e", "center", 600);
     }
   }
+  /*
+    A FAILED relay attempt explains itself. A browser tells a page nothing about
+    why a WebSocket failed, so relayFailureHint reasons from the URL — without it
+    the player sees "connection failed" and has no idea which of half a dozen
+    things to try.
+  */
+  if (net.transport === "relay" && net.state === "failed" && net.error) {
+    card(150, 190, "#ef4444");
+    text("COULD NOT CONNECT", W / 2, 178, 16, "#ef4444", "center", 900);
+    // Wrapped by hand: the hints are a sentence or two, not a label.
+    const words = String(net.error).split(" ");
+    const lines = [];
+    let line = "";
+    for (const w of words) {
+      if ((line + " " + w).trim().length > 58) { lines.push(line.trim()); line = w; }
+      else line += " " + w;
+    }
+    if (line.trim()) lines.push(line.trim());
+    lines.slice(0, 5).forEach((ln, i) => {
+      text(ln, W / 2, 206 + i * 17, 11, "#fca5a5", "center", 600);
+    });
+    text(net.relayUrl, W / 2, 300, 9, "#6b819e", "center", 600);
+    text("press A or S to try again  ·  ESC for the menu",
+         W / 2, 322, 10, "#8fa3c0", "center", 700);
+  }
+
   if (net.transport === "relay" && net.role === "guest" &&
       (net.state === "creating" || net.state === "connecting")) {
     card(170, 130, "#7dd3fc");
@@ -14130,6 +14337,7 @@ const PHYS = {
   netApplySnapshot, netHandle, encodeSignal, decodeSignal, netIsHost, netIsGuest,
   // Relay transport: connect by address instead of pasting codes.
   relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
+  relayFailureHint, relayPort, relayFail,
   RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
   basketScored, ballVsHoops, hoopPos, updateCPU, releaseCPUKeys, CPU_LEVELS,
   cpuCfg, menuRows, makeBall, HOOP_R, HOOP_Y, HOOP_X,
@@ -24287,6 +24495,70 @@ function runTests() {
       ok("an empty address yields nothing to connect to", relayUrl("  ") === "");
       ok("and whitespace around a real address is trimmed",
          relayUrl("  1.2.3.4:99  ") === "ws://1.2.3.4:99");
+
+      /*
+        PASTED input, which is how anyone will actually enter an address. Each of
+        these is something a real paste produces, and refusing any of them would
+        read as the feature being broken rather than the input being unusual.
+      */
+      ok("a pasted URL in angle brackets works",
+         relayUrl("<https://a.example>") === "wss://a.example",
+         relayUrl("<https://a.example>"));
+      ok("a pasted URL in quotes works",
+         relayUrl('"https://a.example"') === "wss://a.example");
+      ok("a trailing full stop from prose is dropped",
+         relayUrl("https://a.example.") === "wss://a.example");
+      ok("a zero-width character from a web page copy is stripped",
+         relayUrl("https://a.example\u200B") === "wss://a.example");
+      ok("a half-typed scheme is completed",
+         relayUrl("//a.example") === "wss://a.example", relayUrl("//a.example"));
+      ok("a path is preserved",
+         relayUrl("https://a.example/room") === "wss://a.example/room");
+      ok("a bare public hostname is assumed to be wss",
+         relayUrl("my-tunnel.example.org") === "wss://my-tunnel.example.org");
+      ok("but a bare IP is not, since it will have no certificate",
+         relayUrl("192.168.0.9").startsWith("ws://"));
+      ok("and neither is localhost", relayUrl("localhost").startsWith("ws://"));
+      ok("nor a .local name", relayUrl("box.local").startsWith("ws://"));
+
+      /*
+        THE PORT. Someone running the relay on a different port sets it once
+        rather than typing it into every address.
+      */
+      {
+        const savedPort = game.opt.relayPort;
+        game.opt.relayPort = 9123;
+        ok("a bare IP uses the configured default port",
+           relayUrl("10.0.0.4") === "ws://10.0.0.4:9123", relayUrl("10.0.0.4"));
+        ok("but an explicit port still wins",
+           relayUrl("10.0.0.4:7000") === "ws://10.0.0.4:7000");
+        game.opt.relayPort = 0;
+        ok("an invalid configured port falls back to the default",
+           relayPort() === RELAY_PORT_DEFAULT, `${relayPort()}`);
+        game.opt.relayPort = 999999;
+        ok("and so does an out-of-range one", relayPort() === RELAY_PORT_DEFAULT);
+        game.opt.relayPort = savedPort;
+      }
+
+      /*
+        FAILURE HINTS. A browser tells a page nothing about why a socket failed, so
+        these reason from the URL. The Cloudflare one is measured, not guessed: a
+        quick tunnel rewrites Sec-WebSocket-Key toward the origin and then checks
+        the reply against the original key, so no reply can ever match.
+      */
+      ok("a cloudflare quick tunnel failure explains itself",
+         /quick tunnel/i.test(relayFailureHint("wss://x.trycloudflare.com")),
+         relayFailureHint("wss://x.trycloudflare.com"));
+      ok("and names an alternative that works",
+         /named|another tunnel/i.test(relayFailureHint("wss://x.trycloudflare.com")));
+      ok("a wss-to-bare-IP failure mentions the certificate",
+         /certificate/i.test(relayFailureHint("wss://10.0.0.5")),
+         relayFailureHint("wss://10.0.0.5"));
+      ok("any other failure suggests checking the relay is running",
+         /relay\.js|relay/i.test(relayFailureHint("ws://10.0.0.5:8787")));
+      ok("every hint is a usable sentence, not a code",
+         ["wss://x.trycloudflare.com", "wss://10.0.0.5", "ws://a:1"]
+           .every((u) => relayFailureHint(u).length > 30));
     }
 
     // 25b. Hosting: open a room, publish the code, go live when a peer joins.
