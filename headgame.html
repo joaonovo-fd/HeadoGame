@@ -1544,6 +1544,20 @@ function cleanSponsor(raw) {
 /** Load the manifest and kick off the image loads. Never throws. */
 function loadSponsors() {
   if (typeof fetch !== "function") { sponsors.loaded = true; return; }
+  /*
+    A file:// page cannot fetch a sibling file — every such origin is unique — so
+    the request is refused and the browser logs "Unsafe attempt to load URL …" in
+    the console. The failure was always handled, but the warning looks like a
+    fault in the game, so the attempt is skipped entirely when the page was opened
+    from disk. Sponsor boards fall back to placeholders, which is what happened
+    anyway.
+  */
+  try {
+    if (typeof location !== "undefined" && location.protocol === "file:") {
+      sponsors.loaded = true;
+      return;
+    }
+  } catch (e) { /* no location: carry on and let the fetch decide */ }
   fetch(SPONSOR_DIR + "sponsors.json")
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("no manifest"))))
     .then((data) => {
@@ -2434,7 +2448,7 @@ function rebuildWatched() {
 // Called at boot, once SCHEME and ACTIONS exist — not here, where they are
 // still in their temporal dead zone.
 
-addEventListener("keydown", (e) => {
+function onKeyDown(e) {
   /*
     Name entry swallows the keyboard: while a field is active, letters type into
     it rather than steering the menu. Without this, typing "SAM" would be read
@@ -2488,6 +2502,15 @@ addEventListener("keydown", (e) => {
     is not also read as menu navigation.
   */
   if (net.editing) {
+    /*
+      A PASTE MUST BE LET THROUGH. This handler used to preventDefault on every
+      key while a field was active, which swallowed Cmd/Ctrl-V before the browser
+      could raise its `paste` event — so the one input people actually need for a
+      tunnel URL silently did nothing. Any modified key is now left alone: the
+      clipboard shortcuts, and browser shortcuts generally, are not ours to eat.
+    */
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+
     const field = net.editing;                 // "addr" | "code" | "port"
     const cur = field === "addr" ? net.relayAddr
               : field === "port" ? net.portText
@@ -2496,7 +2519,17 @@ addEventListener("keydown", (e) => {
       net.editing = null;
       net.relayGo = field;                     // consumed by updateOnline
     } else if (e.key === "Escape") {
-      net.editing = null;
+      /*
+        Handed to updateOnline rather than dealt with here, so ESC unwinds the
+        screen by one step through the single code path that knows how — this
+        handler used to just clear `editing`, stranding the player on a form with
+        no options visible and no way back.
+      */
+      pressed.Escape = true;
+      keys.Escape = true;
+      tapKeys.push("Escape");
+      e.preventDefault();
+      return;
     } else if (e.key === "Tab") {
       // Tab moves between the two fields, as it would in any form.
       net.editing = field === "addr" ? "code" : "addr";
@@ -2545,7 +2578,14 @@ addEventListener("keydown", (e) => {
   if (WATCHED.has(e.code)) e.preventDefault();
   if (!keys[e.code]) pressed[e.code] = true;
   keys[e.code] = true;
-}, { passive: false });
+}
+
+/*
+  Registered here rather than inline, so the suite can drive the SAME handler the
+  browser calls. The paste bug lived inside a listener; a test that could not
+  reach the listener could never have caught it.
+*/
+addEventListener("keydown", onKeyDown, { passive: false });
 
 addEventListener("keyup", (e) => {
   if (WATCHED.has(e.code)) e.preventDefault();
@@ -2569,7 +2609,7 @@ addEventListener("pointerdown", kickAudio);
   the real clipboard: Cmd/Ctrl-V pastes the peer's code, Cmd/Ctrl-C copies your
   own. Both are ignored outside that screen.
 */
-addEventListener("paste", (e) => {
+function onPaste(e) {
   if (game.scene !== SCENE.ONLINE) return;
   const txt = (e.clipboardData && e.clipboardData.getData("text")) || "";
   if (!txt) { e.preventDefault(); return; }
@@ -2602,7 +2642,29 @@ addEventListener("paste", (e) => {
   net.paste = txt.trim();
   net.error = "";
   e.preventDefault();
-});
+}
+addEventListener("paste", onPaste);
+
+/*
+  Test hooks: drive the REAL handlers with a synthetic event. Exported so the
+  suite exercises the same code path the browser does, rather than a copy of its
+  logic that could drift from it.
+*/
+function keydownForTest(init) {
+  let prevented = false;
+  const ev = Object.assign({ key: "", code: "", preventDefault() { prevented = true; } },
+                           init);
+  onKeyDown(ev);
+  return prevented;
+}
+function pasteForTest(text) {
+  let prevented = false;
+  onPaste({
+    clipboardData: { getData: () => text },
+    preventDefault() { prevented = true; },
+  });
+  return prevented;
+}
 
 addEventListener("copy", (e) => {
   if (game.scene !== SCENE.ONLINE) return;
@@ -5245,6 +5307,45 @@ function relayPeer(seat) {
   };
 }
 
+/**
+ * Step back one level on the ONLINE screen. Returns true if it went anywhere.
+ *
+ * The screen is a shallow stack — options, then a form or a live attempt — and
+ * this unwinds one level. Returning false means we are already at the options, so
+ * the caller leaves for the main menu.
+ */
+function onlineBack() {
+  // A field being edited: close the field, keep the form.
+  if (net.editing) {
+    // The port field belongs to a form, so closing it returns to the address.
+    net.editing = net.editing === "port" ? "addr" : null;
+    if (net.editing === null) return onlineToOptions();
+    return true;
+  }
+  // A form, a failure, a connection attempt, or a room we have not started:
+  // all of these step back to the list of options.
+  if (net.relayIntent || net.state !== "idle") return onlineToOptions();
+  return false;
+}
+
+/**
+ * Return to the list of options, dropping any connection in progress.
+ *
+ * Always returns true, so `onlineBack` can tail-call it. The socket has to go:
+ * leaving a half-open relay connection behind would keep a room advertised that
+ * nobody is in.
+ */
+function onlineToOptions() {
+  const keepAddr = net.relayAddr;         // typing it again is needless friction
+  netReset();
+  net.relayAddr = keepAddr;
+  net.relayIntent = null;
+  net.editing = null;
+  net.state = "idle";
+  net.error = "";
+  return true;
+}
+
 /** Handle one relay control message. */
 function relayControl(msg) {
   switch (msg.t) {
@@ -7134,7 +7235,21 @@ function updateMenu(dt) {
  * ENTER accepts a pasted code, ESC backs out.
  */
 function updateOnline(dt) {
-  if (hit("Escape")) { escUsed = true; netReset(); game.scene = SCENE.MENU; return; }
+  /*
+    ESC GOES BACK ONE STEP, not straight out.
+
+    It used to leave for the main menu from anywhere on this screen, so once you
+    picked an option there was no way back to the other options — you had to exit
+    online play entirely and come in again. Now it unwinds: a form or a failure
+    returns to the option list, and only the option list itself leaves.
+  */
+  if (hit("Escape")) {
+    escUsed = true;
+    if (onlineBack()) return;
+    netReset();
+    game.scene = SCENE.MENU;
+    return;
+  }
 
   /*
     RELAY entry. A field having the keyboard means ENTER submits it, so the two
@@ -12875,7 +12990,34 @@ function drawOnline() {
   if (net.error && !relayFailed) {
     text(net.error, W / 2, H - 62, 12, "#f87171", "center", 700);
   }
-  text("ESC — back to setup", W / 2, H - 28, 11, "#6b819e", "center", 600);
+  /*
+    A REAL BACK BUTTON. ESC alone was neither discoverable nor available on a
+    phone, so once an option was chosen there was no visible way back to the
+    others. It steps back one level, exactly as ESC does, and says which level
+    that is so the destination is not a surprise.
+  */
+  {
+    const deep = !!net.editing || !!net.relayIntent || net.state !== "idle";
+    const label = deep ? "◄  BACK" : "◄  BACK TO SETUP";
+    const bw2 = deep ? 130 : 180, bh2 = 30;
+    const bx2 = W / 2 - bw2 / 2, by2 = H - 44;
+    clickable(bx2, by2, bw2, bh2, () => {
+      pressed.Escape = true;
+      keys.Escape = true;
+      tapKeys.push("Escape");
+    });
+    const hot = pointer.inside && pointer.x >= bx2 && pointer.x <= bx2 + bw2 &&
+                pointer.y >= by2 && pointer.y <= by2 + bh2;
+    ctx.fillStyle = hot ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.06)";
+    roundRect(bx2, by2, bw2, bh2, 8);
+    ctx.fill();
+    ctx.strokeStyle = hot ? "#7dd3fc" : "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    text(label, W / 2, by2 + bh2 / 2, 11, hot ? "#ffffff" : "#9fb4d0", "center", 800);
+    text(deep ? "ESC — back to the options" : "ESC — back to setup",
+         W / 2, H - 8, 9, "#5f7391", "center", 600);
+  }
 }
 
 /** A text field with a blinking caret while it is being edited. */
@@ -14746,6 +14888,7 @@ const PHYS = {
   drawMenu, drawMenuBackdrop, drawLogo, stepMenuFx, menuFx, layoutProbe, MENU_GROUP,
   // Pointer and touch input.
   clickable, commitRegions, regionAt, pointerActivate, toLogical, pointer,
+  keys, pressed, onKeyDown, onPaste, keydownForTest, pasteForTest,
   touchPoints, touchIntent, touchControlLayout, touchControlsWanted,
   drawTouchControls, isTouchDevice, drawFinish, tapKeys,
   getClickRegions: () => clickRegions,
@@ -14775,12 +14918,14 @@ const PHYS = {
   drawBoard, updateBoard, LB_MAX, LB_ROWS_VISIBLE,
   drawSettings, PAUSE_ITEMS, SETTINGS_ITEMS, PAUSABLE, loadOpts, saveOpts,
   netSendHello, netSendBracket, tieIsOnline, applyTieControl, updateRoster,
+  updateOnline,
   drawRoster, drawOnline, nameField,
   netApplySnapshot, netHandle, encodeSignal, decodeSignal, netIsHost, netIsGuest,
   // Relay transport: connect by address instead of pasting codes.
   relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
   relayFailureHint, relayPort, relayFail, relayPeer,
   relayBrowse, relayQuick, relayRefresh, relayJoinCode, relayMarkStarted,
+  onlineBack, onlineToOptions,
   RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
   basketScored, ballVsHoops, hoopPos, updateCPU, releaseCPUKeys, CPU_LEVELS,
   cpuCfg, menuRows, makeBall, HOOP_R, HOOP_Y, HOOP_X,
@@ -25464,6 +25609,188 @@ function runTests() {
          !stacked, stacked || "");
       ok("and nothing on that screen lands off the canvas",
          !offscreen, offscreen || "");
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
+    }
+
+    /*
+      25d5. GETTING BACK. Once an option was chosen there was no way back to the
+      other options: ESC left online play entirely, and while a field had the
+      keyboard it did not even do that — the handler cleared `editing` and left the
+      player on a form with nothing on screen and nowhere to go.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      const esc = () => {
+        pressed.Escape = true;
+        edgeFrame = true;
+        updateOnline(0);
+        delete pressed.Escape;
+        escUsed = false;
+      };
+      /** Where the online screen currently is, as a coarse label. */
+      const at = () => game.scene !== SCENE.ONLINE ? "gone"
+                     : net.editing ? "field"
+                     : net.relayIntent ? "form"
+                     : net.state !== "idle" ? "busy"
+                     : "options";
+
+      // From a form field: back to the options, then out.
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.relayIntent = "host";
+      net.editing = "addr";
+      net.relayAddr = "1.2.3.4:8787";
+      esc();
+      ok("ESC on a form returns to the options", at() === "options", at());
+      ok("and remembers the address that was typed",
+         net.relayAddr === "1.2.3.4:8787", net.relayAddr);
+      esc();
+      ok("and ESC from the options leaves online play", game.scene === SCENE.MENU,
+         game.scene);
+
+      // The port field belongs to a form, so it steps back to the address first.
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.relayIntent = "host";
+      net.editing = "port";
+      net.portText = "9000";
+      esc();
+      ok("ESC on the port field returns to the address field",
+         net.editing === "addr", `${net.editing}`);
+
+      /*
+        A FAILED attempt — the state in the reported screenshot — must lead back to
+        the options, since trying a different option is the obvious next move.
+      */
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.transport = "relay";
+      net.state = "failed";
+      net.relayIntent = "host";
+      net.relayAddr = "x.lhr.life";
+      net.error = "could not reach the relay.";
+      esc();
+      ok("ESC after a failed connection returns to the options",
+         at() === "options", at());
+      ok("and clears the error with it", !net.error, net.error);
+
+      // The lobby browser and an open room, likewise.
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.transport = "relay";
+      net.state = "browsing";
+      net.lobbies = [];
+      esc();
+      ok("ESC in the lobby browser returns to the options", at() === "options", at());
+
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.transport = "relay";
+      net.state = "offer";
+      net.role = "host";
+      net.relayCode = "WXYZ";
+      esc();
+      ok("ESC while hosting returns to the options", at() === "options", at());
+      ok("and drops the room, so nothing stays advertised",
+         net.relayCode === "" && net.ws === null);
+
+      /*
+        A VISIBLE BACK BUTTON, because ESC is neither discoverable nor available on
+        a phone. It must be present at every depth and step back one level.
+      */
+      game.scene = SCENE.ONLINE;
+      netReset();
+      net.transport = "relay";
+      net.state = "failed";
+      net.relayIntent = "host";
+      net.relayAddr = "x.lhr.life";
+      net.error = "nope";
+      draw();
+      const back = clickRegions.find((r) => Math.abs(r.y - (H - 44)) < 2);
+      ok("the online screen has a BACK button", !!back);
+      pointerActivate(W / 2, H - 30);
+      edgeFrame = true;
+      updateOnline(0);
+      ok("and tapping it returns to the options", at() === "options", at());
+      for (const k in pressed) delete pressed[k];
+      for (const k of tapKeys) keys[k] = false;
+      tapKeys.length = 0;
+      escUsed = false;
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
+    }
+
+    /*
+      25d6. PASTING. The address field is the one input that genuinely needs a
+      paste — nobody wants to type a tunnel URL by hand — and it did not work: the
+      keydown handler called preventDefault on EVERY key while a field was active,
+      swallowing Cmd/Ctrl-V before the browser could raise its paste event.
+
+      Driven through the listeners the game actually registered, because a stub
+      that discards listeners could never have caught a bug that lived in one.
+    */
+    if (typeof pasteForTest === "function") {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      game.scene = SCENE.ONLINE;
+
+      // A modified key must be left for the browser.
+      netReset();
+      net.relayIntent = "host";
+      net.editing = "addr";
+      ok("a paste shortcut is not swallowed by the text field",
+         keydownForTest({ key: "v", code: "KeyV", metaKey: true }) === false);
+      ok("nor the windows one",
+         keydownForTest({ key: "v", code: "KeyV", ctrlKey: true }) === false);
+      // But an ordinary key still types.
+      net.relayAddr = "";
+      keydownForTest({ key: "a", code: "KeyA" });
+      ok("while an ordinary key still types into the field",
+         net.relayAddr === "a", net.relayAddr);
+
+      // Pasting an address.
+      netReset();
+      net.relayIntent = "host";
+      net.editing = "addr";
+      net.relayAddr = "";
+      pasteForTest("https://abc123.lhr.life");
+      ok("a pasted address lands in the field",
+         net.relayAddr === "https://abc123.lhr.life", net.relayAddr);
+      ok("and resolves to a secure socket",
+         relayUrl(net.relayAddr) === "wss://abc123.lhr.life");
+
+      // A link carrying a room code fills both fields, so one string is enough.
+      netReset();
+      net.relayIntent = "join";
+      net.editing = "addr";
+      net.relayAddr = "";
+      net.relayCode = "";
+      pasteForTest("https://abc123.lhr.life/WXYZ");
+      ok("a pasted link carrying a code splits into both fields",
+         net.relayAddr === "https://abc123.lhr.life" && net.relayCode === "WXYZ",
+         `${net.relayAddr} + ${net.relayCode}`);
+
+      // Pasting into the code field takes only the code characters.
+      netReset();
+      net.relayIntent = "join";
+      net.editing = "code";
+      net.relayCode = "";
+      pasteForTest("  abcd  ");
+      ok("a pasted code is trimmed and upper-cased", net.relayCode === "ABCD",
+         net.relayCode);
+      netReset();
+      net.editing = "code";
+      net.relayCode = "";
+      pasteForTest("code: WX-YZ!");
+      ok("and stripped of anything that is not a code character",
+         net.relayCode.length === 4 && /^[A-Z0-9]{4}$/.test(net.relayCode),
+         net.relayCode);
 
       netReset();
       Object.assign(net, savedNet);

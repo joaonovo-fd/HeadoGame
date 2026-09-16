@@ -26,12 +26,22 @@ const ctxStub = new Proxy({}, {
 
 const store = new Map();
 const WebSocketSpy = { made: [], throwOnConstruct: false };
+const listeners = Object.create(null);
 const sandbox = {
   console,
   performance: { now: () => Date.now() },
   requestAnimationFrame: () => 0,
-  addEventListener: () => {},
-  removeEventListener: () => {},
+  /*
+    Listeners are RECORDED, not discarded, so a test can fire a real paste or
+    keydown at the handler the game actually registered. The paste bug lived in a
+    listener, so a stub that threw them away could never have caught it.
+  */
+  addEventListener: (type, fn) => {
+    (listeners[type] = listeners[type] || []).push(fn);
+  },
+  removeEventListener: (type, fn) => {
+    if (listeners[type]) listeners[type] = listeners[type].filter((f) => f !== fn);
+  },
   innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1,
   location: { search: process.env.HG_NO_TEST ? "" : "?test=1" },
   localStorage: {
@@ -108,4 +118,4 @@ try {
 }
 
 // Exported so a probe script can reuse these stubs instead of duplicating them.
-module.exports = { sandbox, PHYS: sandbox.PHYS, WebSocketSpy };
+module.exports = { sandbox, PHYS: sandbox.PHYS, WebSocketSpy, listeners };
