@@ -106,12 +106,52 @@ async function run() {
   await new Promise((r) => setTimeout(r, 120));
   results.push(["a wrong code is refused", strayGot.some((m) => m.t === "no-room")]);
 
-  // A third player in a full room is refused, not silently ignored.
+  /*
+    A THIRD player is now WELCOME: a tournament seats up to 16, so a room holds
+    the host plus 15. Each guest is given a seat number, which is how the host
+    tells fifteen players apart.
+  */
   let thirdGot = [];
   const third = await client("third", (t) => thirdGot.push(JSON.parse(t)));
   third.send({ t: "join", code });
-  await new Promise((r) => setTimeout(r, 120));
-  results.push(["a third player is refused", thirdGot.some((m) => m.t === "room-full")]);
+  await new Promise((r) => setTimeout(r, 150));
+  const joined3 = thirdGot.find((m) => m.t === "joined");
+  results.push(["a third player can join, for a tournament", !!joined3]);
+  results.push(["and is given a distinct seat", joined3 && joined3.seat === 2,
+                joined3 ? String(joined3.seat) : "no seat"]);
+
+  // Messages carry `from`, so the host can attribute what it receives.
+  hostGot.length = 0;
+  third.send({ t: "i", b: 7 });
+  await new Promise((r) => setTimeout(r, 150));
+  const stamped = hostGot.find((m) => m.t === "i");
+  results.push(["a forwarded message names its sender",
+                !!stamped && stamped.from === 2,
+                stamped ? "from " + stamped.from : "nothing arrived"]);
+
+  // A directed message reaches only its addressee.
+  guestGot.length = 0;
+  thirdGot.length = 0;
+  host.send({ t: "me", e: 9, to: 2 });
+  await new Promise((r) => setTimeout(r, 150));
+  results.push(["a directed message reaches its target",
+                thirdGot.some((m) => m.t === "me" && m.e === 9)]);
+  results.push(["and nobody else", !guestGot.some((m) => m.t === "me")]);
+
+  // A room does fill up eventually, and says so.
+  {
+    const extras = [];
+    for (let i = 0; i < 13; i++) extras.push(await client("x" + i, () => {}));
+    for (const c of extras) c.send({ t: "join", code });
+    await new Promise((r) => setTimeout(r, 400));
+    let fullGot = [];
+    const overflow = await client("overflow", (t) => fullGot.push(JSON.parse(t)));
+    overflow.send({ t: "join", code });
+    await new Promise((r) => setTimeout(r, 200));
+    results.push(["a full room refuses the 17th player",
+                  fullGot.some((m) => m.t === "room-full"),
+                  JSON.stringify(fullGot.slice(0, 2))]);
+  }
 
   // A disconnect notifies the other side.
   guest.sock.destroy();

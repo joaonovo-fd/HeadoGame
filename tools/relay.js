@@ -2,10 +2,11 @@
 /*
   HEAD GAME — relay server.
 
-  A tiny WebSocket relay so two players can connect by ADDRESS rather than by
-  copy-pasting WebRTC offer codes at each other. One player runs this, both
-  browsers connect to it, and it forwards messages between the two members of a
-  room. That is all it does: it never inspects or stores game traffic.
+  A tiny WebSocket relay so players can connect by ADDRESS rather than by
+  copy-pasting WebRTC offer codes at each other. One player runs this, every
+  browser connects to it, and it forwards messages between the members of a room —
+  two for a 1v1, up to sixteen for a tournament. That is all it does: it reads
+  only the routing fields and never inspects or stores game traffic.
 
   WHY A SERVER AT ALL: a browser page cannot accept an incoming connection, so
   "just give me your address" is impossible between two pages on its own. One
@@ -20,17 +21,24 @@
     node tools/relay.js --port 9000
     node tools/relay.js --host 127.0.0.1
 
-  Then in the game: ONLINE -> HOST BY ADDRESS. It shows the address to share.
-  The other player picks JOIN BY ADDRESS and types it in.
+  Then in the game: ONLINE -> A to host a match, T to host a tournament. Either
+  shows an address and a 4-letter code to share; everyone else picks S (JOIN by
+  address) and enters them.
 
   OVER THE INTERNET: the address only reaches players on your own network. For
   anyone else, put a tunnel in front of it — for example:
 
-    cloudflared tunnel --url http://localhost:8787
     ssh -R 80:localhost:8787 serveo.net
+    ngrok http 8787
 
-  and share the https URL the tunnel prints. The game accepts a full URL as the
-  address, and upgrades https:// to wss:// automatically.
+  and share the URL the tunnel prints. The game accepts a full URL as the address
+  and upgrades https:// to wss:// automatically.
+
+  NOT cloudflared's free QUICK tunnel (trycloudflare.com). Measured, not guessed:
+  it generates its own Sec-WebSocket-Key toward the origin and then validates the
+  origin's Sec-WebSocket-Accept against the CLIENT's key, so the two can never
+  agree and every upgrade fails with a 500 no matter what this server replies. A
+  NAMED cloudflare tunnel is fine.
 */
 
 "use strict";
@@ -50,11 +58,17 @@ const HOST = argOf("--host", "0.0.0.0");
 const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F";
 
 /*
-  Rooms, keyed by a short code. Each holds at most two sockets: the first to
-  arrive is the host, the second is the guest. A third is refused rather than
-  silently ignored, so a mistyped code fails loudly instead of looking connected.
+  Rooms, keyed by a short code. The FIRST socket to arrive is the host; the rest
+  are guests. A tournament seats up to 16 players, so a room holds the host plus
+  15 — beyond that a join is refused rather than silently ignored, so a mistyped
+  code or a full lobby fails loudly instead of looking connected.
+
+  Each socket is given an id within its room, and messages carry `from` so the
+  host can tell its players apart. A 1v1 match is just the two-socket case of the
+  same thing, which is why nothing about it needed a separate path.
 */
 const rooms = new Map();
+const ROOM_MAX = 16;
 
 /** A short, unambiguous room code. No 0/O or 1/I, since these get read aloud. */
 function makeCode() {
@@ -178,7 +192,8 @@ function dropSocket(sock) {
   const room = rooms.get(code);
   room.sockets = room.sockets.filter((s) => s !== sock);
   for (const s of room.sockets) {
-    send(s, { t: "peer-left", why: "the other player disconnected" });
+    send(s, { t: "peer-left", seat: sock.hgSeat,
+              why: "the other player disconnected" });
   }
   if (room.sockets.length === 0) {
     rooms.delete(code);
@@ -249,7 +264,8 @@ server.on("upgrade", (req, sock) => {
     */
     if (msg.t === "host") {
       const code = makeCode();
-      rooms.set(code, { sockets: [sock], created: Date.now() });
+      sock.hgSeat = 0;                     // the host is always seat 0
+      rooms.set(code, { sockets: [sock], created: Date.now(), nextSeat: 1 });
       sock.hgRoom = code;
       send(sock, { t: "hosting", code });
       log(`room ${code} opened by #${sock.hgId}`);
@@ -259,22 +275,40 @@ server.on("upgrade", (req, sock) => {
       const code = String(msg.code || "").toUpperCase().trim();
       const room = rooms.get(code);
       if (!room) { send(sock, { t: "no-room", code }); return; }
-      if (room.sockets.length >= 2) { send(sock, { t: "room-full", code }); return; }
+      if (room.sockets.length >= ROOM_MAX) { send(sock, { t: "room-full", code }); return; }
+      sock.hgSeat = room.nextSeat++;
       room.sockets.push(sock);
       sock.hgRoom = code;
-      send(sock, { t: "joined", code });
-      // Tell the host someone arrived, which is its cue to start the handshake.
-      for (const s of room.sockets) if (s !== sock) send(s, { t: "peer-joined" });
-      log(`#${sock.hgId} joined room ${code}`);
+      send(sock, { t: "joined", code, seat: sock.hgSeat });
+      /*
+        Tell the host who arrived. `seat` is what lets a tournament host keep its
+        players apart — with a single opponent it is ignored, so the 1v1 flow is
+        unchanged.
+      */
+      for (const s of room.sockets) {
+        if (s !== sock) send(s, { t: "peer-joined", seat: sock.hgSeat });
+      }
+      log(`#${sock.hgId} joined room ${code} as seat ${sock.hgSeat}`);
       return;
     }
 
-    // Forward to the other member of the room.
     const room = rooms.get(sock.hgRoom);
     if (!room) return;
+
+    /*
+      ROUTING. A message with `to` goes to that seat alone; everything else is
+      broadcast to the rest of the room. Stamped with `from` so the host can
+      attribute what it receives — a tournament needs to know which of fifteen
+      players sent a given packet, and a 1v1 match simply ignores the field.
+
+      The relay still does not parse game traffic: it reads `to` and adds `from`,
+      and passes the rest through untouched.
+    */
+    const stamped = JSON.stringify(Object.assign({}, msg, { from: sock.hgSeat }));
     for (const s of room.sockets) {
       if (s === sock || s.destroyed) continue;
-      try { s.write(encodeFrame(text)); } catch (e) { /* gone */ }
+      if (msg.to !== undefined && s.hgSeat !== msg.to) continue;
+      try { s.write(encodeFrame(stamped)); } catch (e) { /* gone */ }
     }
   };
 

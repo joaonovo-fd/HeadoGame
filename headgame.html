@@ -5167,6 +5167,21 @@ function relayChannelShim(ws) {
       relayControl(msg);
       return;
     }
+    /*
+      ATTRIBUTION. The relay stamps every forwarded message with the seat it came
+      from, so a tournament host can hand it to netHandle as that peer's — without
+      this, fifteen players' input would all arrive looking like one anonymous
+      opponent. A 1v1 match has no peer table, so it takes the plain path.
+    */
+    if (msg && msg.from !== undefined && net.peers.length) {
+      const peer = net.peers.find((p) => p.relaySeat === msg.from);
+      if (peer) {
+        peer.lastRecv = 0;
+        net.lastRecv = 0;
+        try { netHandle(msg, peer); } catch (err) { /* one bad packet is not fatal */ }
+        return;
+      }
+    }
     if (shim.onmessage) shim.onmessage(e);
   };
   ws.onclose = () => { if (shim.onclose) shim.onclose(); };
@@ -5190,6 +5205,44 @@ const RELAY_CONTROL = new Set([
   "hosting", "joined", "peer-joined", "peer-left", "no-room", "room-full", "expired",
 ]);
 
+/**
+ * A relay guest, shaped like a WebRTC peer.
+ *
+ * Its `chan` is a per-seat view of the one shared socket: send() stamps the
+ * message with `to` so the relay routes it to that guest alone, which is what
+ * lets netSendTo work over a transport with a single connection. Everything else
+ * the bracket code reads — entrantId, state, lastRecv — is the same shape the
+ * WebRTC path produces, so the tournament logic cannot tell them apart.
+ */
+function relayPeer(seat) {
+  // Entrant 0 is always the host, so guests start at 1 and fill the lowest gap.
+  let slot = 1;
+  while (net.peers.some((p) => p.entrantId === slot)) slot++;
+  return {
+    id: net.nextPeerId++,
+    relaySeat: seat,
+    pc: null,
+    chan: {
+      readyState: "open",
+      send: (txt) => {
+        if (!net.ws || net.ws.readyState !== 1) return;
+        try {
+          const obj = JSON.parse(txt);
+          obj.to = seat;
+          net.ws.send(JSON.stringify(obj));
+        } catch (e) { /* not JSON: the game only ever sends JSON */ }
+      },
+      close: () => {},
+    },
+    name: "",
+    entrantId: slot,
+    version: "",
+    mismatch: false,
+    lastRecv: 0,
+    state: "live",
+  };
+}
+
 /** Handle one relay control message. */
 function relayControl(msg) {
   switch (msg.t) {
@@ -5204,22 +5257,57 @@ function relayControl(msg) {
       net.state = "connecting";
       net.error = "";
       break;
-    case "peer-joined":
+    case "peer-joined": {
       /*
-        The guest has arrived. Both sides are now connected to the relay, so the
-        channel is live and the ordinary handshake can begin — the host announces
-        itself exactly as it would over WebRTC.
+        A guest has arrived. Both sides are now on the relay, so the channel is
+        live and the ordinary handshake begins — the host announces itself exactly
+        as it would over WebRTC.
       */
       net.state = "live";
       net.active = true;
       net.lastRecv = 0;
+
+      /*
+        A TOURNAMENT needs a peer TABLE, not one channel: the bracket code seats
+        players by entrant id and sends some messages to one machine only. The
+        relay gives every guest a seat number, so each is registered here as a
+        peer whose channel is a thin per-seat view of the shared socket.
+
+        A 1v1 match keeps the single-channel path, which is why nothing about it
+        changed — netChannels falls back to net.chan when the table is empty.
+      */
+      if (netIsHost() && game.mode === MODE.TOURNAMENT && msg.seat !== undefined) {
+        if (!net.peers.some((p) => p.relaySeat === msg.seat)) {
+          const peer = relayPeer(msg.seat);
+          net.peers.push(peer);
+          net.joinNote = `${peer.name || "a player"} joined`;
+          net.joinNoteT = 2.2;
+          netSendTo(peer, { t: "me", e: peer.entrantId });
+        }
+      }
       netSendHello();
       break;
-    case "peer-left":
+    }
+    case "peer-left": {
+      /*
+        In a TOURNAMENT one player leaving is not the end of the session: that
+        peer is dropped and the bracket replaces them, exactly as it does when a
+        WebRTC channel closes. Only a 1v1 match ends here, because there the
+        departing player was the entire opposition.
+      */
+      if (net.peers.length && msg.seat !== undefined) {
+        const peer = net.peers.find((p) => p.relaySeat === msg.seat);
+        if (peer) {
+          netDropPeer(peer);
+          break;
+        }
+      }
+      if (net.peers.length) break;         // some other player, already handled
       net.error = msg.why || "the other player left";
       net.state = "closed";
       net.active = false;
       break;
+    }
     case "no-room":
       net.error = `no game found with code ${msg.code}`;
       net.state = "failed";
@@ -5283,12 +5371,22 @@ function relayConnect(address, onOpen) {
   return ws;
 }
 
-/** HOST over the relay: open a room and publish its code. */
-function relayHost(address) {
+/**
+ * HOST over the relay: open a room and publish its code.
+ *
+ * `tournament` opens a LOBBY instead of a single match — the relay room holds up
+ * to sixteen, and each guest becomes a peer in the table the bracket code reads.
+ */
+function relayHost(address, tournament) {
   netReset();
   net.role = "host";
   net.localSeat = 0;
   net.remoteSeat = 1;
+  net.myEntrant = 0;
+  if (tournament) {
+    game.mode = MODE.TOURNAMENT;
+    net.relayLobby = true;
+  }
   relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "host" })));
 }
 
@@ -5347,6 +5445,7 @@ const net = {
   relayGo: null,         // set by ENTER in a field, consumed by updateOnline
   relayIntent: null,     // "host" | "join" — what the typed address is for
   portText: "",          // the port field while it is being edited
+  relayLobby: false,     // hosting a tournament over the relay, not a 1v1
 
   /*
     THE HUB. A tournament can seat up to TOURN_MAX humans, each on their own
@@ -5420,6 +5519,7 @@ function netReset() {
   net.relayCode = "";
   net.relayUrl = "";
   net.relayWait = 0;
+  net.relayLobby = false;
   // net.relayAddr is deliberately KEPT: it is what the player typed, and having
   // to retype the host's address after every failed attempt is needless friction.
 }
@@ -6939,7 +7039,8 @@ function updateOnline(dt) {
   if (net.relayGo) {
     const which = net.relayGo;
     net.relayGo = null;
-    if (net.relayIntent === "host") { relayHost(net.relayAddr); return; }
+    if (net.relayIntent === "host") { relayHost(net.relayAddr, false); return; }
+    if (net.relayIntent === "tourney") { relayHost(net.relayAddr, true); return; }
     if (net.relayIntent === "join") {
       // Address first, then the code: submitting the address moves the cursor on
       // rather than trying to join a room the player has not named yet.
@@ -6991,6 +7092,14 @@ function updateOnline(dt) {
       net.error = "";
       return;
     }
+    // T — host a TOURNAMENT by address, for up to 16 players.
+    if (hit("KeyT")) {
+      net.relayIntent = "tourney";
+      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
+      net.editing = "addr";
+      net.error = "";
+      return;
+    }
     // A lobby hosts a whole tournament rather than a single opponent.
     if (hit("KeyL")) {
       net.role = "host";
@@ -7009,6 +7118,21 @@ function updateOnline(dt) {
     answer seats that player and rolls the code on for the next one. START is
     host-only — a joiner pressing it would build a rival bracket of its own.
   */
+  /*
+    A RELAY LOBBY starts on SPACE, like the WebRTC lobby — but its state is
+    "offer" (the room is open and waiting) rather than "lobby", since there is no
+    per-joiner code to mint.
+  */
+  if (net.relayLobby && netIsHost() && net.relayCode &&
+      (kickHit(0) || hit("Space"))) {
+    if (net.peers.length === 0) {
+      net.error = "nobody has joined yet";
+      return;
+    }
+    startLobbyTournament();
+    return;
+  }
+
   if (net.state === "lobby" && netIsHost()) {
     if (net.paste && hit("Enter")) { netAcceptJoiner(net.paste); net.paste = ""; return; }
     if (kickHit(0) || hit("Space")) {
@@ -12186,8 +12310,10 @@ function drawOnline() {
     if (net.editing || net.relayIntent) {
       card(104, 250, "#4ade80");
       const joining = net.relayIntent === "join";
-      text(joining ? "JOIN BY ADDRESS" : "HOST BY ADDRESS",
-           W / 2, 130, 18, "#4ade80", "center", 900);
+      const tourney = net.relayIntent === "tourney";
+      text(joining ? "JOIN BY ADDRESS"
+                   : tourney ? "HOST A TOURNAMENT" : "HOST BY ADDRESS",
+           W / 2, 130, 18, tourney ? "#a78bfa" : "#4ade80", "center", 900);
 
       const field = (y, label, value, name, hint) => {
         const on = net.editing === name;
@@ -12230,14 +12356,14 @@ function drawOnline() {
     } else {
       card(104, 292, "#7dd3fc");
       text("How do you want to connect?", W / 2, 126, 16, "#e8f1ff", "center", 800);
-      text("BY ADDRESS — easiest", bx + 30, 148, 10, "#4ade80", "left", 900);
-      opt(156, "A", "HOST by address", "run the relay, share the address", "#4ade80");
-      opt(206, "S", "JOIN by address", "type the host's address and code", "#7dd3fc");
-      text("BY CODE — direct connection, no relay", bx + 30, 268, 10, "#fbbf24", "left", 900);
-      opt(276, "H", "HOST a match", "share a code, paste their reply", "#fbbf24");
-      opt(326, "J", "JOIN with a code", "paste the code the host sends", "#fb923c");
-      text(`L — host a tournament for up to ${TOURN_MAX} players`,
-           W / 2, 384, 10, "#a78bfa", "center", 700);
+      text("BY ADDRESS — easiest", bx + 30, 144, 10, "#4ade80", "left", 900);
+      opt(152, "A", "HOST a match", "run the relay, share the address", "#4ade80");
+      opt(200, "S", "JOIN a game", "type the host's address and code", "#7dd3fc");
+      opt(248, "T", `HOST a TOURNAMENT`,
+          `up to ${TOURN_MAX} players, each on their own device`, "#a78bfa");
+      text("BY CODE — direct connection, no relay", bx + 30, 306, 10, "#fbbf24", "left", 900);
+      opt(314, "H", "HOST a match", "share a code, paste their reply", "#fbbf24");
+      opt(362, "J", "JOIN with a code", "paste the code the host sends", "#fb923c");
     }
 
     text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
@@ -12252,11 +12378,38 @@ function drawOnline() {
       (net.state === "offer" || net.state === "creating")) {
     card(150, 210, "#4ade80");
     if (net.relayCode) {
-      text("YOUR GAME IS OPEN", W / 2, 182, 15, "#4ade80", "center", 900);
-      text(net.relayCode, W / 2, 232, 58, "#ffffff", "center", 900);
-      text("the other player needs this code", W / 2, 272, 11, "#cddcf2", "center", 700);
-      text(`…and this address:  ${net.relayAddr}`, W / 2, 296, 12, "#a7f3d0", "center", 800);
-      text("waiting for them to join…", W / 2, 328, 11, "#7dd3fc", "center", 600);
+      const lobby = net.relayLobby;
+      text(lobby ? "TOURNAMENT LOBBY IS OPEN" : "YOUR GAME IS OPEN",
+           W / 2, 178, 15, lobby ? "#a78bfa" : "#4ade80", "center", 900);
+      text(net.relayCode, W / 2, 222, 52, "#ffffff", "center", 900);
+      text(`address:  ${net.relayAddr}`, W / 2, 256, 12, "#a7f3d0", "center", 800);
+      if (lobby) {
+        /*
+          The joined players, so the host knows who is in before starting. Sixteen
+          names would not fit as a list, so they are a compact row of chips.
+        */
+        const n = net.peers.length;
+        text(n ? `${n + 1} PLAYER${n ? "S" : ""} IN` : "waiting for players…",
+             W / 2, 284, 12, n ? "#4ade80" : "#7dd3fc", "center", 800);
+        const chips = [cleanName(game.names[0], DEFAULT_NAMES[0])]
+          .concat(net.peers.map((p) => p.name || `PLAYER ${p.entrantId + 1}`));
+        const cw = Math.min(104, (W - 260) / Math.max(1, chips.length));
+        let cx2 = W / 2 - (cw * chips.length) / 2;
+        for (const nm of chips) {
+          ctx.fillStyle = "rgba(167,139,250,0.18)";
+          roundRect(cx2 + 2, 296, cw - 4, 20, 5);
+          ctx.fill();
+          text(String(nm).slice(0, 10), cx2 + cw / 2, 306, 9, "#ddd6fe", "center", 800);
+          cx2 += cw;
+        }
+        text(n ? "SPACE to start the tournament"
+               : `share the code and address · up to ${TOURN_MAX} players`,
+             W / 2, 330, 11, n ? "#4ade80" : "#6b819e", "center", 800);
+      } else {
+        text("the other player needs this code and address",
+             W / 2, 286, 11, "#cddcf2", "center", 700);
+        text("waiting for them to join…", W / 2, 320, 11, "#7dd3fc", "center", 600);
+      }
     } else {
       text("connecting to the relay…", W / 2, 232, 16, "#7dd3fc", "center", 800);
       text(net.relayUrl || net.relayAddr, W / 2, 256, 11, "#6b819e", "center", 600);
@@ -14337,7 +14490,7 @@ const PHYS = {
   netApplySnapshot, netHandle, encodeSignal, decodeSignal, netIsHost, netIsGuest,
   // Relay transport: connect by address instead of pasting codes.
   relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
-  relayFailureHint, relayPort, relayFail,
+  relayFailureHint, relayPort, relayFail, relayPeer,
   RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
   basketScored, ballVsHoops, hoopPos, updateCPU, releaseCPUKeys, CPU_LEVELS,
   cpuCfg, menuRows, makeBall, HOOP_R, HOOP_Y, HOOP_X,
@@ -24683,6 +24836,88 @@ function runTests() {
 
       netReset();
       Object.assign(net, savedNet);
+      game.remoteName = "";
+    }
+
+    /*
+      25d2. A TOURNAMENT over the relay. The bracket code seats players by entrant
+      id and sends some messages to one machine only, so it needs a peer TABLE —
+      which a single shared socket has to fake. Each guest becomes a peer whose
+      channel stamps `to` with that guest's seat.
+    */
+    {
+      const savedNet = { ...net };
+      const savedPeers = [...net.peers];
+      const savedMode = game.mode;
+      const savedNames = [...game.names];
+      WebSocketSpy.made.length = 0;
+
+      relayHost("localhost:8787", true);
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ws._recv({ t: "hosting", code: "ABCD" });
+      ok("hosting a relay tournament switches to tournament mode",
+         game.mode === MODE.TOURNAMENT);
+      ok("and marks the session as a lobby", net.relayLobby === true);
+      ok("with a room code to share", net.relayCode === "ABCD");
+      ok("and the host is entrant 0", net.myEntrant === 0);
+
+      for (const seat of [1, 2, 3]) ws._recv({ t: "peer-joined", seat });
+      ok("each joiner becomes a peer", net.peers.length === 3, `${net.peers.length}`);
+      ok("with a distinct entrant id, none of them the host's",
+         new Set(net.peers.map((p) => p.entrantId)).size === 3 &&
+         net.peers.every((p) => p.entrantId !== 0),
+         net.peers.map((p) => p.entrantId).join());
+      ok("and its own relay seat", net.peers.map((p) => p.relaySeat).join() === "1,2,3");
+      ok("a repeated join for the same seat does not double-register",
+         (() => { ws._recv({ t: "peer-joined", seat: 2 });
+                  return net.peers.length === 3; })());
+
+      // Attribution: a stamped message must reach the right peer.
+      ws._recv({ t: "hi", n: "BOB", v: VERSION, from: 2 });
+      const bob = net.peers.find((p) => p.relaySeat === 2);
+      ok("a forwarded message is attributed to the peer that sent it",
+         bob && bob.name === "BOB", bob ? bob.name : "no peer");
+      ok("and its version is recorded against that peer", bob.version === VERSION);
+
+      // A directed send must carry `to`, or the relay would broadcast it.
+      ws.sent.length = 0;
+      netSendTo(bob, { t: "me", e: 9 });
+      const directed = JSON.parse(ws.sent[ws.sent.length - 1]);
+      ok("a message to one peer is addressed to its seat", directed.to === 2,
+         `${directed.to}`);
+      ok("and carries its payload", directed.t === "me" && directed.e === 9);
+
+      // A broadcast reaches everyone, so it must NOT be addressed.
+      ws.sent.length = 0;
+      netSend({ t: "br", x: 1 });
+      const sentAll = ws.sent.map((m) => JSON.parse(m));
+      ok("a broadcast is sent once per peer", sentAll.length === net.peers.length,
+         `${sentAll.length} for ${net.peers.length} peers`);
+      ok("addressed to each of them",
+         new Set(sentAll.map((m) => m.to)).size === net.peers.length,
+         sentAll.map((m) => m.to).join());
+
+      /*
+        ONE PLAYER LEAVING must not end a tournament — the bracket replaces them.
+        Only a 1v1 match ends on a departure, because there the leaver was the
+        entire opposition.
+      */
+      ws._recv({ t: "peer-left", seat: 2, why: "gone" });
+      ok("a tournament survives one player leaving",
+         net.peers.length === 2 && net.state !== "closed",
+         `${net.peers.length} peers, state ${net.state}`);
+      ok("and it is that player who was dropped",
+         !net.peers.some((p) => p.relaySeat === 2));
+
+      // A room that fills up is refused by the relay, not silently ignored.
+      ok("the relay room holds a whole bracket", TOURN_MAX === 16);
+
+      netReset();
+      net.peers = savedPeers;
+      Object.assign(net, savedNet);
+      game.mode = savedMode;
+      game.names = savedNames;
       game.remoteName = "";
     }
 
