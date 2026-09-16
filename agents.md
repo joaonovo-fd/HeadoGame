@@ -1,0 +1,1 @@
+Don't commit with claude as co-authored.

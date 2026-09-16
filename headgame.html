@@ -1646,6 +1646,7 @@ function musicTrackForScene() {
     case SCENE.PLAY:
     case SCENE.COUNTDOWN:
     case SCENE.CELEBRATE:
+    case SCENE.ARENA3D:
       return "play";
     default:
       return "menu";
@@ -2652,6 +2653,12 @@ const SCENE = {
   RUNOVER: "runover",       // roguelike: the run ended
   RUNWIN: "runwin",         // roguelike: the ladder was cleared
   RULES: "rules",           // spawn rates and world toggles
+  /*
+    The 3D deathmatch. A SIBLING of PLAY, not a variant of it: it runs its own
+    simulation over `game.arena` and shares none of the 2D ball physics. Kept
+    separate precisely so the 2D kernel never has to learn about a z axis.
+  */
+  ARENA3D: "arena3d",
 };
 
 /*
@@ -2667,9 +2674,11 @@ const MODE = {
   VOLLEY: "volley",          // net at midfield, ball on the ground concedes
   TENNIS: "tennis",          // low net, ball may bounce ONCE per side
   BASKET: "basket",          // elevated hoops, ball through the hoop scores
+  ARENA3D: "arena3d",        // third-person 3D deathmatch, no ball at all
 };
 // Cycled by the MODE row, in order.
-const MODE_ORDER = [MODE.SINGLE, MODE.VOLLEY, MODE.TENNIS, MODE.BASKET, MODE.TOURNAMENT];
+const MODE_ORDER = [MODE.SINGLE, MODE.VOLLEY, MODE.TENNIS, MODE.BASKET,
+                    MODE.ARENA3D, MODE.TOURNAMENT];
 
 /*
   Per-mode ball and rule configuration. `modeCfg()` is the single source of
@@ -2710,6 +2719,16 @@ const MODE_CFG = {
   [MODE.BASKET]:     { ballR: 14, ballMass: 0.72, grav: 0.62, drag: 0.8,  rest: 1.18,
                        knockback: true,  net: 0,   confine: false, goals: false,
                        kickMul: 1.15, reachMul: 1.15 },
+  /*
+    The 3D arena has no ball, so these numbers are never read by its
+    simulation. The entry exists because `modeCfg()` is called from shared code
+    that has no reason to know which modes are 2D — and because the test suite
+    rightly insists every mode in MODE_ORDER declares a complete config. Values
+    mirror soccer so anything that does fall through behaves sanely.
+  */
+  [MODE.ARENA3D]:    { ballR: 14, ballMass: 1,    grav: 1,    drag: 1,   rest: 1,
+                       knockback: false, net: 0,   confine: false, goals: false,
+                       kickMul: 1, reachMul: 1 },
 };
 const modeCfg = () => MODE_CFG[game.mode] || MODE_CFG[MODE.SINGLE];
 
@@ -2760,6 +2779,17 @@ const ARENA = {
     ground: "#b3762f", stripe: "rgba(0,0,0,0.10)",
     line: "rgba(255,240,220,0.55)", surface: "wood",
   },
+  /*
+    The 3D arena: a sealed industrial box under cold light. Unlike the other
+    themes these colours are read by the 3D renderer rather than drawPitch —
+    `sky` fills the horizon gradient, `ground` shades the floor plates and
+    `line` draws the floor grid. `crowd` is null: there is no stand indoors.
+  */
+  [MODE.ARENA3D]: {
+    sky: ["#070b14", "#16233b"], crowd: null,
+    ground: "#37414f", stripe: "rgba(125,211,252,0.07)",
+    line: "rgba(125,211,252,0.30)", surface: "plate",
+  },
 };
 
 const arena = () => ARENA[game.mode] || ARENA[MODE.SINGLE];
@@ -2768,6 +2798,7 @@ const MODE_LABEL = {
   [MODE.VOLLEY]: "VOLLEYBALL",
   [MODE.TENNIS]: "TENNIS",
   [MODE.BASKET]: "BASKETBALL",
+  [MODE.ARENA3D]: "3D ARENA",
   [MODE.TOURNAMENT]: "TOURNAMENT",
 };
 const MODE_HINT = {
@@ -2775,6 +2806,7 @@ const MODE_HINT = {
   [MODE.VOLLEY]: "big light ball — don't let it land",
   [MODE.TENNIS]: "low net, one bounce per side",
   [MODE.BASKET]: "shoot through the hoops",
+  [MODE.ARENA3D]: "third-person deathmatch — WASD + mouse",
   [MODE.TOURNAMENT]: "knockout bracket, hot-seat",
 };
 
@@ -2986,15 +3018,23 @@ function menuRows() {
     if (r === "players") return game.mode === MODE.TOURNAMENT;
     if (r === "opponent") return game.mode !== MODE.TOURNAMENT;
     if (r === "cpulevel") return game.mode !== MODE.TOURNAMENT && game.cpu[1];
-    if (r === "online") return true;
+    /*
+      Online play streams 2D snapshots, so the 3D arena cannot be played over
+      the network — the row is hidden here rather than offering a link that
+      would connect and then desync.
+    */
+    if (r === "online") return game.mode !== MODE.ARENA3D;
     if (r === "settings") return true;
     if (r === "board") return true;
     if (r === "roguelike") return true;
     if (r === "controls") return true;
     if (r === "credits") return true;
     if (r === "rules") return true;
+    // The 3D arena builds its own cover layout and re-rolls nothing, so neither
+    // the 2D maps nor the chaos tunables have any meaning there.
+    if (r === "chaos") return game.mode !== MODE.ARENA3D;
     // Platforms would block a volleyball or tennis rally, so no map choice there.
-    if (r === "map") return modeCfg().net === 0;
+    if (r === "map") return modeCfg().net === 0 && game.mode !== MODE.ARENA3D;
     // The second name only matters when a second human shares this keyboard.
     if (r === "name2") return game.mode !== MODE.TOURNAMENT && !game.cpu[1] && !net.active;
     return true;
@@ -5878,7 +5918,8 @@ function updateRoster(dt) {
 }
 
 /** Scenes during which ESC should open the pause overlay. */
-const PAUSABLE = new Set([SCENE.COUNTDOWN, SCENE.PLAY, SCENE.CELEBRATE]);
+const PAUSABLE = new Set([SCENE.COUNTDOWN, SCENE.PLAY, SCENE.CELEBRATE,
+                          SCENE.ARENA3D]);
 
 /**
  * Open the pause overlay, remembering what it interrupted.
@@ -18340,6 +18381,80 @@ function runTests() {
       ok("every box face is visible from outside the box", !outFail, outFail || "");
       ok("every box face declares a matching unit normal", !inFail, inFail || "");
     }
+  }
+
+  // 24f. The new mode must satisfy every contract MODE_ORDER implies.
+  {
+    const savedMode = game.mode;
+    const savedCpu = [...game.cpu];
+
+    ok("the 3D arena is a selectable mode", MODE_ORDER.includes(MODE.ARENA3D));
+    ok("it has a scene of its own", SCENE.ARENA3D === "arena3d");
+    ok("it is labelled on the menu", MODE_LABEL[MODE.ARENA3D] === "3D ARENA");
+    ok("it explains itself on the menu",
+       typeof MODE_HINT[MODE.ARENA3D] === "string" && MODE_HINT[MODE.ARENA3D].length > 8);
+
+    // The config contract the MODE_ORDER loops assert for every mode.
+    const c = MODE_CFG[MODE.ARENA3D];
+    ok("it declares a complete mode config",
+       !!c && typeof c.ballR === "number" && typeof c.ballMass === "number" &&
+       typeof c.grav === "number" && typeof c.drag === "number" &&
+       typeof c.rest === "number");
+    ok("it has no net, no goals and no half-confinement",
+       c.net === 0 && c.goals === false && c.confine === false);
+
+    // The theme contract, plus the fields the 3D renderer actually reads.
+    const t = ARENA[MODE.ARENA3D];
+    ok("it declares a complete arena theme",
+       !!t && Array.isArray(t.sky) && t.sky.length === 2 && !!t.ground &&
+       !!t.line && !!t.surface);
+    ok("and its theme has no crowd stand, being indoors", t.crowd === null);
+
+    // Menu rows: the three that make no sense here must be gone.
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    const rows3d = menuRows();
+    ok("the 3D arena hides the 2D map picker", !rows3d.includes("map"));
+    ok("the 3D arena hides chaos mode", !rows3d.includes("chaos"));
+    ok("the 3D arena hides online play, which cannot carry it",
+       !rows3d.includes("online"));
+    ok("but it still offers an opponent and a CPU level",
+       rows3d.includes("opponent") && rows3d.includes("cpulevel"));
+    ok("and it still offers frags-to-win and a time limit",
+       rows3d.includes("goals") && rows3d.includes("time"));
+
+    // Panel contiguity: the same invariant the existing loops check per mode.
+    {
+      let switches = 0, prev = null;
+      for (const r of rows3d) {
+        const g = MENU_GROUP[r];
+        if (prev && g !== prev) switches++;
+        prev = g;
+      }
+      const groups = new Set(rows3d.map((r) => MENU_GROUP[r]));
+      ok("its menu cursor never leaves and re-enters a panel",
+         switches === groups.size - 1,
+         `${switches} switches across ${groups.size} panels`);
+    }
+
+    ok("the 3D arena can be paused like any live match",
+       PAUSABLE.has(SCENE.ARENA3D));
+    ok("and it plays the match music, not the menu loop",
+       (() => { const s = game.scene; game.scene = SCENE.ARENA3D;
+                const r = musicTrackForScene(); game.scene = s; return r === "play"; })());
+
+    // The other modes must be untouched by the addition.
+    ok("adding a mode did not disturb the 2D modes",
+       MODE_ORDER.includes(MODE.SINGLE) && MODE_ORDER.includes(MODE.VOLLEY) &&
+       MODE_ORDER.includes(MODE.TENNIS) && MODE_ORDER.includes(MODE.BASKET) &&
+       MODE_ORDER.includes(MODE.TOURNAMENT));
+    ok("soccer still offers the map picker",
+       (() => { game.mode = MODE.SINGLE; return menuRows().includes("map"); })());
+    ok("soccer still offers online play",
+       (() => { game.mode = MODE.SINGLE; return menuRows().includes("online"); })());
+
+    game.mode = savedMode;
+    game.cpu = savedCpu;
   }
 
   // 23. Determinism: identical initial conditions give identical results.
