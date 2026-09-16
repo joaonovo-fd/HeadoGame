@@ -11305,6 +11305,9 @@ const PHYS = {
   drawArena3D, drawArenaWorld, drawFighterBillboard, drawArenaHUD, arenaViews,
   drawArenaSky, drawArenaScoreboard, arenaFloorFaces, arenaWallFaces, shiftHex,
   updateArenaCPU, stepArena3D, separateFighters,
+  // The live state object and the frame driver, so a harness can run the REAL
+  // loop rather than approximating it by calling step and draw by hand.
+  game, step, draw, frame,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
