@@ -5203,6 +5203,8 @@ function relayFail(url) {
 /** Message names the relay itself uses. Everything else is game traffic. */
 const RELAY_CONTROL = new Set([
   "hosting", "joined", "peer-joined", "peer-left", "no-room", "room-full", "expired",
+  // The lobby browser: a pushed listing, and the two ways quick-connect can fail.
+  "lobbies", "no-lobbies", "room-started",
 ]);
 
 /**
@@ -5320,6 +5322,27 @@ function relayControl(msg) {
       net.error = "the room expired";
       net.state = "failed";
       break;
+    case "lobbies":
+      /*
+        A pushed listing. The relay sends one on request and again whenever a room
+        opens, fills, starts or closes, so this arrives unsolicited and simply
+        replaces what is on screen — no polling, and never a stale list.
+      */
+      net.lobbies = Array.isArray(msg.rooms) ? msg.rooms : [];
+      net.lobbyAt = performance.now();
+      net.state = "browsing";
+      net.error = "";
+      break;
+    case "no-lobbies":
+      // Nothing to join, which is the cue to host instead.
+      net.lobbies = [];
+      net.state = "browsing";
+      net.error = "no games are open — press H to host one";
+      break;
+    case "room-started":
+      net.error = `game ${msg.code} has already started`;
+      net.state = "failed";
+      break;
     default:
       break;
   }
@@ -5387,7 +5410,79 @@ function relayHost(address, tournament) {
     game.mode = MODE.TOURNAMENT;
     net.relayLobby = true;
   }
-  relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "host" })));
+  /*
+    The room ADVERTISES itself, so it appears in other players' lobby browsers with
+    something recognisable rather than only a code. The name defaults to the host's
+    own player name, since that is what their friends will be looking for.
+  */
+  const name = cleanName(net.roomName || game.names[0], DEFAULT_NAMES[0]);
+  relayConnect(address, (ws) => ws.send(JSON.stringify({
+    t: "host",
+    name,
+    mode: tournament ? "tournament" : "match",
+    private: !!net.roomPrivate,
+  })));
+}
+
+/**
+ * BROWSE: connect to a relay and subscribe to its listing of open games.
+ *
+ * The point of the lobby browser is that a player should not need a code — they
+ * see what is open and pick one. The subscription is push-based, so the list stays
+ * current without polling.
+ */
+function relayBrowse(address) {
+  netReset();
+  net.role = null;                   // decided by whichever room they join
+  net.lobbyIntent = "browse";
+  relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "list" })));
+}
+
+/**
+ * QUICK CONNECT: join whatever is open, or say there is nothing.
+ *
+ * One keypress from the menu to playing, which is the shortest path this system
+ * can offer. The relay picks the fullest joinable room so players collect into one
+ * game rather than scattering.
+ */
+function relayQuick(address, mode) {
+  netReset();
+  net.role = "guest";
+  net.localSeat = 1;
+  net.remoteSeat = 0;
+  net.lobbyIntent = "quick";
+  relayConnect(address, (ws) =>
+    ws.send(JSON.stringify(mode ? { t: "quick", mode } : { t: "quick" })));
+}
+
+/** Ask for a fresh listing. Used by the browser's refresh. */
+function relayRefresh() {
+  if (net.ws && net.ws.readyState === 1) net.ws.send(JSON.stringify({ t: "list" }));
+}
+
+/** Join a room from the browser, by code. */
+function relayJoinCode(code) {
+  if (!net.ws || net.ws.readyState !== 1) return false;
+  /*
+    The seat is claimed here because the browser had no role yet: whoever joins a
+    room someone else opened is a guest, and the relay's own seat numbering
+    confirms it a moment later.
+  */
+  net.role = "guest";
+  net.localSeat = 1;
+  net.remoteSeat = 0;
+  net.relayCode = String(code || "").toUpperCase();
+  net.ws.send(JSON.stringify({ t: "join", code: net.relayCode }));
+  net.state = "connecting";
+  return true;
+}
+
+/** Tell the relay this room has started, so it leaves the listing. */
+function relayMarkStarted() {
+  if (net.transport !== "relay") return;
+  if (!net.ws || net.ws.readyState !== 1) return;
+  if (!netIsHost()) return;
+  net.ws.send(JSON.stringify({ t: "room-state", started: true }));
 }
 
 /** JOIN over the relay: connect and ask for a room by code. */
@@ -5446,6 +5541,12 @@ const net = {
   relayIntent: null,     // "host" | "join" — what the typed address is for
   portText: "",          // the port field while it is being edited
   relayLobby: false,     // hosting a tournament over the relay, not a 1v1
+  lobbies: [],           // the open games, as last pushed by the relay
+  lobbyAt: 0,            // when that listing arrived
+  lobbyRow: 0,           // cursor in the browser
+  lobbyIntent: null,     // "browse" | "quick" once an address is entered
+  roomName: "",          // the name this machine advertises when hosting
+  roomPrivate: false,    // hosting unlisted
 
   /*
     THE HUB. A tournament can seat up to TOURN_MAX humans, each on their own
@@ -5520,6 +5621,10 @@ function netReset() {
   net.relayUrl = "";
   net.relayWait = 0;
   net.relayLobby = false;
+  net.lobbies = [];
+  net.lobbyAt = 0;
+  net.lobbyRow = 0;
+  net.lobbyIntent = null;
   // net.relayAddr is deliberately KEPT: it is what the player typed, and having
   // to retype the host's address after every failed attempt is needless friction.
 }
@@ -7041,6 +7146,8 @@ function updateOnline(dt) {
     net.relayGo = null;
     if (net.relayIntent === "host") { relayHost(net.relayAddr, false); return; }
     if (net.relayIntent === "tourney") { relayHost(net.relayAddr, true); return; }
+    if (net.relayIntent === "browse") { relayBrowse(net.relayAddr); return; }
+    if (net.relayIntent === "quick") { relayQuick(net.relayAddr, null); return; }
     if (net.relayIntent === "join") {
       // Address first, then the code: submitting the address moves the cursor on
       // rather than trying to join a room the player has not named yet.
@@ -7072,6 +7179,46 @@ function updateOnline(dt) {
     net.editing = "addr";
     return;
   }
+  /*
+    THE LOBBY BROWSER. Up/down picks a game, kick or ENTER joins it, R refreshes,
+    H hosts one instead. Driven by either player's bindings, like every other menu
+    in the game, so whoever is holding a controller can use it.
+  */
+  if (net.state === "browsing" && !net.editing) {
+    const n = net.lobbies.length;
+    if (n) {
+      if (hit(SCHEME[0].up) || hit(SCHEME[1].up) || hit("ArrowUp")) {
+        net.lobbyRow = (net.lobbyRow + n - 1) % n;
+      }
+      if (hit(SCHEME[0].down) || hit(SCHEME[1].down) || hit("ArrowDown")) {
+        net.lobbyRow = (net.lobbyRow + 1) % n;
+      }
+      if (kickHit(0) || kickHit(1) || hit("Space") || hit("Enter")) {
+        const pick = net.lobbies[clamp(net.lobbyRow, 0, n - 1)];
+        if (pick) relayJoinCode(pick.code);
+        return;
+      }
+    }
+    if (hit("KeyR")) { relayRefresh(); return; }
+    // Nothing worth joining: host a game on the relay already connected to.
+    if (hit("KeyH")) {
+      const name = cleanName(net.roomName || game.names[0], DEFAULT_NAMES[0]);
+      net.role = "host";
+      net.localSeat = 0;
+      net.remoteSeat = 1;
+      net.myEntrant = 0;
+      net.relayLobby = game.mode === MODE.TOURNAMENT;
+      net.ws.send(JSON.stringify({
+        t: "host", name,
+        mode: game.mode === MODE.TOURNAMENT ? "tournament" : "match",
+        private: !!net.roomPrivate,
+      }));
+      net.state = "creating";
+      return;
+    }
+    return;                              // the browser owns the keyboard
+  }
+
   if (net.editing) return;               // the keyboard belongs to the field
 
   if (net.state === "idle" || net.state === "failed") {
@@ -7088,6 +7235,21 @@ function updateOnline(dt) {
     if (hit("KeyS")) {
       net.relayIntent = "join";
       net.relayCode = "";
+      net.editing = "addr";
+      net.error = "";
+      return;
+    }
+    // B — browse the games open on a relay. Q — join one straight away.
+    if (hit("KeyB")) {
+      net.relayIntent = "browse";
+      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
+      net.editing = "addr";
+      net.error = "";
+      return;
+    }
+    if (hit("KeyQ")) {
+      net.relayIntent = "quick";
+      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
       net.editing = "addr";
       net.error = "";
       return;
@@ -7157,6 +7319,7 @@ function updateOnline(dt) {
 
   // Once live, the host starts the match for both machines.
   if (net.state === "live" && netIsHost() && (kickHit(0) || hit("Space"))) {
+    relayMarkStarted();
     netSendConfig();
     if (game.mode === MODE.TOURNAMENT) {
       // Name the field first; the bracket then syncs to the guest.
@@ -7188,6 +7351,8 @@ function updateOnline(dt) {
  * CPUs that fill any unclaimed slot, so a half-full lobby still plays.
  */
 function startLobbyTournament() {
+  // The game is under way, so it leaves the lobby listing and refuses latecomers.
+  relayMarkStarted();
   if (!netIsHost()) return;                 // host-authoritative, always
   game.mode = MODE.TOURNAMENT;
   /*
@@ -12321,9 +12486,14 @@ function drawOnline() {
       card(104, 250, "#4ade80");
       const joining = net.relayIntent === "join";
       const tourney = net.relayIntent === "tourney";
-      text(joining ? "JOIN BY ADDRESS"
-                   : tourney ? "HOST A TOURNAMENT" : "HOST BY ADDRESS",
-           W / 2, 130, 18, tourney ? "#a78bfa" : "#4ade80", "center", 900);
+      const finding = net.relayIntent === "browse" || net.relayIntent === "quick";
+      const title = joining ? "JOIN BY ADDRESS"
+                  : tourney ? "HOST A TOURNAMENT"
+                  : net.relayIntent === "browse" ? "BROWSE GAMES"
+                  : net.relayIntent === "quick" ? "QUICK CONNECT"
+                  : "HOST BY ADDRESS";
+      text(title, W / 2, 130, 18,
+           tourney ? "#a78bfa" : finding ? "#7dd3fc" : "#4ade80", "center", 900);
 
       const field = (y, label, value, name, hint) => {
         const on = net.editing === name;
@@ -12338,7 +12508,8 @@ function drawOnline() {
         text(shown + (on ? "▌" : ""), bx + 44, y + 28, 13,
              value ? "#ffffff" : "#5f7391", "left", 700);
       };
-      field(152, "HOST ADDRESS", net.relayAddr, "addr", `localhost:${relayPort()}`);
+      field(152, finding ? "RELAY ADDRESS" : "HOST ADDRESS",
+            net.relayAddr, "addr", `localhost:${relayPort()}`);
       if (joining) field(202, "GAME CODE", net.relayCode, "code", "ABCD");
       if (net.editing === "port") {
         field(joining ? 252 : 202, "DEFAULT PORT", net.portText, "port",
@@ -12354,9 +12525,16 @@ function drawOnline() {
         text("tools/play-online.sh", W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
         text("it opens a public tunnel and prints the address to share",
              W / 2, iy + 36, 10, "#6b819e", "center", 600);
-      } else {
+      } else if (joining) {
         text("ask the host for their address and 4-letter code",
              W / 2, iy, 11, "#cddcf2", "center", 700);
+      } else {
+        // Browsing needs no code at all — that is the point of it.
+        text(net.relayIntent === "quick"
+               ? "you will be dropped straight into whatever is open"
+               : "you will see every game open on this relay",
+             W / 2, iy, 11, "#cddcf2", "center", 700);
+        text("no code needed", W / 2, iy + 18, 10, "#7dd3fc", "center", 700);
       }
       // The default port, changeable here, for anyone not running 8787.
       text(`default port ${relayPort()} — P to change`,
@@ -12364,20 +12542,29 @@ function drawOnline() {
       text("TAB switches field  ·  ENTER confirms  ·  ESC cancels",
            W / 2, 338, 10, "#6b819e", "center", 600);
     } else {
-      card(104, 292, "#7dd3fc");
-      text("How do you want to connect?", W / 2, 126, 16, "#e8f1ff", "center", 800);
-      text("BY ADDRESS — easiest", bx + 30, 144, 10, "#4ade80", "left", 900);
-      opt(152, "A", "HOST a match", "run the relay, share the address", "#4ade80");
-      opt(200, "S", "JOIN a game", "type the host's address and code", "#7dd3fc");
-      opt(248, "T", `HOST a TOURNAMENT`,
-          `up to ${TOURN_MAX} players, each on their own device`, "#a78bfa");
-      text("BY CODE — direct connection, no relay", bx + 30, 306, 10, "#fbbf24", "left", 900);
-      opt(314, "H", "HOST a match", "share a code, paste their reply", "#fbbf24");
-      opt(362, "J", "JOIN with a code", "paste the code the host sends", "#fb923c");
+      card(104, 348, "#7dd3fc");
+      text("How do you want to play?", W / 2, 124, 16, "#e8f1ff", "center", 800);
+      text("FIND A GAME", bx + 30, 140, 10, "#7dd3fc", "left", 900);
+      opt(148, "Q", "QUICK CONNECT", "join whatever is open, straight away", "#7dd3fc");
+      opt(190, "B", "BROWSE GAMES", "see every open game and pick one", "#38bdf8");
+      text("HOST A GAME", bx + 30, 240, 10, "#4ade80", "left", 900);
+      opt(248, "A", "HOST a match", "one opponent", "#4ade80");
+      opt(290, "T", "HOST a TOURNAMENT",
+          `up to ${TOURN_MAX} players`, "#a78bfa");
+      text("BY CODE — no relay, or if you were sent one", bx + 30, 340, 10, "#fbbf24",
+           "left", 900);
+      opt(348, "S", "JOIN by address + code", "if someone gave you both", "#fbbf24");
+      opt(390, "J", "JOIN with a paste code", "the direct WebRTC handshake", "#fb923c");
+      text("H — host with a paste code instead", W / 2, 436, 9, "#6b819e", "center", 600);
     }
 
-    text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
-         W / 2, 410, 11, "#7dd3fc", "center", 700);
+    if (!net.editing && !net.relayIntent) {
+      text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
+           W / 2, 466, 11, "#7dd3fc", "center", 700);
+    } else {
+      text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
+           W / 2, 400, 11, "#7dd3fc", "center", 700);
+    }
   }
 
   /*
@@ -12425,6 +12612,71 @@ function drawOnline() {
       text(net.relayUrl || net.relayAddr, W / 2, 256, 11, "#6b819e", "center", 600);
     }
   }
+  /*
+    THE LOBBY BROWSER. Open games, with who is hosting, what they are playing and
+    how full it is — so a player picks a game instead of being told a code.
+  */
+  if (net.state === "browsing") {
+    card(104, 330, "#7dd3fc");
+    text("OPEN GAMES", W / 2, 130, 18, "#7dd3fc", "center", 900);
+    text(net.relayAddr, W / 2, 150, 10, "#6b819e", "center", 600);
+
+    const list = net.lobbies;
+    if (!list.length) {
+      text("nothing open on this relay", W / 2, 240, 15, "#8fa3c0", "center", 700);
+      text("H — host a game here     R — look again",
+           W / 2, 268, 12, "#4ade80", "center", 800);
+    } else {
+      const rowH = 40, top = 168;
+      const shown = Math.min(list.length, 5);
+      // Scrolled so the cursor stays visible once there are more than five.
+      const first = clamp(net.lobbyRow - 2, 0, Math.max(0, list.length - shown));
+      for (let i = 0; i < shown; i++) {
+        const idx = first + i;
+        const r = list[idx];
+        if (!r) break;
+        const ry = top + i * (rowH + 6);
+        const on = idx === net.lobbyRow;
+        const full = r.players >= r.max;
+
+        clickable(bx + 20, ry, bw - 40, rowH, () => {
+          net.lobbyRow = idx;
+          relayJoinCode(r.code);
+        });
+
+        ctx.fillStyle = on ? "rgba(125,211,252,0.18)" : "rgba(255,255,255,0.05)";
+        roundRect(bx + 20, ry, bw - 40, rowH, 8);
+        ctx.fill();
+        if (on) {
+          ctx.strokeStyle = "#7dd3fc";
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+        }
+        // A tournament is worth distinguishing at a glance from a 1v1.
+        const isT = r.mode === "tournament";
+        ctx.fillStyle = isT ? "#a78bfa" : "#4ade80";
+        roundRect(bx + 30, ry + 11, 18, 18, 4);
+        ctx.fill();
+        text(isT ? "T" : "1", bx + 39, ry + 20, 11, "#0b1220", "center", 900);
+
+        text(String(r.name).toUpperCase(), bx + 58, ry + 15, 13,
+             on ? "#ffffff" : "#cddcf2", "left", 800);
+        text(isT ? "tournament" : "one-on-one", bx + 58, ry + 30, 9,
+             isT ? "#c4b5fd" : "#86efac", "left", 600);
+
+        text(`${r.players}/${r.max}`, bx + bw - 110, ry + 20, 13,
+             full ? "#ef4444" : "#a7f3d0", "center", 900);
+        text(r.code, bx + bw - 50, ry + 20, 13, "#7dd3fc", "center", 900);
+      }
+      if (list.length > shown) {
+        text(`${list.length} games — ${list.length - shown} more`,
+             W / 2, top + shown * (rowH + 6) + 8, 9, "#6b819e", "center", 600);
+      }
+      text("↑↓ pick  ·  ENTER join  ·  R refresh  ·  H host  ·  ESC back",
+           W / 2, 412, 10, "#8fa3c0", "center", 700);
+    }
+  }
+
   /*
     A FAILED relay attempt explains itself. A browser tells a page nothing about
     why a WebSocket failed, so relayFailureHint reasons from the URL — without it
@@ -14501,6 +14753,7 @@ const PHYS = {
   // Relay transport: connect by address instead of pasting codes.
   relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
   relayFailureHint, relayPort, relayFail, relayPeer,
+  relayBrowse, relayQuick, relayRefresh, relayJoinCode, relayMarkStarted,
   RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
   basketScored, ballVsHoops, hoopPos, updateCPU, releaseCPUKeys, CPU_LEVELS,
   cpuCfg, menuRows, makeBall, HOOP_R, HOOP_Y, HOOP_X,
@@ -24944,6 +25197,149 @@ function runTests() {
       game.mode = savedMode;
       game.names = savedNames;
       game.remoteName = "";
+    }
+
+    /*
+      25d3. THE LOBBY BROWSER. A player should be able to see what is open and pick
+      one, rather than needing a code read out to them.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      WebSocketSpy.made.length = 0;
+
+      relayBrowse("localhost:8787");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ok("browsing subscribes to the listing",
+         ws.sent.length === 1 && JSON.parse(ws.sent[0]).t === "list",
+         ws.sent.join());
+
+      ws._recv({ t: "lobbies", rooms: [
+        { code: "AAAA", name: "JOAO", mode: "match", players: 1, max: 2, age: 3 },
+        { code: "BBBB", name: "CUP", mode: "tournament", players: 5, max: 16, age: 40 },
+      ] });
+      ok("a pushed listing is shown", net.state === "browsing" &&
+         net.lobbies.length === 2, `${net.state} ${net.lobbies.length}`);
+      ok("with each game's name, mode and capacity",
+         net.lobbies[1].name === "CUP" && net.lobbies[1].mode === "tournament" &&
+         net.lobbies[1].max === 16);
+
+      // An UNSOLICITED update replaces the list, so it is never stale.
+      ws._recv({ t: "lobbies", rooms: [
+        { code: "CCCC", name: "NEW", mode: "match", players: 1, max: 2, age: 1 },
+      ] });
+      ok("a later push replaces the list rather than appending",
+         net.lobbies.length === 1 && net.lobbies[0].code === "CCCC",
+         `${net.lobbies.length}`);
+
+      // The rows must be selectable and joinable.
+      ws._recv({ t: "lobbies", rooms: [
+        { code: "AAAA", name: "ONE", mode: "match", players: 1, max: 2, age: 3 },
+        { code: "BBBB", name: "TWO", mode: "tournament", players: 5, max: 16, age: 40 },
+      ] });
+      game.scene = SCENE.ONLINE;
+      draw();
+      const rows = clickRegions.filter((r) => r.w > 500 && r.h === 40);
+      ok("every listed game is clickable", rows.length === 2, `${rows.length}`);
+
+      net.lobbyRow = 1;
+      ws.sent.length = 0;
+      relayJoinCode(net.lobbies[1].code);
+      const joinMsg = JSON.parse(ws.sent[ws.sent.length - 1]);
+      ok("joining from the browser asks for that room",
+         joinMsg.t === "join" && joinMsg.code === "BBBB", ws.sent.join());
+      ok("and claims the guest seat", net.role === "guest" && net.localSeat === 1);
+      ws._recv({ t: "joined", code: "BBBB", seat: 3 });
+      ok("and the relay confirms it", net.state === "connecting");
+
+      /*
+        QUICK CONNECT: one keypress from the menu to playing, which is the
+        shortest path this system can offer.
+      */
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayQuick("localhost:8787", null);
+      const q = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      q._open();
+      ok("quick connect asks the relay to pick a game",
+         JSON.parse(q.sent[0]).t === "quick", q.sent.join());
+      ok("and sends no mode filter when none was chosen",
+         JSON.parse(q.sent[0]).mode === undefined);
+      q._recv({ t: "joined", code: "ZZZZ", seat: 1 });
+      q._recv({ t: "peer-joined", seat: 0 });
+      ok("and a match becomes live", net.state === "live" && net.active);
+
+      // Nothing open must be a clear cue to host, not a dead end.
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayQuick("localhost:8787", null);
+      const q2 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      q2._open();
+      q2._recv({ t: "no-lobenter" });        // an unknown control name is ignored
+      q2._recv({ t: "no-lobbies" });
+      ok("nothing open leaves the player in the browser",
+         net.state === "browsing", net.state);
+      ok("and tells them to host one", /host/i.test(net.error), net.error);
+
+      // A game that already started must be refused with a reason.
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayJoin("localhost:8787", "ABCD");
+      const q3 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      q3._open();
+      q3._recv({ t: "room-started", code: "ABCD" });
+      ok("a game in progress is refused with a reason",
+         net.state === "failed" && /started/i.test(net.error), net.error);
+
+      // A HOST advertises itself, so it can be found.
+      netReset();
+      WebSocketSpy.made.length = 0;
+      game.names = ["JOAO", "P2"];
+      relayHost("localhost:8787", false);
+      const h = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      h._open();
+      const hostMsg = JSON.parse(h.sent[0]);
+      ok("hosting advertises a name", hostMsg.t === "host" && !!hostMsg.name,
+         h.sent[0]);
+      ok("defaulting to the host's own player name", hostMsg.name === "JOAO",
+         hostMsg.name);
+      ok("and declares it is a one-on-one", hostMsg.mode === "match");
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayHost("localhost:8787", true);
+      const h2 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      h2._open();
+      ok("a tournament host declares that instead",
+         JSON.parse(h2.sent[0]).mode === "tournament");
+
+      /*
+        STARTING must remove the room from the listing, or players keep trying to
+        join a match already in progress.
+      */
+      h2._recv({ t: "hosting", code: "ABCD" });
+      h2._recv({ t: "peer-joined", seat: 1 });
+      h2.sent.length = 0;
+      relayMarkStarted();
+      const startMsg = h2.sent.map((m) => JSON.parse(m))
+        .find((m) => m.t === "room-state");
+      ok("starting tells the relay the room is no longer joinable",
+         !!startMsg && startMsg.started === true, h2.sent.join());
+      // A guest must never claim to have started someone else's room.
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayJoin("localhost:8787", "ABCD");
+      const gw = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      gw._open();
+      gw.sent.length = 0;
+      relayMarkStarted();
+      ok("but a guest cannot mark a room started", gw.sent.length === 0,
+         gw.sent.join());
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
+      game.names = loadNames();
     }
 
     // 25e. Failure and teardown must leave nothing behind.

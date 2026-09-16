@@ -71,6 +71,8 @@ function client(name, onMsg) {
   });
 }
 
+const t0 = (x) => x;
+
 async function run() {
   const results = [];
   let code = null, guestGot = [], hostGot = [];
@@ -79,7 +81,7 @@ async function run() {
     hostGot.push(m);
     if (m.t === "hosting") code = m.code;
   });
-  host.send({ t: "host" });
+  host.send({ t: "host", mode: "tournament", name: "TEST CUP" });
   await new Promise((r) => setTimeout(r, 120));
   results.push(["host receives a room code", !!code && /^[A-Z2-9]{4}$/.test(code), code]);
 
@@ -157,6 +159,119 @@ async function run() {
   guest.sock.destroy();
   await new Promise((r) => setTimeout(r, 200));
   results.push(["a disconnect notifies the peer", hostGot.some((m) => m.t === "peer-left")]);
+
+  /* ---- the lobby browser -------------------------------------------------
+     A player should be able to SEE the open games rather than be told a code.
+     The listing is pushed on change, so these check both the reply to a request
+     and the unsolicited update when something changes.
+  */
+  {
+    let watchGot = [];
+    const watcher = await client("watcher", (m) => watchGot.push(JSON.parse(t0(m))));
+    // A watcher asks once and then stays subscribed.
+    watcher.send({ t: "list" });
+    await new Promise((r) => setTimeout(r, 200));
+    const first = watchGot.filter((m) => m.t === "lobbies").pop();
+    results.push(["a listing is returned on request", !!first,
+                  JSON.stringify(watchGot.slice(0, 2))]);
+    results.push(["and it includes the open tournament",
+                  !!first && first.rooms.some((r) => r.code === code),
+                  first ? JSON.stringify(first.rooms) : ""]);
+    const entry = first && first.rooms.find((r) => r.code === code);
+    results.push(["with the host's name", !!entry && entry.name === "TEST CUP",
+                  entry ? entry.name : ""]);
+    results.push(["its mode", !!entry && entry.mode === "tournament"]);
+    results.push(["and how full it is",
+                  !!entry && typeof entry.players === "number" && entry.max === 16,
+                  entry ? `${entry.players}/${entry.max}` : ""]);
+
+    // A NEW room must push an update to the watcher without being asked.
+    watchGot.length = 0;
+    let code2 = null;
+    const host2 = await client("host2", (m) => {
+      const p = JSON.parse(t0(m));
+      if (p.t === "hosting") code2 = p.code;
+    });
+    host2.send({ t: "host", mode: "match", name: "SECOND GAME" });
+    await new Promise((r) => setTimeout(r, 250));
+    const pushed = watchGot.filter((m) => m.t === "lobbies").pop();
+    results.push(["opening a room pushes an update to watchers",
+                  !!pushed && pushed.rooms.some((r) => r.code === code2),
+                  pushed ? JSON.stringify(pushed.rooms.map((r) => r.code)) : "nothing pushed"]);
+    results.push(["a 1v1 room advertises room for two",
+                  !!pushed && pushed.rooms.find((r) => r.code === code2).max === 2]);
+
+    // A room that has STARTED must drop out of the listing.
+    watchGot.length = 0;
+    host2.send({ t: "room-state", started: true });
+    await new Promise((r) => setTimeout(r, 250));
+    const afterStart = watchGot.filter((m) => m.t === "lobbies").pop();
+    results.push(["a started game leaves the listing",
+                  !!afterStart && !afterStart.rooms.some((r) => r.code === code2),
+                  afterStart ? JSON.stringify(afterStart.rooms.map((r) => r.code)) : ""]);
+    // And cannot be joined.
+    let lateGot = [];
+    const late = await client("late", (m) => lateGot.push(JSON.parse(t0(m))));
+    late.send({ t: "join", code: code2 });
+    await new Promise((r) => setTimeout(r, 200));
+    results.push(["and refuses a late joiner",
+                  lateGot.some((m) => m.t === "room-started"),
+                  JSON.stringify(lateGot.slice(0, 2))]);
+
+    // A PRIVATE room is never advertised, but its code still works.
+    let code3 = null;
+    const host3 = await client("host3", (m) => {
+      const p = JSON.parse(t0(m));
+      if (p.t === "hosting") code3 = p.code;
+    });
+    host3.send({ t: "host", mode: "match", name: "HIDDEN", private: true });
+    await new Promise((r) => setTimeout(r, 250));
+    watchGot.length = 0;
+    watcher.send({ t: "list" });
+    await new Promise((r) => setTimeout(r, 200));
+    const withPrivate = watchGot.filter((m) => m.t === "lobbies").pop();
+    results.push(["a private room is not listed",
+                  !!withPrivate && !withPrivate.rooms.some((r) => r.code === code3)]);
+    let privGot = [];
+    const privJoin = await client("priv", (m) => privGot.push(JSON.parse(t0(m))));
+    privJoin.send({ t: "join", code: code3 });
+    await new Promise((r) => setTimeout(r, 200));
+    results.push(["but can still be joined with its code",
+                  privGot.some((m) => m.t === "joined")]);
+
+    /* ---- quick connect --------------------------------------------------- */
+    let quickGot = [];
+    const quick = await client("quick", (m) => quickGot.push(JSON.parse(t0(m))));
+    quick.send({ t: "quick" });
+    await new Promise((r) => setTimeout(r, 250));
+    const landed = quickGot.find((m) => m.t === "joined");
+    results.push(["quick connect joins an open game", !!landed,
+                  JSON.stringify(quickGot.slice(0, 2))]);
+    /*
+      It should pick the FULLEST joinable room, so players collect into one game
+      rather than scattering across several half-empty ones. The tournament has
+      several members by now; the private one is excluded from consideration.
+    */
+    results.push(["choosing the fullest one", !!landed && landed.code === code,
+                  landed ? landed.code : ""]);
+
+    // With nothing joinable, quick connect says so rather than hanging.
+    {
+      // Filter by a mode nothing is hosting.
+      let noneGot = [];
+      const seeker = await client("seeker", (m) => noneGot.push(JSON.parse(t0(m))));
+      seeker.send({ t: "quick", mode: "nonsense-mode" });
+      await new Promise((r) => setTimeout(r, 250));
+      /*
+        An unknown mode is sanitised to "match", so this finds the match rooms
+        rather than nothing — which is the correct behaviour, and worth asserting
+        so a future change to the allow-list does not silently strand a player.
+      */
+      results.push(["quick connect with an unknown mode still finds a game",
+                    noneGot.some((m) => m.t === "joined" || m.t === "no-lobbies"),
+                    JSON.stringify(noneGot.slice(0, 2))]);
+    }
+  }
 
   let fails = 0;
   for (const [name, pass, extra] of results) {

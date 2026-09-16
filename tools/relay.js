@@ -21,24 +21,37 @@
     node tools/relay.js --port 9000
     node tools/relay.js --host 127.0.0.1
 
-  Then in the game: ONLINE -> A to host a match, T to host a tournament. Either
-  shows an address and a 4-letter code to share; everyone else picks S (JOIN by
-  address) and enters them.
+  In the game, ONLINE offers:
+    Q  quick connect — join whatever is open on the relay
+    B  browse — see every open game, with its host, mode and how full it is
+    A  host a match           T  host a tournament (up to 16)
+    S  join with an address and a code, if someone gave you both
+
+  A host ADVERTISES its room (name, mode, player count) so the browser has
+  something to show. Rooms drop out of the listing once they fill or start, so
+  nobody is offered a game they cannot join. `private: true` keeps a room out of
+  the listing while its code still works.
 
   OVER THE INTERNET: the address only reaches players on your own network. For
-  anyone else, put a tunnel in front of it — for example:
+  anyone else, use the helper, which starts this relay and a tunnel together:
 
-    ssh -R 80:localhost:8787 serveo.net
-    ngrok http 8787
+    tools/play-online.sh
 
-  and share the URL the tunnel prints. The game accepts a full URL as the address
-  and upgrades https:// to wss:// automatically.
+  It tunnels over SSH to localhost.run, which works where the two obvious choices
+  do not. Both failures were measured, not guessed:
 
-  NOT cloudflared's free QUICK tunnel (trycloudflare.com). Measured, not guessed:
-  it generates its own Sec-WebSocket-Key toward the origin and then validates the
-  origin's Sec-WebSocket-Accept against the CLIENT's key, so the two can never
-  agree and every upgrade fails with a 500 no matter what this server replies. A
-  NAMED cloudflare tunnel is fine.
+    cloudflared's free QUICK tunnel (trycloudflare.com) generates its own
+    Sec-WebSocket-Key toward the origin, then validates the origin's
+    Sec-WebSocket-Accept against the CLIENT's key. They can never agree, so every
+    upgrade fails with a 500 whatever this server replies. A NAMED cloudflare
+    tunnel is fine.
+
+    ngrok pins its own CA bundle, so on a network that inspects TLS — a corporate
+    proxy such as Netskope or Zscaler — its agent cannot authenticate at all and
+    never establishes the tunnel.
+
+  The game accepts a full URL as the address and upgrades https:// to wss://
+  automatically.
 */
 
 "use strict";
@@ -69,6 +82,74 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F";
 */
 const rooms = new Map();
 const ROOM_MAX = 16;
+
+/**
+ * Sanitise a room name supplied by a host.
+ *
+ * It is displayed on other people's screens, so it is length-capped and stripped
+ * of control characters — a relay must not become a way to write arbitrary bytes
+ * into someone else's lobby list.
+ */
+function cleanRoomName(name) {
+  const s = String(name == null ? "" : name)
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 20);
+  return s || "a game";
+}
+
+/** The modes this relay will advertise. Anything else is treated as a match. */
+const ROOM_MODES = new Set(["match", "tournament"]);
+function cleanRoomMode(mode) {
+  const m = String(mode == null ? "" : mode).toLowerCase();
+  return ROOM_MODES.has(m) ? m : "match";
+}
+
+/** The joinable rooms, as the lobby browser needs them. */
+function lobbyList() {
+  const out = [];
+  for (const [code, room] of rooms) {
+    if (room.private || room.started) continue;
+    const max = room.max || ROOM_MAX;
+    if (room.sockets.length >= max) continue;      // nothing to join
+    out.push({
+      code,
+      name: room.name || "a game",
+      mode: room.mode || "match",
+      players: room.sockets.length,
+      max,
+      age: Math.round((Date.now() - room.created) / 1000),
+    });
+  }
+  // Newest first: a room someone just opened is the one they are waiting in.
+  out.sort((a, b) => a.age - b.age);
+  return out;
+}
+
+/**
+ * Push a fresh listing to everyone watching the lobby.
+ *
+ * Pushed on change rather than polled: a poll either lags behind a room opening
+ * or hammers the relay, and the change points are all right here.
+ */
+function broadcastLobby() {
+  const rooms2 = lobbyList();
+  for (const room of rooms.values()) {
+    for (const s of room.sockets) {
+      if (s.hgWatching) send(s, { t: "lobbies", rooms: rooms2 });
+    }
+  }
+  for (const s of watchers) {
+    if (!s.destroyed && s.hgWatching) send(s, { t: "lobbies", rooms: rooms2 });
+  }
+}
+
+/*
+  Sockets that have asked for the listing but are not in a room yet — a player
+  browsing. Tracked separately because broadcastLobby walks rooms, and someone
+  who has joined nothing appears in none of them.
+*/
+const watchers = new Set();
 
 /** A short, unambiguous room code. No 0/O or 1/I, since these get read aloud. */
 function makeCode() {
@@ -201,6 +282,8 @@ function dropSocket(sock) {
   } else {
     log(`#${sock.hgId} left room ${code}`);
   }
+  // A room opening up, or vanishing, changes what is joinable.
+  broadcastLobby();
 }
 
 const log = (...m) => console.log(`[relay ${new Date().toISOString().slice(11, 19)}]`, ...m);
@@ -265,21 +348,100 @@ server.on("upgrade", (req, sock) => {
     if (msg.t === "host") {
       const code = makeCode();
       sock.hgSeat = 0;                     // the host is always seat 0
-      rooms.set(code, { sockets: [sock], created: Date.now(), nextSeat: 1 });
+      /*
+        Room METADATA, so the lobby browser has something to show. Supplied by the
+        host and sanitised here rather than trusted: it is displayed on other
+        people's screens, so a name is length-capped and stripped of control
+        characters, and the mode must be one this relay knows about.
+      */
+      rooms.set(code, {
+        sockets: [sock],
+        created: Date.now(),
+        nextSeat: 1,
+        name: cleanRoomName(msg.name),
+        mode: cleanRoomMode(msg.mode),
+        max: msg.mode === "tournament" ? ROOM_MAX : 2,
+        started: false,
+        private: !!msg.private,            // hidden from the listing
+      });
       sock.hgRoom = code;
       send(sock, { t: "hosting", code });
-      log(`room ${code} opened by #${sock.hgId}`);
+      log(`room ${code} opened by #${sock.hgId} (${msg.mode || "match"})`);
+      broadcastLobby();
+      return;
+    }
+    /*
+      LIST. Everything currently joinable, so a player can pick a game instead of
+      being told a code. A socket that asks stays subscribed, and is pushed a fresh
+      list whenever a room opens, fills, starts or closes — polling for this would
+      either lag or hammer the relay.
+    */
+    if (msg.t === "list") {
+      sock.hgWatching = true;
+      watchers.add(sock);
+      send(sock, { t: "lobbies", rooms: lobbyList() });
+      return;
+    }
+    if (msg.t === "unlist") {
+      sock.hgWatching = false;
+      watchers.delete(sock);
+      return;
+    }
+    /*
+      QUICK. Join the fullest room that still has space, so players collect into
+      one game rather than scattering across several half-empty ones. Falls back to
+      telling the caller there is nothing to join, which is its cue to host.
+    */
+    if (msg.t === "quick") {
+      /*
+        A mode is a PREFERENCE, not a filter. cleanRoomMode always returns
+        something, so filtering by it unconditionally meant a bare "quick" was
+        silently treated as "match only" and reported no lobbies while a
+        tournament sat open. Preferred rooms are tried first, then anything.
+      */
+      const want = msg.mode === undefined ? null : cleanRoomMode(msg.mode);
+      const all = lobbyList();
+      if (!all.length) { send(sock, { t: "no-lobbies" }); return; }
+      const preferred = want ? all.filter((r) => r.mode === want) : [];
+      const pick = (preferred.length ? preferred : all)
+        // Fullest first, so players collect into one game rather than scattering
+        // across several half-empty ones.
+        .sort((a, b) => b.players - a.players)[0];
+      msg = { t: "join", code: pick.code };
+      // Falls through to the join handler below.
+    }
+    /*
+      STARTED / RENAMED. A host tells the relay when its game begins or its
+      details change, so the listing stops offering a match already in progress.
+    */
+    if (msg.t === "room-state") {
+      const room = rooms.get(sock.hgRoom);
+      if (room && room.sockets[0] === sock) {
+        if (msg.started !== undefined) room.started = !!msg.started;
+        if (msg.name !== undefined) room.name = cleanRoomName(msg.name);
+        if (msg.mode !== undefined) {
+          room.mode = cleanRoomMode(msg.mode);
+          room.max = room.mode === "tournament" ? ROOM_MAX : 2;
+        }
+        broadcastLobby();
+      }
       return;
     }
     if (msg.t === "join") {
       const code = String(msg.code || "").toUpperCase().trim();
       const room = rooms.get(code);
       if (!room) { send(sock, { t: "no-room", code }); return; }
-      if (room.sockets.length >= ROOM_MAX) { send(sock, { t: "room-full", code }); return; }
+      if (room.sockets.length >= (room.max || ROOM_MAX)) {
+        send(sock, { t: "room-full", code });
+        return;
+      }
+      if (room.started) { send(sock, { t: "room-started", code }); return; }
       sock.hgSeat = room.nextSeat++;
       room.sockets.push(sock);
       sock.hgRoom = code;
-      send(sock, { t: "joined", code, seat: sock.hgSeat });
+      send(sock, { t: "joined", code, seat: sock.hgSeat,
+                   name: room.name, mode: room.mode });
+      broadcastLobby();
       /*
         Tell the host who arrived. `seat` is what lets a tournament host keep its
         players apart — with a single opponent it is ignored, so the 1v1 flow is
@@ -335,10 +497,11 @@ server.on("upgrade", (req, sock) => {
     opponent had gone — the match simply froze until the 6-second game-level
     timeout. dropSocket is idempotent, so hearing several is harmless.
   */
-  sock.on("end", () => dropSocket(sock));
-  sock.on("error", () => dropSocket(sock));
-  sock.on("close", () => dropSocket(sock));
-  sock.on("timeout", () => dropSocket(sock));
+  const gone = () => { watchers.delete(sock); dropSocket(sock); };
+  sock.on("end", gone);
+  sock.on("error", gone);
+  sock.on("close", gone);
+  sock.on("timeout", gone);
 });
 
 /* Reap rooms nobody ever joined, so a long-running relay does not leak them. */
@@ -398,4 +561,5 @@ function start() {
 // Only listen when run directly, never when imported.
 if (require.main === module) start();
 
-module.exports = { readFrames, encodeFrame, encodeClose, makeCode, rooms, start, server };
+module.exports = { readFrames, encodeFrame, encodeClose, makeCode, rooms, start,
+                   server, cleanRoomName, cleanRoomMode, lobbyList, ROOM_MAX };
