@@ -6466,14 +6466,20 @@ function arenaCover() {
   Spawn points, one per corner of the arena, inset clear of the crates. Two
   fighters and four spawns means a death can always be answered with a spawn
   away from the killer — see respawnFighter.
+
+  Each yaw faces the middle of the room: camBasis builds forward as
+  (sin yaw, ·, cos yaw), so the yaw that looks from a spawn toward the origin is
+  atan2(-x, -z). Spawning with your back to the fight is disorienting, and the
+  first version of this table had every corner facing the wall behind it.
 */
 function arenaSpawns() {
   const d = 400;
+  const facingCentre = (x, z) => Math.atan2(-x, -z);
   return [
-    { x: -d, z: -d, yaw: Math.PI * 0.75 },
-    { x: d, z: -d, yaw: -Math.PI * 0.75 },
-    { x: -d, z: d, yaw: Math.PI * 0.25 },
-    { x: d, z: d, yaw: -Math.PI * 0.25 },
+    { x: -d, z: -d, yaw: facingCentre(-d, -d) },
+    { x: d, z: -d, yaw: facingCentre(d, -d) },
+    { x: -d, z: d, yaw: facingCentre(-d, d) },
+    { x: d, z: d, yaw: facingCentre(d, d) },
   ];
 }
 
@@ -8643,6 +8649,336 @@ function boxFaces(batch, cx, cy, cz, hw, hh, hd, hex, tag) {
   face([P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), P(x1, y0, z1)], v3(1, 0, 0));
 }
 
+/* --------------------------------------------- 10c. 3D ARENA RENDERING
+
+   One draw pass per viewport: sky, then the world as a single sorted face
+   batch, then the fighters as billboards, then the HUD in plain 2D.
+
+   Fighters are billboards rather than boxes on purpose. The 2D game's whole
+   visual identity is those hand-drawn faces and hats, and drawFace/drawHat
+   already paint them at any screen position and radius — so the 3D mode shows
+   the same characters the rest of the game does, rather than strangers.
+*/
+
+/** The viewports for this frame: one, or two stacked for split-screen. */
+function arenaViews() {
+  if (!game.arena || !game.arena.split) return [makeView(0, 0, W, H)];
+  // Stacked rather than side-by-side: a 1000x300 strip keeps a usable
+  // horizontal field of view, which a 500x600 column would not.
+  return [makeView(0, 0, W, H / 2), makeView(0, H / 2, W, H / 2)];
+}
+
+/** The floor, as a grid of plates so the grid lines give a sense of speed. */
+function arenaFloorFaces(batch, theme) {
+  const N = 8;
+  const step = (ARENA_HW * 2) / N;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const x0 = -ARENA_HW + i * step, z0 = -ARENA_HD + j * step;
+      // Alternating shade, so the grid reads without drawing any lines at all.
+      const dark = (i + j) % 2 === 0;
+      const col = dark ? theme.ground : shiftHex(theme.ground, 12);
+      batch.push([v3(x0, 0, z0), v3(x0 + step, 0, z0),
+                  v3(x0 + step, 0, z0 + step), v3(x0, 0, z0 + step)],
+                 col, { normal: v3(0, 1, 0), tag: "floor" });
+    }
+  }
+}
+
+/** Nudge a hex colour lighter (positive) or darker (negative) by `d` per channel. */
+function shiftHex(hex, d) {
+  const [r, g, b] = hexRGB(hex);
+  const c = (v) => clamp(v + d, 0, 255);
+  return `#${[c(r), c(g), c(b)].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * The enclosing walls, drawn as inward-facing quads.
+ *
+ * Only the far walls are wanted: a wall behind the camera would fill the screen.
+ * Back-face culling does exactly that for free, provided each wall is wound to
+ * face INWARD — the opposite of a crate, since we stand inside this box.
+ */
+function arenaWallFaces(batch, theme) {
+  const h = ARENA_WALL_H;
+  const w = shiftHex(theme.ground, -14);
+  const X = ARENA_HW, Z = ARENA_HD;
+  // Each quad is wound counter-clockwise seen from INSIDE the room.
+  batch.push([v3(-X, 0, -Z), v3(-X, h, -Z), v3(X, h, -Z), v3(X, 0, -Z)], w,
+             { normal: v3(0, 0, 1), tag: "wall" });
+  batch.push([v3(X, 0, Z), v3(X, h, Z), v3(-X, h, Z), v3(-X, 0, Z)], w,
+             { normal: v3(0, 0, -1), tag: "wall" });
+  batch.push([v3(-X, 0, Z), v3(-X, h, Z), v3(-X, h, -Z), v3(-X, 0, -Z)], w,
+             { normal: v3(1, 0, 0), tag: "wall" });
+  batch.push([v3(X, 0, -Z), v3(X, h, -Z), v3(X, h, Z), v3(X, 0, Z)], w,
+             { normal: v3(-1, 0, 0), tag: "wall" });
+}
+
+/** Sky: a flat gradient, since the room is sealed and has no horizon to sell. */
+function drawArenaSky(view, theme) {
+  const g = ctx.createLinearGradient(0, view.y, 0, view.y + view.h);
+  g.addColorStop(0, theme.sky[0]);
+  g.addColorStop(1, theme.sky[1]);
+  ctx.fillStyle = g;
+  ctx.fillRect(view.x, view.y, view.w, view.h);
+}
+
+/**
+ * One viewport's view of the world: floor, walls, cover, shots and impacts.
+ *
+ * Everything goes through a single batch so the depth sort is global — sorting
+ * per object would let a near crate paint behind a far one.
+ */
+function drawArenaWorld(cam, view, theme) {
+  const basis = camBasis(cam);
+  const batch = faceBatch();
+
+  arenaFloorFaces(batch, theme);
+  arenaWallFaces(batch, theme);
+  for (const c of game.arena.cover) {
+    boxFaces(batch, c.x, c.y, c.z, c.hw, c.hh, c.hd, shiftHex(theme.ground, 26), "cover");
+  }
+  const painted = batch.flush(cam, view, basis);
+
+  // Projectiles: small bright dots, drawn after the world so they are never
+  // hidden by a face they are in front of.
+  for (const s of game.arena.shots) {
+    const p = project(v3(s.x, s.y, s.z), cam, view, basis);
+    if (!p) continue;
+    const r = Math.max(1.5, SHOT_R * p.s);
+    ctx.fillStyle = "#fde68a";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    // A short tracer back along its path sells the speed at 1750 units/s.
+    const tail = project(v3(s.x - s.vx * 0.02, s.y - s.vy * 0.02, s.z - s.vz * 0.02),
+                         cam, view, basis);
+    if (tail) {
+      ctx.strokeStyle = "rgba(253,230,138,0.5)";
+      ctx.lineWidth = Math.max(1, r * 0.8);
+      ctx.beginPath();
+      ctx.moveTo(tail.x, tail.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+  }
+
+  // Impact flashes.
+  for (const fx of game.arena.hitFx) {
+    const p = project(v3(fx.x, fx.y, fx.z), cam, view, basis);
+    if (!p) continue;
+    const a = clamp(fx.life / 0.3, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = "#fca5a5";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(2, 26 * p.s) * (1.4 - a), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  return { basis, painted };
+}
+
+/**
+ * A fighter, as a billboard: a shadow, a body, and the 2D game's own face.
+ *
+ * `self` is true for the fighter this viewport belongs to — their own body is
+ * drawn but their head is skipped, because a third-person camera sitting behind
+ * the head would otherwise fill the screen with the back of it.
+ */
+function drawFighterBillboard(f, cam, view, basis, self) {
+  if (f.dead) return;
+  const feet = project(v3(f.x, f.y, f.z), cam, view, basis);
+  const head = project(v3(f.x, f.y + FIGHTER_H, f.z), cam, view, basis);
+  if (!feet || !head) return;
+
+  // A ground shadow, which is what actually tells the player where a fighter is
+  // standing — without it, a fighter and its position read as unrelated.
+  const shR = Math.max(2, FIGHTER_R * feet.s);
+  ctx.fillStyle = "rgba(0,0,0,0.34)";
+  ctx.beginPath();
+  ctx.ellipse(feet.x, feet.y, shR, shR * 0.38, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const hpx = Math.abs(feet.y - head.y);
+  const bodyW = Math.max(3, FIGHTER_R * 1.35 * feet.s);
+  const headR = Math.max(3, hpx * 0.26);
+
+  // Torso.
+  ctx.fillStyle = f.team.color;
+  roundRect(feet.x - bodyW / 2, head.y + headR * 1.1, bodyW,
+            Math.max(2, feet.y - head.y - headR * 1.1), Math.min(6, bodyW * 0.3));
+  ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  if (!self && headR > 4) {
+    const look = lookForSeat(f.seat);
+    const cy = head.y + headR;
+    ctx.fillStyle = f.team.accent;
+    ctx.beginPath();
+    ctx.arc(feet.x, cy, headR, 0, Math.PI * 2);
+    ctx.fill();
+    // Reuse the 2D face and hat, so the same character appears in both modes.
+    // "stunned" is the existing mood for being hit — the 2D game uses it for a
+    // mine blast, and it reads exactly right for taking a round.
+    drawFace(feet.x, cy, headR, 1, look.face, f.hurt > 0 ? "stunned" : "idle", f.team);
+    drawHat(feet.x, cy, headR, 1, look.hat, f.team);
+
+    // A floating health pip, so you can read how close an opponent is to death.
+    const bw = Math.max(14, bodyW * 1.4), bh = 4;
+    const by = cy - headR - 10;
+    ctx.fillStyle = "rgba(6,12,22,0.75)";
+    ctx.fillRect(feet.x - bw / 2, by, bw, bh);
+    ctx.fillStyle = f.hp > 50 ? "#4ade80" : f.hp > 25 ? "#fbbf24" : "#ef4444";
+    ctx.fillRect(feet.x - bw / 2, by, bw * (f.hp / HP_MAX), bh);
+  }
+}
+
+/** Crosshair, health, ammo state and frags for one viewport. */
+function drawArenaHUD(seat, view) {
+  const A = game.arena;
+  const f = A.fighters[seat];
+  const cx = view.cx, cy = view.cy;
+
+  // Crosshair: a gap in the middle so it never hides what it is aiming at.
+  if (!f.dead) {
+    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.lineWidth = 1.5;
+    const g = 5, l = 9;
+    ctx.beginPath();
+    ctx.moveTo(cx - g - l, cy); ctx.lineTo(cx - g, cy);
+    ctx.moveTo(cx + g, cy); ctx.lineTo(cx + g + l, cy);
+    ctx.moveTo(cx, cy - g - l); ctx.lineTo(cx, cy - g);
+    ctx.moveTo(cx, cy + g); ctx.lineTo(cx, cy + g + l);
+    ctx.stroke();
+    // Red while the shot is still cooling, so the rhythm of fire is visible.
+    if (f.fireCD > 0) {
+      ctx.fillStyle = "rgba(239,68,68,0.75)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Health bar, bottom-left of this viewport.
+  const bx = view.x + 16, by = view.y + view.h - 30;
+  const bw = 170, bh = 14;
+  ctx.fillStyle = "rgba(6,12,22,0.8)";
+  roundRect(bx, by, bw, bh, 4);
+  ctx.fill();
+  const frac = clamp(f.hp / HP_MAX, 0, 1);
+  ctx.fillStyle = frac > 0.5 ? "#4ade80" : frac > 0.25 ? "#fbbf24" : "#ef4444";
+  roundRect(bx + 2, by + 2, (bw - 4) * frac, bh - 4, 3);
+  ctx.fill();
+  text(`${Math.max(0, Math.round(f.hp))}`, bx + bw / 2, by + bh / 2, 10,
+       "#ffffff", "center", 900);
+
+  // Frags, bottom-right, with the opponent's for comparison.
+  const foe = A.fighters[1 - seat];
+  text(`${A.frags[seat]} — ${A.frags[1 - seat]}`,
+       view.x + view.w - 18, by + bh / 2, 15, "#ffffff", "right", 900);
+  text(`${seatLabel(seat)} vs ${seatLabel(1 - seat)}`,
+       view.x + view.w - 18, by - 10, 9, "#9fb4d0", "right", 700);
+
+  if (f.dead) {
+    text("DOWN", cx, cy - 14, 26, "#ef4444", "center", 900);
+    text(`respawning in ${Math.max(0, f.respawn).toFixed(1)}s`,
+         cx, cy + 12, 12, "#cddcf2", "center", 700);
+  }
+  // A hit flash, so taking damage is felt even when the shooter is off screen.
+  if (f.hurt > 0 && game.opt.flash) {
+    ctx.fillStyle = `rgba(239,68,68,${clamp(f.hurt, 0, 1) * 0.3})`;
+    ctx.fillRect(view.x, view.y, view.w, view.h);
+  }
+  void foe;
+}
+
+/** The whole 3D scene: every viewport, then the shared match chrome. */
+function drawArena3D() {
+  const A = game.arena;
+  if (!A) return;
+  const theme = ARENA[MODE.ARENA3D];
+  const views = arenaViews();
+
+  for (let i = 0; i < views.length; i++) {
+    const view = views[i];
+    // The viewport this pass belongs to. Not split: always the mouse-owning
+    // seat, falling back to seat 0 so a two-bot match still renders.
+    const seat = A.split ? i : Math.max(0, arenaMouseSeat());
+    const cam = A.cam[seat];
+
+    ctx.save();
+    // Clip, so a split view cannot paint into its neighbour.
+    ctx.beginPath();
+    ctx.rect(view.x, view.y, view.w, view.h);
+    ctx.clip();
+
+    drawArenaSky(view, theme);
+    const { basis } = drawArenaWorld(cam, view, theme);
+    // Fighters after the world, and the far one first so a near fighter paints
+    // over a distant one.
+    const order = [...A.fighters].sort((a, b) => {
+      const da = v3len(v3sub(v3(a.x, a.y, a.z), cam.pos));
+      const db = v3len(v3sub(v3(b.x, b.y, b.z), cam.pos));
+      return db - da;
+    });
+    for (const f of order) drawFighterBillboard(f, cam, view, basis, f.seat === seat);
+    drawArenaHUD(seat, view);
+
+    ctx.restore();
+  }
+
+  // A divider, so the two halves of a split screen read as separate views.
+  if (A.split) {
+    ctx.fillStyle = "rgba(0,0,0,0.85)";
+    ctx.fillRect(0, H / 2 - 1.5, W, 3);
+  }
+
+  drawArenaScoreboard();
+  if (game.flash > 0 && game.opt.flash) {
+    ctx.fillStyle = `rgba(255,255,255,${game.flash * 0.28})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (game.opt.hints) {
+    text(mouse.locked ? "ESC — pause" : "CLICK to capture the mouse  ·  ESC — pause",
+         W / 2, H - 8, 10, "rgba(143,163,192,0.75)", "center", 600);
+  }
+}
+
+/** Frags and the clock, centred at the top and shared by both viewports. */
+function drawArenaScoreboard() {
+  const A = game.arena;
+  const bw = 300, bh = 44, bx = (W - bw) / 2, by = 8;
+  ctx.fillStyle = "rgba(6,12,22,0.82)";
+  roundRect(bx, by, bw, bh, 10);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.14)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  for (let i = 0; i < 2; i++) {
+    const f = A.fighters[i];
+    const cx = i === 0 ? bx + 54 : bx + bw - 54;
+    ctx.fillStyle = f.team.color;
+    ctx.beginPath();
+    ctx.arc(i === 0 ? bx + 20 : bx + bw - 20, by + bh / 2, 10, 0, Math.PI * 2);
+    ctx.fill();
+    text(String(A.frags[i]), cx, by + bh / 2 - 2, 22, "#ffffff", "center", 900);
+    text(game.cpu[i] ? "CPU" : `P${i + 1}`, cx, by + bh - 9, 8, "#9fb4d0", "center", 800);
+  }
+
+  if (game.matchSecs > 0) {
+    const low = game.clock <= 10;
+    const col = low && Math.sin(performance.now() / 120) > 0 ? "#ef4444" : "#ffffff";
+    text(fmtClock(game.clock), W / 2, by + 17, 17, col, "center", 900);
+  } else {
+    text("∞", W / 2, by + 17, 15, "#5f7391", "center", 900);
+  }
+  text(`FIRST TO ${game.goalsToWin}`, W / 2, by + 34, 8, "#7dd3fc", "center", 800);
+}
+
 const fmtClock = (s) => {
   const t = Math.max(0, Math.ceil(s));
   return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
@@ -9360,6 +9696,16 @@ function drawFrozenPitch() {
   const keep = game.scene;
   game.scene = game.pauseFrom || SCENE.PLAY;
   try {
+    /*
+      A paused 3D match must show the arena behind the overlay, not the soccer
+      pitch. Without this the pause screen showed a green field the player was
+      demonstrably not standing on.
+    */
+    if (game.arena && game.mode === MODE.ARENA3D) {
+      drawArena3D();
+      game.scene = keep;
+      return;
+    }
     drawPitch();
     drawPlatforms();
     drawWalls();
@@ -10662,6 +11008,12 @@ function draw() {
   if (game.scene === SCENE.SELECT)   { drawSelect();   ctx.restore(); return; }
   if (game.scene === SCENE.BRACKET)  { drawBracket();  ctx.restore(); return; }
   if (game.scene === SCENE.CHAMPION) { drawChampion(); ctx.restore(); return; }
+  /*
+    The 3D arena paints its own world, HUD and scoreboard: none of the 2D pitch
+    furniture below applies to it. Placed with the other full-screen scenes for
+    exactly that reason.
+  */
+  if (game.scene === SCENE.ARENA3D)  { drawArena3D();  ctx.restore(); return; }
 
   if (game.shake > 0) {
     // Gated here rather than at the ~11 places that set `shake`, so the
@@ -10763,6 +11115,8 @@ const PHYS = {
   stepFighter, moveBasis, arenaBounds, fighterVsCover,
   fireShot, stepShots, shotVsFighter, applyDamage, arenaFrag, aimRay, fighterEye,
   arenaMouseSeat,
+  drawArena3D, drawArenaWorld, drawFighterBillboard, drawArenaHUD, arenaViews,
+  drawArenaSky, drawArenaScoreboard, arenaFloorFaces, arenaWallFaces, shiftHex,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
@@ -19406,6 +19760,25 @@ function runTests() {
       ok("every spawn is inside the arena",
          spawns.every((s) => Math.abs(s.x) < ARENA_HW - FIGHTER_R &&
                              Math.abs(s.z) < ARENA_HD - FIGHTER_R));
+      /*
+        Every spawn must FACE THE FIGHT. Checked by projecting the room centre
+        through a camera built from the spawn's own yaw: if the centre is behind
+        the camera, the player spawns staring at the wall behind them. All four
+        corners were wrong when this test was written — the assertions above
+        passed throughout, because none of them looked at facing.
+      */
+      let away = null;
+      for (const s of spawns) {
+        const cam = { pos: v3(s.x, EYE_H, s.z), yaw: s.yaw, pitch: 0 };
+        const p = project(v3(0, EYE_H, 0), cam, makeView(0, 0, W, H), camBasis(cam));
+        if (!p) { away = `spawn ${s.x},${s.z} faces away from the arena centre`; break; }
+        // And roughly centred, not merely somewhere in front.
+        if (Math.abs(p.x - W / 2) > W * 0.2) {
+          away = `spawn ${s.x},${s.z} points ${(p.x - W / 2).toFixed(0)}px off centre`;
+          break;
+        }
+      }
+      ok("every spawn faces the middle of the arena", !away, away || "");
     }
 
     /*
@@ -20097,6 +20470,156 @@ function runTests() {
 
     Object.assign(game, saved);
     for (const k in keys) keys[k] = false;
+    game.particles = [];
+  }
+
+  // 24l. Rendering: viewports, split-screen and the HUD.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, pauseFrom: game.pauseFrom,
+                    goalsToWin: game.goalsToWin, score: [...game.score] };
+    game.mode = MODE.ARENA3D;
+    game.sel = [0, 3];
+
+    // Viewport geometry: one full view, or two stacked halves.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      const one = arenaViews();
+      ok("a single-player view fills the canvas",
+         one.length === 1 && one[0].w === W && one[0].h === H);
+
+      game.cpu = [false, false];
+      startMatch();
+      const two = arenaViews();
+      ok("split-screen gives two viewports", two.length === 2);
+      ok("stacked, each half the height",
+         two[0].h === H / 2 && two[1].h === H / 2 &&
+         two[0].y === 0 && two[1].y === H / 2);
+      ok("each the full width, for a usable field of view",
+         two[0].w === W && two[1].w === W);
+      ok("and they do not overlap", two[0].y + two[0].h === two[1].y);
+      ok("both halves share the same lens",
+         near(two[0].focal, two[1].focal, 1e-12));
+    }
+
+    // The scene must paint without throwing, in both layouts, and paint SOMETHING.
+    {
+      for (const cpu of [[false, true], [false, false]]) {
+        game.cpu = cpu;
+        startMatch();
+        const label = cpu[1] ? "vs CPU" : "split-screen";
+        let threw = null;
+        try { drawArena3D(); } catch (e) { threw = e && e.message; }
+        ok(`the 3D arena renders (${label}) without throwing`, !threw, threw || "");
+      }
+    }
+    // It must also survive being drawn with a fighter dead, mid-respawn.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      game.arena.fighters[1].dead = true;
+      game.arena.fighters[1].respawn = 1.2;
+      let threw = null;
+      try { drawArena3D(); } catch (e) { threw = e && e.message; }
+      ok("and renders with a fighter down", !threw, threw || "");
+    }
+    // And with projectiles and impact effects live.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      fireShot(game.arena.fighters[0]);
+      game.arena.hitFx.push({ x: 0, y: 40, z: 0, life: 0.2 });
+      let threw = null;
+      try { drawArena3D(); } catch (e) { threw = e && e.message; }
+      ok("and renders with shots and impacts in flight", !threw, threw || "");
+    }
+    // And from a camera jammed into a corner, where faces straddle the near plane.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      const f = game.arena.fighters[0];
+      f.x = ARENA_HW - FIGHTER_R; f.z = ARENA_HD - FIGHTER_R; f.yaw = -Math.PI * 0.75;
+      f.pitch = PITCH_MAX;
+      updateArenaCameras();
+      let threw = null;
+      try { drawArena3D(); } catch (e) { threw = e && e.message; }
+      ok("and renders from a camera crammed into a corner", !threw, threw || "");
+    }
+
+    // The world batch must actually paint geometry, not silently cull it all.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      const view = makeView(0, 0, W, H);
+      const r = drawArenaWorld(game.arena.cam[0], view, ARENA[MODE.ARENA3D]);
+      ok("the world pass paints a substantial number of faces", r.painted > 20,
+         `${r.painted} faces`);
+    }
+
+    // The HUD must report the seat it was asked for, not always seat 0.
+    {
+      game.cpu = [false, false];
+      startMatch();
+      game.arena.frags = [3, 1];
+      game.arena.fighters[1].hp = 45;
+      const view = makeView(0, H / 2, W, H / 2);
+      const all = capturePaint(() => drawArenaHUD(1, view)).strings.join(" | ");
+      ok("the HUD shows the requested seat's health", all.includes("45"), all);
+      ok("and its frag count from that seat's point of view",
+         all.includes("1 — 3"), all);
+      const all0 = capturePaint(() => drawArenaHUD(0, makeView(0, 0, W, H / 2)))
+        .strings.join(" | ");
+      ok("and the other seat sees the score the other way round",
+         all0.includes("3 — 1"), all0);
+    }
+    // A downed fighter's HUD says so, and counts down.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      game.arena.fighters[0].dead = true;
+      game.arena.fighters[0].respawn = 1.5;
+      const all = capturePaint(() => drawArenaHUD(0, makeView(0, 0, W, H)))
+        .strings.join(" | ");
+      ok("a downed player is told so", all.includes("DOWN"), all);
+      ok("and told when they return", /respawning in 1\.5s/.test(all), all);
+    }
+    // The scoreboard shows frags and the target.
+    {
+      game.cpu = [false, true];
+      game.goalsToWin = 7;
+      startMatch();
+      game.arena.frags = [2, 5];
+      const all = capturePaint(() => drawArenaScoreboard()).strings.join(" | ");
+      ok("the scoreboard shows both frag counts",
+         all.includes("2") && all.includes("5"), all);
+      ok("and the target to win", all.includes("FIRST TO 7"), all);
+    }
+
+    // Pausing a 3D match must show the arena behind the overlay, not a pitch.
+    {
+      game.cpu = [false, true];
+      startMatch();
+      openPause();
+      let threw = null;
+      try { drawPause(); } catch (e) { threw = e && e.message; }
+      ok("the pause overlay renders over a 3D match", !threw, threw || "");
+      game.scene = SCENE.ARENA3D;
+      game.pauseFrom = null;
+    }
+
+    // Colour helpers must stay in range and stay valid hex.
+    {
+      ok("shiftHex lightens and darkens within range",
+         /^#[0-9a-f]{6}$/.test(shiftHex("#37414f", 26)) &&
+         /^#[0-9a-f]{6}$/.test(shiftHex("#37414f", -26)));
+      ok("and clamps rather than wrapping",
+         shiftHex("#ffffff", 40) === "#ffffff" && shiftHex("#000000", -40) === "#000000");
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
     game.particles = [];
   }
 
