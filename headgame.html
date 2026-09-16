@@ -3627,10 +3627,13 @@ function finishMatch(winner, byTime) {
   game.timer = 0;
   /*
     Every route out of a match passes through here, so this is the one place that
-    can guarantee the 3D mode's pointer lock is released — whether the match ended
-    on frags, on the clock, or on a tournament tie being resolved.
+    can guarantee the 3D mode is fully torn down — whether the match ended on
+    frags, on the clock, or on a tournament tie being resolved. Clearing the
+    arena here rather than at each call site is what stops a match that ended on
+    time from leaving a live fighter behind for the next scene to render.
   */
   releaseArenaLock();
+  game.arena = null;
   // A guest is only mirroring the host's world; the host records the result so
   // the same match is not counted twice on one machine.
   if (!netIsGuest()) recordResult(winner, game.score);
@@ -6512,7 +6515,11 @@ function makeFighter(seat, team) {
  * unfair, so the spawn is chosen by distance rather than at random.
  */
 function respawnFighter(f) {
-  const foe = game.arena.fighters.find((o) => o.seat !== f.seat);
+  // A fighter can be mid-respawn when the match ends; without the arena there is
+  // no opponent to spawn away from, so any spawn will do.
+  const foe = game.arena
+    ? game.arena.fighters.find((o) => o.seat !== f.seat)
+    : null;
   const spawns = arenaSpawns();
   let best = spawns[0], bestD = -1;
   for (const s of spawns) {
@@ -6580,6 +6587,13 @@ function endArena3D() {
  * exact for axis-aligned boxes, and it needs no square roots.
  */
 function segmentHitsCover(a, b, pad = 0) {
+  /*
+    A frag can end the match — and tear the arena down — part-way through a step
+    that still has projectiles and a bot decision left to resolve. Treating a
+    torn-down arena as "nothing to hit" is correct: there is no world left to
+    collide with, and the alternative is a crash on the winning shot.
+  */
+  if (!game.arena) return false;
   const d = v3sub(b, a);
   for (const c of game.arena.cover) {
     const lo = [c.x - c.hw - pad, c.y - c.hh - pad, c.z - c.hd - pad];
@@ -6664,7 +6678,7 @@ function outsideArena(p) {
    outside a user gesture), because aim also has key bindings.
 */
 
-const mouse = { dx: 0, dy: 0, locked: false, wantLock: false };
+const mouse = { dx: 0, dy: 0, locked: false, wantLock: false, fireHeld: false };
 
 /** True when this environment can lock the pointer at all. */
 const pointerLockSupported = () =>
@@ -6889,7 +6903,9 @@ function aimRay(f) {
 
 /** Fire, if the cooldown allows. Returns true when a shot was created. */
 function fireShot(f) {
-  if (f.dead || f.fireCD > 0) return false;
+  // The arena can be torn down mid-step by a winning frag; a queued fire request
+  // from the same step must then simply do nothing.
+  if (!game.arena || f.dead || f.fireCD > 0) return false;
   const dir = aimRay(f);
   const eye = fighterEye(f);
   game.arena.shots.push({
@@ -6953,7 +6969,7 @@ function shotVsFighter(s, f, dt) {
  * victim. Returns true when this hit was fatal.
  */
 function applyDamage(f, dmg, bySeat) {
-  if (f.dead) return false;
+  if (!game.arena || f.dead) return false;
   f.hp -= dmg;
   f.hurt = 0.25;
   if (f.hp > 0) return false;
@@ -6983,14 +6999,16 @@ function arenaFrag(killer, victim) {
   game.arena.hitFx.push({ x: victim.x, y: victim.y + EYE_H, z: victim.z, life: 0.6 });
 
   if (game.arena.frags[killer.seat] >= game.goalsToWin) {
+    // finishMatch tears the arena down and releases the mouse for every exit
+    // path, so there is nothing more to do here.
     finishMatch(killer.seat, false);
-    endArena3D();
   }
 }
 
 /** Advance every projectile, resolving hits and expiry. */
 function stepShots(dt) {
   const A = game.arena;
+  if (!A) return;
   for (let i = A.shots.length - 1; i >= 0; i--) {
     const s = A.shots[i];
     s.life -= dt;
@@ -7007,7 +7025,12 @@ function stepShots(dt) {
         break;
       }
     }
-    if (done) { A.shots.splice(i, 1); continue; }
+    /*
+      A hit may have been the winning frag, which ends the match and clears
+      game.arena. `A` is still a valid object to finish tidying, but nothing
+      further should be simulated.
+    */
+    if (done) { A.shots.splice(i, 1); if (!game.arena) return; continue; }
 
     s.x += s.vx * dt;
     s.y += s.vy * dt;
@@ -7025,6 +7048,166 @@ function stepShots(dt) {
     A.hitFx[i].life -= dt;
     if (A.hitFx[i].life <= 0) A.hitFx.splice(i, 1);
   }
+}
+
+/* ---- the bot --------------------------------------------------------- */
+
+/**
+ * Decide what a CPU-driven fighter wants, and write it into that seat's intent.
+ *
+ * Reuses CPU_LEVELS — the same easy/medium/hard tuning the 2D game uses — so the
+ * menu's difficulty row means the same thing in both halves of the game:
+ *   react  how long it takes to respond to a new situation
+ *   err    how far off its aim is
+ *   aggr   how willing it is to close distance
+ *   idle   how often it simply does nothing
+ *   speed  a cap on how much of its movement it actually uses
+ */
+function updateArenaCPU(f, dt) {
+  const a = intent[f.seat];
+  const lvl = cpuCfg();
+  const foe = game.arena && game.arena.fighters.find((o) => o.seat !== f.seat);
+
+  a.left = a.right = a.up = a.down = false;
+  a.jump = false;
+  a.dashEdge = false;
+  a.aimX = 0;
+  a.aimY = 0;
+  // No arena means the match just ended: the bot has nothing left to decide.
+  if (!game.arena || f.dead || !foe) return;
+
+  if (!f.ai) f.ai = { think: 0, strafe: 1, jumpT: 0, fire: false };
+  const ai = f.ai;
+
+  // Re-decide only every `react` seconds: a bot that re-evaluates every substep
+  // reacts inhumanly fast and jitters between choices.
+  ai.think -= dt;
+  if (ai.think <= 0) {
+    ai.think = lvl.react;
+    if (Math.random() < 0.25) ai.strafe = -ai.strafe;
+    ai.idle = Math.random() < lvl.idle;
+  }
+
+  const toFoe = v3sub(v3(foe.x, foe.y + EYE_H, foe.z), fighterEye(f));
+  const dist = Math.hypot(toFoe.x, toFoe.z);
+
+  /*
+    AIM. Turn toward the target at a bounded rate rather than snapping: a bot
+    that snaps is unbeatable and reads as cheating. `err` offsets where it thinks
+    the target is, so an easy bot misses honestly rather than by being slowed.
+  */
+  const wantYaw = Math.atan2(toFoe.x, toFoe.z);
+  const wantPitch = Math.atan2(toFoe.y, Math.max(1, dist));
+  // Shortest way round the circle, so it never turns the long way about.
+  let dYaw = wantYaw - f.yaw;
+  while (dYaw > Math.PI) dYaw -= Math.PI * 2;
+  while (dYaw < -Math.PI) dYaw += Math.PI * 2;
+  const errRad = (lvl.err / 600) * (Math.sin(performance.now() / 700 + f.seat) );
+  const turn = STICK_SENS * (0.6 + lvl.aggr) * dt;
+  a.aimX = clamp(dYaw + errRad, -turn, turn);
+  a.aimY = clamp(wantPitch - f.pitch, -turn, turn);
+
+  if (ai.idle) return;                       // a beat of doing nothing
+
+  // MOVEMENT. Close when far, strafe when comfortable, back off when crowded.
+  const wantDist = 260 - lvl.aggr * 90;
+  if (dist > wantDist + 70) a.up = true;
+  else if (dist < wantDist - 90) a.down = true;
+  if (ai.strafe > 0) a.right = true; else a.left = true;
+
+  // Speed is scaled by using the movement keys only part of the time, which is
+  // how the 2D CPU is throttled too — the physics stays identical for everyone.
+  if (Math.random() > lvl.speed) { a.up = a.down = a.left = a.right = false; }
+
+  // Hop over a crate it has walked into, and occasionally to be less predictable.
+  if (f.onGround && (Math.random() < lvl.jump * dt * 2.2)) a.jump = true;
+  // Dash to close a long gap, if the level is aggressive enough to bother.
+  if (dist > 420 && f.dashCD <= 0 && Math.random() < lvl.aggr * dt * 2) {
+    a.dashEdge = true;
+  }
+
+  /*
+    FIRE only with a genuinely clear shot: aimed close enough, and no cover in
+    the way. Shooting a crate would be free damage to nobody and makes the bot
+    look blind.
+  */
+  const aimed = Math.abs(dYaw) < 0.14 + (1 - lvl.aggr) * 0.1;
+  const clear = !segmentHitsCover(fighterEye(f), v3(foe.x, foe.y + EYE_H, foe.z));
+  if (aimed && clear && f.fireCD <= 0 && !foe.dead) fireShot(f);
+}
+
+/**
+ * One simulation step of the 3D arena.
+ *
+ * Mirrors the shape of the PLAY case: CPU seats fill their own intent, every
+ * seat's intent then drives its fighter, world state advances, and the clock is
+ * checked last so a frag scored on the final tick still counts.
+ */
+function stepArena3D(dt) {
+  const A = game.arena;
+  if (!A) return;
+
+  for (let i = 0; i < 2; i++) {
+    if (game.cpu[i]) updateArenaCPU(A.fighters[i], dt);
+  }
+
+  // Fire, for any human seat asking to. Bots fire from inside their own
+  // decision function, where they can check they have a clear shot.
+  for (let i = 0; i < 2; i++) {
+    if (game.cpu[i]) continue;
+    const a = intent[i];
+    // The mouse button is an alternative to the kick key, not a replacement:
+    // a player using the aim keys still needs a way to shoot.
+    const wants = a.kickEdge || a.kick ||
+                  (mouse.fireHeld && i === arenaMouseSeat());
+    if (wants) fireShot(A.fighters[i]);
+  }
+
+  for (let i = 0; i < 2; i++) stepFighter(A.fighters[i], intent[i], dt);
+
+  // Fighters must not stand inside each other, or two players can occupy the
+  // same spot and neither can tell who is where.
+  separateFighters(A.fighters[0], A.fighters[1]);
+
+  stepShots(dt);
+  /*
+    A frag may have ended the match inside stepShots, which tears the arena down.
+    Everything after this point would be operating on state that no longer
+    exists, so stop here.
+  */
+  if (!game.arena) return;
+
+  updateArenaCameras();
+
+  if (game.matchSecs > 0 || game.suddenDeath) {
+    game.clock -= dt;
+    if (game.clock <= 0) { game.clock = 0; timeExpired(); }
+  }
+}
+
+/**
+ * Push two fighters apart if they overlap.
+ *
+ * Split evenly between them, so neither can shove the other around by walking
+ * into them — a heavier-feeling push would need masses, and a deathmatch reads
+ * better when bodies simply cannot interpenetrate.
+ */
+function separateFighters(a, b) {
+  if (!a || !b || a.dead || b.dead) return;
+  const dx = b.x - a.x, dz = b.z - a.z;
+  // Vertical clearance means one is standing on the other's head: leave it.
+  if (Math.abs(b.y - a.y) >= FIGHTER_H * 0.8) return;
+  const d = Math.hypot(dx, dz);
+  const min = FIGHTER_R * 2;
+  if (d >= min) return;
+  // Exactly coincident: pick an arbitrary axis rather than dividing by zero.
+  const nx = d > 1e-6 ? dx / d : 1;
+  const nz = d > 1e-6 ? dz / d : 0;
+  const push = (min - d) / 2;
+  a.x -= nx * push; a.z -= nz * push;
+  b.x += nx * push; b.z += nz * push;
+  arenaBounds(a);
+  arenaBounds(b);
 }
 
 function step(dt) {
@@ -7113,6 +7296,10 @@ function step(dt) {
 
     case SCENE.SELECT:
       updateSelect(dt);
+      break;
+
+    case SCENE.ARENA3D:
+      stepArena3D(dt);
       break;
 
     case SCENE.COUNTDOWN:
@@ -11117,6 +11304,7 @@ const PHYS = {
   arenaMouseSeat,
   drawArena3D, drawArenaWorld, drawFighterBillboard, drawArenaHUD, arenaViews,
   drawArenaSky, drawArenaScoreboard, arenaFloorFaces, arenaWallFaces, shiftHex,
+  updateArenaCPU, stepArena3D, separateFighters,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
@@ -20619,6 +20807,272 @@ function runTests() {
     }
 
     endArena3D();
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 24m. The bot, the scene step, and a match played end to end.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, score: [...game.score], winner: game.winner,
+                    goalsToWin: game.goalsToWin, clock: game.clock,
+                    matchSecs: game.matchSecs, cpuLevel: game.cpuLevel,
+                    timeIdx: game.timeIdx };
+    game.mode = MODE.ARENA3D;
+    game.sel = [0, 3];
+    game.cpu = [false, true];
+
+    const clearIntent = () => {
+      for (const a of intent) {
+        a.left = a.right = a.up = a.down = a.kick = a.kickEdge = a.wallEdge = false;
+        a.aimX = a.aimY = 0;
+        a.jump = a.dashEdge = false;
+      }
+    };
+
+    // The bot turns toward its target rather than snapping to it.
+    {
+      startMatch();
+      const [me, bot] = game.arena.fighters;
+      me.x = 0; me.z = 0;
+      bot.x = 0; bot.z = 400; bot.yaw = 0;      // facing away from the target
+      clearIntent();
+      updateArenaCPU(bot, DT);
+      const a = intent[1];
+      ok("the bot turns toward its target", Math.abs(a.aimX) > 0);
+      ok("but only at a bounded rate, never snapping",
+         Math.abs(a.aimX) <= STICK_SENS * 2 * DT + 1e-9, `${a.aimX}`);
+    }
+
+    // The bot closes a long gap and does not crowd a short one.
+    {
+      startMatch();
+      const [me, bot] = game.arena.fighters;
+      game.cpuLevel = 2;                        // hard: most willing to close
+      me.x = 0; me.z = 0;
+      bot.x = 0; bot.z = 480;
+      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
+      // Averaged over many decisions, since idle beats and speed throttling are
+      // deliberately random — a single sample would be a coin toss.
+      let approach = 0, retreat = 0;
+      for (let i = 0; i < 400; i++) {
+        bot.ai = null;
+        clearIntent();
+        updateArenaCPU(bot, DT);
+        if (intent[1].up) approach++;
+        if (intent[1].down) retreat++;
+      }
+      ok("the bot moves in to engage when far away", approach > retreat,
+         `${approach} approach vs ${retreat} retreat`);
+
+      // Now put them nose to nose: it should back off, not push closer.
+      // Well inside the retreat threshold (wantDist - 90), since between the two
+      // thresholds the bot deliberately holds its ground and only strafes.
+      me.z = 480 - 60;
+      let approach2 = 0, retreat2 = 0;
+      for (let i = 0; i < 400; i++) {
+        bot.ai = null;
+        clearIntent();
+        updateArenaCPU(bot, DT);
+        if (intent[1].up) approach2++;
+        if (intent[1].down) retreat2++;
+      }
+      ok("and backs off when crowded", retreat2 > approach2,
+         `${approach2} approach vs ${retreat2} retreat`);
+      ok("and strafes while it fights",
+         (() => {
+           let s = 0;
+           for (let i = 0; i < 200; i++) {
+             bot.ai = null; clearIntent(); updateArenaCPU(bot, DT);
+             if (intent[1].left || intent[1].right) s++;
+           }
+           return s > 100;
+         })());
+    }
+
+    // The bot only shoots with a clear line: never through cover.
+    {
+      startMatch();
+      const [me, bot] = game.arena.fighters;
+      game.cpuLevel = 2;
+      // Directly across the centre pillar from each other.
+      me.x = 0; me.z = -300;
+      bot.x = 0; bot.z = 300;
+      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
+      bot.pitch = 0;
+      game.arena.shots.length = 0;
+      for (let i = 0; i < 200; i++) { bot.fireCD = 0; clearIntent(); updateArenaCPU(bot, DT); }
+      ok("the bot does not shoot through cover", game.arena.shots.length === 0,
+         `${game.arena.shots.length} shots`);
+
+      // Remove the cover and it should open fire.
+      game.arena.cover = [];
+      bot.yaw = Math.atan2(me.x - bot.x, me.z - bot.z);
+      for (let i = 0; i < 200; i++) { bot.fireCD = 0; clearIntent(); updateArenaCPU(bot, DT); }
+      ok("but does shoot when the line is clear", game.arena.shots.length > 0,
+         `${game.arena.shots.length} shots`);
+    }
+    // A dead bot does nothing at all.
+    {
+      startMatch();
+      const bot = game.arena.fighters[1];
+      bot.dead = true;
+      game.arena.shots.length = 0;
+      clearIntent();
+      for (let i = 0; i < 50; i++) updateArenaCPU(bot, DT);
+      ok("a dead bot neither moves nor fires",
+         game.arena.shots.length === 0 && !intent[1].up && !intent[1].left &&
+         !intent[1].right && !intent[1].down && intent[1].aimX === 0);
+    }
+    // Harder levels react faster than easier ones, per CPU_LEVELS.
+    {
+      ok("a harder bot reacts faster than an easier one",
+         CPU_LEVELS[2].react < CPU_LEVELS[0].react);
+      ok("and is more willing to close the distance",
+         CPU_LEVELS[2].aggr > CPU_LEVELS[0].aggr);
+      ok("and aims more accurately",
+         CPU_LEVELS[2].err < CPU_LEVELS[0].err);
+    }
+
+    // Fighters cannot stand inside one another.
+    {
+      startMatch();
+      const [a, b] = game.arena.fighters;
+      a.x = 0; a.z = 0; a.y = 0;
+      b.x = 4; b.z = 0; b.y = 0;
+      separateFighters(a, b);
+      ok("overlapping fighters are pushed apart",
+         Math.hypot(b.x - a.x, b.z - a.z) >= FIGHTER_R * 2 - 1e-6,
+         `${Math.hypot(b.x - a.x, b.z - a.z).toFixed(2)}`);
+      // Exactly coincident must not produce NaN.
+      a.x = 100; a.z = 100; b.x = 100; b.z = 100;
+      separateFighters(a, b);
+      ok("and exactly coincident fighters do not become NaN",
+         [a.x, a.z, b.x, b.z].every(isFinite) &&
+         Math.hypot(b.x - a.x, b.z - a.z) > 1);
+    }
+
+    // The scene step runs without throwing, and is deterministic.
+    {
+      /** Play `secs` of arena from a fixed start and fingerprint the result. */
+      const play = (secs) => {
+        game.mode = MODE.ARENA3D;
+        game.cpu = [false, false];        // no bots: bots use Math.random
+        game.sel = [0, 3];
+        game.goalsToWin = 9;
+        // Untimed, so the clock cannot end the run. startMatch derives matchSecs
+        // from timeIdx, so the index is what must be set — index 0 is "no limit".
+        game.timeIdx = 0;
+        startMatch();
+        const [a, b] = game.arena.fighters;
+        a.x = -200; a.z = -200; a.yaw = 0.6;
+        b.x = 200; b.z = 200; b.yaw = -2.2;
+        const n = Math.round(secs / DT);
+        for (let i = 0; i < n; i++) {
+          // A fixed, reproducible input pattern for both seats.
+          for (let s = 0; s < 2; s++) {
+            const a2 = intent[s];
+            a2.up = (i + s * 7) % 5 < 3;
+            a2.left = (i + s) % 11 === 0;
+            a2.right = (i + s) % 13 === 0;
+            a2.jump = (i + s * 3) % 97 === 0;
+            a2.dashEdge = (i + s * 5) % 211 === 0;
+            a2.kick = (i + s * 9) % 41 === 0;
+            a2.kickEdge = false;
+            a2.aimX = ((i % 7) - 3) * 0.004;
+            a2.aimY = ((i % 5) - 2) * 0.003;
+          }
+          stepArena3D(DT);
+          if (!game.arena) break;
+        }
+        const A = game.arena;
+        if (!A) return "ended";
+        return A.fighters.map((f) =>
+          [f.x, f.y, f.z, f.vx, f.vy, f.vz, f.yaw, f.pitch, f.hp]
+            .map((v) => v.toFixed(6)).join(",")).join("|") +
+          `#${A.frags.join("-")}`;
+      };
+
+      let threw = null;
+      let first = null;
+      try { first = play(4); } catch (e) { threw = e && e.message; }
+      ok("the 3D scene steps without throwing", !threw, threw || "");
+      ok("and the 3D simulation is deterministic", first === play(4),
+         `${String(first).slice(0, 60)}`);
+      ok("and it produced a finite world",
+         !/NaN|Infinity/.test(String(first)), String(first).slice(0, 80));
+    }
+
+    // A full match against a bot must reach a winner and clean up after itself.
+    {
+      game.mode = MODE.ARENA3D;
+      game.cpu = [false, true];
+      game.cpuLevel = 2;
+      game.sel = [0, 3];
+      game.goalsToWin = 2;
+      game.timeIdx = 0;                   // untimed: the frag target must end it
+      startMatch();
+      clearIntent();
+
+      let guard = 0;
+      // Drive the human seat to fire constantly; the bot fights back.
+      while (game.scene === SCENE.ARENA3D && guard++ < 120000) {
+        const A = game.arena;
+        if (!A) break;
+        const me = A.fighters[0], foe = A.fighters[1];
+        // Aim at the opponent and hold the trigger.
+        me.yaw = Math.atan2(foe.x - me.x, foe.z - me.z);
+        me.pitch = 0;
+        A.cover.length = 0;               // a clear duel, so it resolves
+        intent[0].kick = true;
+        me.fireCD = 0;
+        stepArena3D(DT);
+      }
+      ok("a full 3D match reaches a winner", game.scene === SCENE.WIN,
+         `${game.scene} after ${guard} steps`);
+      ok("and names a real winner", game.winner === 0 || game.winner === 1,
+         `${game.winner}`);
+      ok("and tears the arena down when it ends", game.arena === null);
+      ok("and released the mouse", !mouse.locked && !mouse.wantLock);
+      /*
+        The win screen must render after a 3D match. It used to be reachable with
+        game.arena still populated when the match ended on the clock, which left
+        a live 3D world behind a 2D scene.
+      */
+      ok("and the win screen renders afterwards",
+         (() => { try { draw(); return true; } catch (e) { return false; } })());
+    }
+
+    // Time expiry must also end a 3D match, with the frag leader winning.
+    {
+      game.mode = MODE.ARENA3D;
+      game.cpu = [false, true];
+      game.sel = [0, 3];
+      game.goalsToWin = 99;
+      /*
+        The clock comes from TIME_OPTIONS[timeIdx] — startMatch sets matchSecs
+        from it, so setting matchSecs directly here would simply be overwritten.
+        Index 1 is the shortest real time limit.
+      */
+      game.timeIdx = 1;
+      startMatch();
+      ok("a timed 3D match starts with a clock",
+         game.clock > 0 && game.matchSecs === TIME_OPTIONS[1],
+         `clock ${game.clock} secs ${game.matchSecs}`);
+      game.arena.frags = [1, 4];
+      game.score = [1, 4];
+      game.clock = 0.05;                  // wind it down rather than simulating a minute
+      clearIntent();
+      let guard = 0;
+      while (game.scene === SCENE.ARENA3D && guard++ < 1000) stepArena3D(DT);
+      ok("a timed 3D match ends when the clock runs out",
+         game.scene === SCENE.WIN, `${game.scene}`);
+      ok("and the frag leader wins on time", game.winner === 1, `${game.winner}`);
+      ok("and the arena is gone afterwards", game.arena === null);
+    }
+
+    clearIntent();
     Object.assign(game, saved);
     game.particles = [];
   }
