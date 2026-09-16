@@ -25,6 +25,7 @@ const ctxStub = new Proxy({}, {
 });
 
 const store = new Map();
+const WebSocketSpy = { made: [], throwOnConstruct: false };
 const sandbox = {
   console,
   performance: { now: () => Date.now() },
@@ -53,6 +54,29 @@ const sandbox = {
   },
   navigator: { getGamepads: () => [] },
   btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+  /*
+    A scriptable WebSocket. The relay transport is driven entirely through this,
+    so the address parsing, control messages and channel shim are all testable
+    without a real socket or a real server.
+  */
+  WebSocket: class {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      this.onopen = this.onclose = this.onerror = this.onmessage = null;
+      WebSocketSpy.made.push(this);
+      if (WebSocketSpy.throwOnConstruct) throw new Error("bad url");
+    }
+    send(d) { this.sent.push(d); }
+    close() { this.readyState = 3; if (this.onclose) this.onclose(); }
+    /* Test helpers, not part of the browser API. */
+    _open() { this.readyState = 1; if (this.onopen) this.onopen(); }
+    _recv(obj) {
+      if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) });
+    }
+  },
+
   atob: (s) => Buffer.from(s, "base64").toString("binary"),
   RTCPeerConnection: class { constructor(){ this.localDescription=null; }
     createDataChannel(){ return { addEventListener(){}, send(){}, close(){} }; }
@@ -70,6 +94,7 @@ const sandbox = {
   Image: class { set src(v) { this._s = v; } },
   fetch: () => Promise.reject(new Error("no network in harness")),
 };
+sandbox.WebSocketSpy = WebSocketSpy;
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 
@@ -83,4 +108,4 @@ try {
 }
 
 // Exported so a probe script can reuse these stubs instead of duplicating them.
-module.exports = { sandbox, PHYS: sandbox.PHYS };
+module.exports = { sandbox, PHYS: sandbox.PHYS, WebSocketSpy };

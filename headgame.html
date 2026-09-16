@@ -2428,6 +2428,41 @@ addEventListener("keydown", (e) => {
     return;
   }
 
+  /*
+    RELAY TEXT ENTRY. The online screen lets you type a host address and a room
+    code, which needs the keyboard for characters an address contains — dots,
+    colons, slashes, dashes — rather than the letters-only name filter below.
+    Handled first, and it swallows the keyboard while active so typing "1.2.3.4"
+    is not also read as menu navigation.
+  */
+  if (net.editing) {
+    const field = net.editing;                 // "addr" | "code"
+    const cur = field === "addr" ? net.relayAddr : net.relayCode;
+    if (e.key === "Enter") {
+      net.editing = null;
+      net.relayGo = field;                     // consumed by updateOnline
+    } else if (e.key === "Escape") {
+      net.editing = null;
+    } else if (e.key === "Tab") {
+      // Tab moves between the two fields, as it would in any form.
+      net.editing = field === "addr" ? "code" : "addr";
+    } else if (e.key === "Backspace") {
+      const next = cur.slice(0, -1);
+      if (field === "addr") net.relayAddr = next; else net.relayCode = next;
+    } else if (e.key.length === 1 && cur.length < 120) {
+      // A code is four letters; an address may contain URL punctuation.
+      const ok2 = field === "code" ? /^[A-Za-z0-9]$/.test(e.key)
+                                   : /^[\w.:/\-[\]@]$/.test(e.key);
+      if (ok2) {
+        const ch = field === "code" ? e.key.toUpperCase() : e.key;
+        if (field === "addr") net.relayAddr += ch;
+        else if (net.relayCode.length < 4) net.relayCode += ch;
+      }
+    }
+    e.preventDefault();
+    return;
+  }
+
   if (game.editing >= 0) {
     const i = game.editing;
     if (e.key === "Enter" || e.key === "Escape") {
@@ -4814,6 +4849,205 @@ const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
 const NET_BEAT_HZ = 4;
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
+/*
+  RELAY (address-based multiplayer).
+
+  Copy-pasting a WebRTC offer code and then an answer code back is reliable but
+  laborious — two long strings, in opposite directions, before anyone plays. The
+  relay replaces that with an address: one player runs tools/relay.js, shares the
+  address it prints, and the other types it in. The relay hands out a short room
+  code and forwards messages between the two members of a room.
+
+  The relay carries the GAME PROTOCOL DIRECTLY rather than brokering a WebRTC
+  connection. It is one more hop, but it means no ICE, no NAT traversal and no
+  failure mode where the handshake completes and the media path silently does
+  not — which is the usual way peer-to-peer play fails for people behind awkward
+  routers. WebRTC remains available on the same screen for anyone who wants the
+  lower-latency direct path.
+
+  Local play over a LAN is a couple of milliseconds either way. Over a tunnel it
+  costs whatever the tunnel costs, which the snapshot interpolation already
+  smooths — the same machinery that hides ordinary jitter.
+*/
+const RELAY_PORT_DEFAULT = 8787;
+const RELAY_TIMEOUT = 10;        // seconds to wait for a room before giving up
+
+/**
+ * Turn whatever the player typed into a WebSocket URL.
+ *
+ * Accepts `1.2.3.4`, `1.2.3.4:9000`, `host:port`, or a full http(s)/ws(s) URL —
+ * because people will paste all of those, and refusing four of the five would
+ * read as the feature being broken.
+ */
+function relayUrl(input) {
+  let s = String(input || "").trim();
+  if (!s) return "";
+  // A full URL: swap the scheme for its WebSocket equivalent.
+  if (/^wss?:\/\//i.test(s)) return s;
+  if (/^https:\/\//i.test(s)) return s.replace(/^https:/i, "wss:");
+  if (/^http:\/\//i.test(s)) return s.replace(/^http:/i, "ws:");
+  // A bare host, with or without a port.
+  s = s.replace(/^\/+/, "").replace(/\/+$/, "");
+  /*
+    A hostname with no port gets the default. An address WITH a port keeps it.
+    Checked by counting colons so an IPv6 literal is not mangled — it is passed
+    through untouched and the player can bracket it themselves.
+  */
+  if (s.includes("[") || (s.match(/:/g) || []).length > 1) return `ws://${s}`;
+  if (/:\d+$/.test(s)) return `ws://${s}`;
+  // A tunnel hostname is almost certainly https, and plain ws to it would fail.
+  if (/\.(com|net|org|io|dev|app|sh|xyz|me|link|live|cloud|trycloudflare\.com)$/i.test(s)) {
+    return `wss://${s}`;
+  }
+  return `ws://${s}:${RELAY_PORT_DEFAULT}`;
+}
+
+/**
+ * A relay socket dressed up as an RTCDataChannel.
+ *
+ * netAttachChannel only needs onopen/onclose/onerror/onmessage and send(), so
+ * wrapping the WebSocket to that shape lets the entire existing protocol —
+ * hello, snapshots, intent, bracket sync — run over the relay unchanged. Not one
+ * line of game netcode had to learn about a second transport.
+ */
+function relayChannelShim(ws) {
+  const shim = {
+    binaryType: "arraybuffer",
+    onopen: null, onclose: null, onerror: null, onmessage: null,
+    get readyState() { return ws.readyState === 1 ? "open" : "closed"; },
+    send(data) {
+      // The relay forwards text; the game already sends JSON strings.
+      if (ws.readyState === 1) ws.send(data);
+    },
+    close() { try { ws.close(); } catch (e) { /* already gone */ } },
+  };
+  ws.onmessage = (e) => {
+    /*
+      Relay control messages are consumed here; everything else is game traffic
+      and is handed straight to the protocol. Splitting them by name rather than
+      by channel keeps the relay dumb.
+    */
+    let msg = null;
+    try { msg = JSON.parse(e.data); } catch (err) { /* not ours */ }
+    if (msg && typeof msg.t === "string" && RELAY_CONTROL.has(msg.t)) {
+      relayControl(msg);
+      return;
+    }
+    if (shim.onmessage) shim.onmessage(e);
+  };
+  ws.onclose = () => { if (shim.onclose) shim.onclose(); };
+  ws.onerror = () => { if (shim.onerror) shim.onerror(); };
+  return shim;
+}
+
+/** Message names the relay itself uses. Everything else is game traffic. */
+const RELAY_CONTROL = new Set([
+  "hosting", "joined", "peer-joined", "peer-left", "no-room", "room-full", "expired",
+]);
+
+/** Handle one relay control message. */
+function relayControl(msg) {
+  switch (msg.t) {
+    case "hosting":
+      // The room exists; show the code for the other player to type.
+      net.relayCode = msg.code;
+      net.state = "offer";
+      net.error = "";
+      break;
+    case "joined":
+      net.relayCode = msg.code;
+      net.state = "connecting";
+      net.error = "";
+      break;
+    case "peer-joined":
+      /*
+        The guest has arrived. Both sides are now connected to the relay, so the
+        channel is live and the ordinary handshake can begin — the host announces
+        itself exactly as it would over WebRTC.
+      */
+      net.state = "live";
+      net.active = true;
+      net.lastRecv = 0;
+      netSendHello();
+      break;
+    case "peer-left":
+      net.error = msg.why || "the other player left";
+      net.state = "closed";
+      net.active = false;
+      break;
+    case "no-room":
+      net.error = `no game found with code ${msg.code}`;
+      net.state = "failed";
+      break;
+    case "room-full":
+      net.error = `game ${msg.code} already has two players`;
+      net.state = "failed";
+      break;
+    case "expired":
+      net.error = "the room expired";
+      net.state = "failed";
+      break;
+    default:
+      break;
+  }
+}
+
+/** Open a WebSocket to the relay, or report why not. */
+function relayConnect(address, onOpen) {
+  const url = relayUrl(address);
+  if (!url) { net.error = "enter the host's address"; net.state = "failed"; return null; }
+  // Remember what was typed, so a retry after a failure does not need it again.
+  net.relayAddr = String(address || "").trim();
+  net.relayUrl = url;
+  net.state = "creating";
+  net.error = "";
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    net.error = "bad address: " + e.message;
+    net.state = "failed";
+    return null;
+  }
+  net.ws = ws;
+  net.transport = "relay";
+  const shim = relayChannelShim(ws);
+  ws.onopen = () => {
+    /*
+      The socket is up, but the GAME is not connected until a peer joins the room.
+      netAttachChannel's onopen is therefore deliberately not fired here — it is
+      fired by the "peer-joined" control message, so `net.state` never claims a
+      live match with nobody on the other end.
+    */
+    net.error = "";
+    onOpen(ws);
+  };
+  netAttachChannel(shim);
+  // Suppress the shim's own onopen: liveness is decided by the relay's messages.
+  shim.onopen = null;
+  return ws;
+}
+
+/** HOST over the relay: open a room and publish its code. */
+function relayHost(address) {
+  netReset();
+  net.role = "host";
+  net.localSeat = 0;
+  net.remoteSeat = 1;
+  relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "host" })));
+}
+
+/** JOIN over the relay: connect and ask for a room by code. */
+function relayJoin(address, code) {
+  netReset();
+  net.role = "guest";
+  net.localSeat = 1;
+  net.remoteSeat = 0;
+  const room = String(code || "").toUpperCase().trim();
+  if (!room) { net.error = "enter the 4-letter game code"; net.state = "failed"; return; }
+  relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "join", code: room })));
+}
+
 const net = {
   active: false,          // an online match is running
   role: null,             // "host" | "guest"
@@ -4842,6 +5076,21 @@ const net = {
   spectating: false,     // guest watching a tie it is not playing
   peerVersion: "",       // the other machine's build, from its hello
   versionMismatch: false,// true once a differing peer version is seen
+
+  /*
+    RELAY transport. "webrtc" is the original copy-a-code path; "relay" connects
+    by address through tools/relay.js. Both drive the same protocol, so nothing
+    downstream of netAttachChannel knows which is in use.
+  */
+  transport: "webrtc",   // "webrtc" | "relay"
+  ws: null,              // the relay WebSocket, when transport === "relay"
+  relayAddr: "",         // what the player typed as the host's address
+  relayCode: "",         // the 4-letter room code
+  relayUrl: "",          // the resolved ws:// or wss:// URL
+  relayWait: 0,          // seconds spent waiting for a room
+  editing: null,         // "addr" | "code" while a relay field has the keyboard
+  relayGo: null,         // set by ENTER in a field, consumed by updateOnline
+  relayIntent: null,     // "host" | "join" — what the typed address is for
 
   /*
     THE HUB. A tournament can seat up to TOURN_MAX humans, each on their own
@@ -4873,6 +5122,8 @@ const netIsGuest = () => net.active && net.role === "guest";
 function netReset() {
   try { if (net.chan) net.chan.close(); } catch (e) { /* already gone */ }
   try { if (net.pc) net.pc.close(); } catch (e) { /* already gone */ }
+  // The relay socket too, or a reset leaves the old room still forwarding.
+  try { if (net.ws) net.ws.close(); } catch (e) { /* already gone */ }
   // Every hub connection goes too, or a stale peer keeps receiving snapshots.
   for (const p of net.peers) {
     try { if (p.chan) p.chan.close(); } catch (e) { /* already gone */ }
@@ -4908,6 +5159,13 @@ function netReset() {
   net.snapGap = 1 / NET_SNAP_HZ;
   net.snapAt = 0;
   net.copied = false;
+  net.ws = null;
+  net.transport = "webrtc";
+  net.relayCode = "";
+  net.relayUrl = "";
+  net.relayWait = 0;
+  // net.relayAddr is deliberately KEPT: it is what the player typed, and having
+  // to retype the host's address after every failed attempt is needless friction.
 }
 
 /*
@@ -6417,9 +6675,43 @@ function updateMenu(dt) {
 function updateOnline(dt) {
   if (hit("Escape")) { escUsed = true; netReset(); game.scene = SCENE.MENU; return; }
 
+  /*
+    RELAY entry. A field having the keyboard means ENTER submits it, so the two
+    address-based actions are driven from here rather than from a hotkey the
+    player would have to know about while typing.
+  */
+  if (net.relayGo) {
+    const which = net.relayGo;
+    net.relayGo = null;
+    if (net.relayIntent === "host") { relayHost(net.relayAddr); return; }
+    if (net.relayIntent === "join") {
+      // Address first, then the code: submitting the address moves the cursor on
+      // rather than trying to join a room the player has not named yet.
+      if (which === "addr" && !net.relayCode) { net.editing = "code"; return; }
+      relayJoin(net.relayAddr, net.relayCode);
+      return;
+    }
+  }
+  if (net.editing) return;               // the keyboard belongs to the field
+
   if (net.state === "idle" || net.state === "failed") {
     if (hit("KeyH")) { netHost(); return; }
     if (hit("KeyJ")) { net.state = "await-offer"; net.paste = ""; return; }
+    // A — host by address. S — join by address. Both use the relay.
+    if (hit("KeyA")) {
+      net.relayIntent = "host";
+      net.relayAddr = net.relayAddr || `localhost:${RELAY_PORT_DEFAULT}`;
+      net.editing = "addr";
+      net.error = "";
+      return;
+    }
+    if (hit("KeyS")) {
+      net.relayIntent = "join";
+      net.relayCode = "";
+      net.editing = "addr";
+      net.error = "";
+      return;
+    }
     // A lobby hosts a whole tournament rather than a single opponent.
     if (hit("KeyL")) {
       net.role = "host";
@@ -10792,7 +11084,9 @@ function drawOnline() {
 
   // Header.
   text("PLAY ONLINE", W / 2, 42, 28, "#ffffff", "center", 900);
-  text("connects the two browsers directly — no server, no accounts",
+  text(net.transport === "relay"
+         ? "connected through your own relay — no accounts, nothing stored"
+         : "connect by address, or paste codes for a direct link",
        W / 2, 66, 11, "#8fa3c0", "center", 600);
 
   // ---- step rail: shows exactly where you are in the handshake ----------
@@ -10805,7 +11099,8 @@ function drawOnline() {
   } else if (net.role === "guest") {
     stage = net.state === "await-offer" ? 0 : net.state === "answer" ? 1 : net.state === "live" ? 2 : 0;
   }
-  if (net.role) {
+  // The rail describes the two-code handshake, which the relay does not have.
+  if (net.role && net.transport !== "relay") {
     const rw = 150, gap = 16, totalW = steps.length * rw + (steps.length - 1) * gap;
     let rx = (W - totalW) / 2;
     for (let i = 0; i < steps.length; i++) {
@@ -10887,35 +11182,106 @@ function drawOnline() {
 
   // ---- role picker ------------------------------------------------------
   if (net.state === "idle" || net.state === "failed") {
-    card(104, 270, "#7dd3fc");
-    text("Who are you?", W / 2, 134, 18, "#e8f1ff", "center", 800);
-
     const opt = (y, key, title, blurb, colour) => {
       ctx.fillStyle = "rgba(255,255,255,0.05)";
-      roundRect(bx + 24, y, bw - 48, 62, 9);
+      roundRect(bx + 24, y, bw - 48, 46, 9);
       ctx.fill();
       ctx.strokeStyle = colour;
       ctx.lineWidth = 1.5;
       ctx.stroke();
       ctx.fillStyle = colour;
-      roundRect(bx + 38, y + 15, 32, 32, 7);
+      roundRect(bx + 36, y + 8, 28, 28, 6);
       ctx.fill();
-      text(key, bx + 54, y + 31, 18, "#0b1220", "center", 900);
-      text(title, bx + 84, y + 24, 15, "#e8f1ff", "left", 800);
-      text(blurb, bx + 84, y + 44, 11, "#8fa3c0", "left", 600);
+      text(key, bx + 50, y + 22, 15, "#0b1220", "center", 900);
+      text(title, bx + 76, y + 17, 13, "#e8f1ff", "left", 800);
+      text(blurb, bx + 76, y + 34, 10, "#8fa3c0", "left", 600);
     };
-    opt(150, "H", "HOST a match", "one opponent — you run the game", "#4ade80");
-    opt(218, "L", "HOST a TOURNAMENT",
-        `up to ${TOURN_MAX} players, each on their own computer`, "#a78bfa");
-    opt(286, "J", "JOIN", "paste the code the host sends you", "#fbbf24");
+
+    /*
+      ADDRESS-BASED play is listed FIRST and described as the easy path, because
+      it is: one player runs the relay and reads out an address, rather than both
+      players copying long codes in opposite directions. The code-based WebRTC
+      flow stays below it for anyone who wants a direct connection.
+    */
+    if (net.editing || net.relayIntent) {
+      card(104, 250, "#4ade80");
+      const joining = net.relayIntent === "join";
+      text(joining ? "JOIN BY ADDRESS" : "HOST BY ADDRESS",
+           W / 2, 130, 18, "#4ade80", "center", 900);
+
+      const field = (y, label, value, name, hint) => {
+        const on = net.editing === name;
+        ctx.fillStyle = on ? "rgba(74,222,128,0.12)" : "rgba(0,0,0,0.35)";
+        roundRect(bx + 30, y, bw - 60, 40, 8);
+        ctx.fill();
+        ctx.strokeStyle = on ? "#4ade80" : "rgba(255,255,255,0.16)";
+        ctx.lineWidth = on ? 2.5 : 1.5;
+        ctx.stroke();
+        text(label, bx + 44, y + 13, 9, "#8fa3c0", "left", 800);
+        const shown = value || hint;
+        text(shown + (on ? "▌" : ""), bx + 44, y + 28, 13,
+             value ? "#ffffff" : "#5f7391", "left", 700);
+      };
+      field(152, "HOST ADDRESS", net.relayAddr, "addr", `localhost:${RELAY_PORT_DEFAULT}`);
+      if (joining) field(202, "GAME CODE", net.relayCode, "code", "ABCD");
+
+      const iy = joining ? 254 : 210;
+      if (!joining) {
+        text("start the relay first:", W / 2, iy, 11, "#cddcf2", "center", 700);
+        text("node tools/relay.js", W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
+        text("it prints the address to share", W / 2, iy + 36, 10, "#6b819e", "center", 600);
+      } else {
+        text("ask the host for their address and 4-letter code",
+             W / 2, iy, 11, "#cddcf2", "center", 700);
+      }
+      text("TAB switches field  ·  ENTER confirms  ·  ESC cancels",
+           W / 2, 336, 10, "#6b819e", "center", 600);
+    } else {
+      card(104, 292, "#7dd3fc");
+      text("How do you want to connect?", W / 2, 126, 16, "#e8f1ff", "center", 800);
+      text("BY ADDRESS — easiest", bx + 30, 148, 10, "#4ade80", "left", 900);
+      opt(156, "A", "HOST by address", "run the relay, share the address", "#4ade80");
+      opt(206, "S", "JOIN by address", "type the host's address and code", "#7dd3fc");
+      text("BY CODE — direct connection, no relay", bx + 30, 268, 10, "#fbbf24", "left", 900);
+      opt(276, "H", "HOST a match", "share a code, paste their reply", "#fbbf24");
+      opt(326, "J", "JOIN with a code", "paste the code the host sends", "#fb923c");
+      text(`L — host a tournament for up to ${TOURN_MAX} players`,
+           W / 2, 384, 10, "#a78bfa", "center", 700);
+    }
 
     text(`playing as ${cleanName(game.names[0], DEFAULT_NAMES[0])}`,
-         W / 2, 386, 12, "#7dd3fc", "center", 700);
-    text("change it on the setup screen · everyone needs this file open",
-         W / 2, 406, 11, "#6b819e", "center", 600);
+         W / 2, 410, 11, "#7dd3fc", "center", 700);
   }
 
-  if (net.state === "creating") {
+  /*
+    RELAY host: the address and code to read out. Deliberately large, because the
+    whole point is that it can be spoken aloud or messaged in one line.
+  */
+  if (net.transport === "relay" && net.role === "host" &&
+      (net.state === "offer" || net.state === "creating")) {
+    card(150, 210, "#4ade80");
+    if (net.relayCode) {
+      text("YOUR GAME IS OPEN", W / 2, 182, 15, "#4ade80", "center", 900);
+      text(net.relayCode, W / 2, 232, 58, "#ffffff", "center", 900);
+      text("the other player needs this code", W / 2, 272, 11, "#cddcf2", "center", 700);
+      text(`…and this address:  ${net.relayAddr}`, W / 2, 296, 12, "#a7f3d0", "center", 800);
+      text("waiting for them to join…", W / 2, 328, 11, "#7dd3fc", "center", 600);
+    } else {
+      text("connecting to the relay…", W / 2, 232, 16, "#7dd3fc", "center", 800);
+      text(net.relayUrl || net.relayAddr, W / 2, 256, 11, "#6b819e", "center", 600);
+    }
+  }
+  if (net.transport === "relay" && net.role === "guest" &&
+      (net.state === "creating" || net.state === "connecting")) {
+    card(170, 130, "#7dd3fc");
+    text(net.state === "creating" ? "connecting to the relay…" : "joining the game…",
+         W / 2, 216, 16, "#7dd3fc", "center", 800);
+    text(net.relayUrl, W / 2, 242, 11, "#6b819e", "center", 600);
+    if (net.relayCode) text(`code ${net.relayCode}`, W / 2, 262, 12, "#a7f3d0", "center", 800);
+  }
+
+  // The relay draws its own connecting panels above, so this is WebRTC only.
+  if (net.state === "creating" && net.transport !== "relay") {
     card(150, 110, "#7dd3fc");
     text("preparing connection…", W / 2, 196, 17, "#7dd3fc", "center", 800);
     text("gathering network candidates", W / 2, 220, 11, "#6b819e", "center", 600);
@@ -12628,6 +12994,9 @@ const PHYS = {
   netSendHello, netSendBracket, tieIsOnline, applyTieControl, updateRoster,
   drawRoster, drawOnline, nameField,
   netApplySnapshot, netHandle, encodeSignal, decodeSignal, netIsHost, netIsGuest,
+  // Relay transport: connect by address instead of pasting codes.
+  relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
+  RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
   basketScored, ballVsHoops, hoopPos, updateCPU, releaseCPUKeys, CPU_LEVELS,
   cpuCfg, menuRows, makeBall, HOOP_R, HOOP_Y, HOOP_X,
   ballVsNet, volleyGround, confineToHalf, netTop, rollChaos, resetChaos,
@@ -22724,6 +23093,209 @@ function runTests() {
     clearIntentAll();
     Object.assign(game, saved);
     game.particles = [];
+  }
+
+  /* ---------------------------------------------------------------------
+     RELAY TRANSPORT
+
+     Address-based multiplayer: one player runs tools/relay.js, the other types
+     the address. Tested through a scriptable WebSocket, so the parsing, the
+     control protocol and the channel shim are all exercised without a socket.
+     Skipped where the harness provides no WebSocket at all.
+     ------------------------------------------------------------------- */
+  if (typeof WebSocket === "function") {
+    // 25a. Address parsing. People will paste all of these shapes.
+    {
+      ok("a bare host gets the default port",
+         relayUrl("192.168.1.20") === `ws://192.168.1.20:${RELAY_PORT_DEFAULT}`,
+         relayUrl("192.168.1.20"));
+      ok("an explicit port is kept",
+         relayUrl("192.168.1.20:9000") === "ws://192.168.1.20:9000",
+         relayUrl("192.168.1.20:9000"));
+      ok("localhost works", relayUrl("localhost:8787") === "ws://localhost:8787");
+      ok("an http URL becomes ws",
+         relayUrl("http://box.local:8787") === "ws://box.local:8787");
+      ok("an https URL becomes wss, so a tunnel just works",
+         relayUrl("https://foo.trycloudflare.com") === "wss://foo.trycloudflare.com",
+         relayUrl("https://foo.trycloudflare.com"));
+      ok("a ws URL is passed through",
+         relayUrl("ws://1.2.3.4:5") === "ws://1.2.3.4:5");
+      ok("a wss URL is passed through",
+         relayUrl("wss://a.example/x") === "wss://a.example/x");
+      /*
+        A public hostname with no port is assumed to be a tunnel on https: plain
+        ws:// to it would be blocked or refused, which would look like the game
+        being broken rather than the address needing a scheme.
+      */
+      ok("a bare tunnel hostname is assumed to be wss",
+         relayUrl("nice-name.trycloudflare.com").startsWith("wss://"),
+         relayUrl("nice-name.trycloudflare.com"));
+      ok("trailing slashes are tolerated",
+         relayUrl("1.2.3.4:99/") === "ws://1.2.3.4:99",
+         relayUrl("1.2.3.4:99/"));
+      ok("an empty address yields nothing to connect to", relayUrl("  ") === "");
+      ok("and whitespace around a real address is trimmed",
+         relayUrl("  1.2.3.4:99  ") === "ws://1.2.3.4:99");
+    }
+
+    // 25b. Hosting: open a room, publish the code, go live when a peer joins.
+    {
+      const savedNet = { ...net };
+      WebSocketSpy.made.length = 0;
+
+      relayHost("localhost:8787");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ok("hosting by address opens a socket", !!ws, "no socket");
+      ok("to the resolved URL", ws.url === "ws://localhost:8787", ws.url);
+      ok("and this machine is the host on seat 0",
+         net.role === "host" && net.localSeat === 0 && net.remoteSeat === 1);
+      ok("and it reports the relay transport", net.transport === "relay");
+
+      ws._open();
+      ok("opening the socket asks the relay for a room",
+         ws.sent.length === 1 && JSON.parse(ws.sent[0]).t === "host",
+         ws.sent.join());
+      /*
+        The socket being open does NOT mean a match is live: nobody has joined
+        yet. Claiming "live" here was the bug this assertion exists to prevent.
+      */
+      ok("but an open socket alone is not a live match",
+         net.state !== "live" && !net.active, net.state);
+
+      ws._recv({ t: "hosting", code: "WXYZ" });
+      ok("the relay's code is shown to the player", net.relayCode === "WXYZ");
+      ok("and the host is waiting for someone", net.state === "offer", net.state);
+
+      ws._recv({ t: "peer-joined" });
+      ok("a peer joining makes the match live", net.state === "live" && net.active);
+      ok("and the host greets them immediately",
+         ws.sent.some((m) => { try { return JSON.parse(m).t === "hi"; }
+                              catch (e) { return false; } }),
+         ws.sent.join(" "));
+
+      ws._recv({ t: "peer-left", why: "they closed the tab" });
+      ok("the other player leaving ends the match",
+         net.state === "closed" && !net.active);
+      ok("and says why", /closed the tab/.test(net.error), net.error);
+
+      netReset();
+      Object.assign(net, savedNet);
+    }
+
+    // 25c. Joining: by address and code, including the ways it can fail.
+    {
+      const savedNet = { ...net };
+      WebSocketSpy.made.length = 0;
+
+      relayJoin("10.0.0.5:8787", "abcd");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ok("joining by address opens a socket", !!ws);
+      ok("and this machine is the guest on seat 1",
+         net.role === "guest" && net.localSeat === 1 && net.remoteSeat === 0);
+      ws._open();
+      const asked = JSON.parse(ws.sent[0]);
+      ok("it asks to join the room", asked.t === "join");
+      ok("with the code upper-cased, so typing case does not matter",
+         asked.code === "ABCD", asked.code);
+
+      ws._recv({ t: "joined", code: "ABCD" });
+      ok("being admitted moves it to connecting", net.state === "connecting");
+      ws._recv({ t: "peer-joined" });
+      ok("and the handshake makes it live", net.state === "live" && net.active);
+
+      // A wrong code must say so plainly.
+      netReset();
+      relayJoin("10.0.0.5:8787", "ZZZZ");
+      const ws2 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws2._open();
+      ws2._recv({ t: "no-room", code: "ZZZZ" });
+      ok("an unknown code fails with a readable message",
+         net.state === "failed" && /ZZZZ/.test(net.error), net.error);
+
+      netReset();
+      relayJoin("10.0.0.5:8787", "FULL");
+      const ws3 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws3._open();
+      ws3._recv({ t: "room-full", code: "FULL" });
+      ok("a full room fails with a readable message",
+         net.state === "failed" && /two players/.test(net.error), net.error);
+
+      netReset();
+      relayJoin("10.0.0.5:8787", "");
+      ok("joining without a code is refused before opening a socket",
+         net.state === "failed" && /code/.test(net.error), net.error);
+
+      netReset();
+      Object.assign(net, savedNet);
+    }
+
+    // 25d. The shim: game traffic reaches the protocol, control messages do not.
+    {
+      const savedNet = { ...net };
+      WebSocketSpy.made.length = 0;
+      relayHost("localhost:8787");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ws._recv({ t: "hosting", code: "QRST" });
+      ws._recv({ t: "peer-joined" });
+
+      // A control message must NOT be handed to the game protocol.
+      const before = net.peerVersion;
+      ws._recv({ t: "hosting", code: "OTHER" });
+      ok("a relay control message is consumed by the relay, not the game",
+         net.peerVersion === before);
+
+      // A game message MUST reach the protocol: a hello sets the peer version.
+      ws._recv({ t: "hi", n: "OTHER PLAYER", v: VERSION });
+      ok("a game message reaches the protocol through the relay",
+         net.peerVersion === VERSION, net.peerVersion);
+      ok("and the peer's name arrives with it",
+         game.remoteName === "OTHER PLAYER", `${game.remoteName}`);
+
+      // The two namespaces must not overlap, or a game message could be eaten.
+      const gameNames = ["hi", "s", "i", "cfg", "br", "me", "hb", "go"];
+      ok("no game message name collides with a relay control name",
+         gameNames.every((n) => !RELAY_CONTROL.has(n)),
+         gameNames.filter((n) => RELAY_CONTROL.has(n)).join());
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.remoteName = "";
+    }
+
+    // 25e. Failure and teardown must leave nothing behind.
+    {
+      const savedNet = { ...net };
+      WebSocketSpy.made.length = 0;
+
+      relayHost("localhost:8787");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ws._recv({ t: "hosting", code: "ABCD" });
+      netReset();
+      ok("resetting closes the relay socket", ws.readyState === 3);
+      ok("and clears the room code", net.relayCode === "");
+      ok("and returns to the default transport", net.transport === "webrtc");
+      ok("and drops the socket reference", net.ws === null);
+      /*
+        The typed ADDRESS is deliberately kept: retyping the host's address after
+        every failed attempt would be needless friction.
+      */
+      ok("but remembers the address the player typed",
+         net.relayAddr === "localhost:8787", net.relayAddr);
+
+      // A socket that refuses to construct must fail cleanly, not throw.
+      WebSocketSpy.throwOnConstruct = true;
+      let threw = null;
+      try { relayHost("localhost:8787"); } catch (e) { threw = e.message; }
+      WebSocketSpy.throwOnConstruct = false;
+      ok("a socket that cannot be created fails cleanly", !threw, threw || "");
+      ok("and says so", net.state === "failed" && !!net.error, net.error);
+
+      netReset();
+      Object.assign(net, savedNet);
+      net.relayAddr = "";
+    }
   }
 
   // 23. Determinism: identical initial conditions give identical results.
