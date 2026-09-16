@@ -3077,6 +3077,12 @@ const game = {
   helpers: [],          // AI goalkeepers / strikers
   bullets: [],          // pistol rounds in flight
   walls: [],            // temporary player-built walls
+  /*
+    3D arena state, or null. Null whenever the 3D mode is not the live scene, so
+    no other scene can read a stale fighter or a projectile left in flight from
+    a previous match. Built by startArena3D, torn down by endArena3D.
+  */
+  arena: null,
   run: null,            // roguelike run state, or null
   ctrlSeat: 0,          // which player the controls screen is editing
   ctrlRow: 0,
@@ -3444,6 +3450,19 @@ function startMatch() {
   game.ballSide = -1;
   for (const pl of game.players) if (pl) pl.ai = null;   // fresh AI memory
   game.suddenDeath = false;
+
+  /*
+    The 3D arena runs its own simulation over its own state, so it takes over
+    here rather than falling through to a kickoff it has no ball for. Everything
+    above still applies: teams, the scoreline, the clock and the leaderboard are
+    shared with every other mode.
+  */
+  if (game.mode === MODE.ARENA3D) {
+    startArena3D();
+    return;
+  }
+  game.arena = null;         // no stale 3D state behind a 2D match
+
   // kickoff() ends by calling applyRunPerks(), so the run's pistol and helpers
   // are granted there — after the reset that would otherwise wipe them.
   kickoff(0, false);          // opening kickoff: normal gravity
@@ -6253,6 +6272,306 @@ function updateParticles(dt) {
     p.x += p.vx * dt;
     p.y += p.vy * dt;
   }
+}
+
+/* ------------------------------------------------- 8b. 3D ARENA MODE
+
+   A third-person deathmatch. Entirely separate from the 2D simulation above:
+   it owns `game.arena` and never touches the ball, the pitch or the walls.
+
+   Everything is in world units, y UP, floor at y = 0. The 2D game's px/s
+   feel is deliberately kept — a fighter runs at a similar pace to a 2D
+   player, so the two halves of the game are recognisably the same game.
+*/
+
+const ARENA_HW = 520;         // half-width  (x from -520 to 520)
+const ARENA_HD = 520;         // half-depth  (z from -520 to 520)
+const ARENA_WALL_H = 210;     // enclosing wall height
+const FIGHTER_R = 26;         // collision radius
+const FIGHTER_H = 74;         // standing height, feet at y=0
+const EYE_H = 58;             // eye/muzzle height above the feet
+
+const F_ACCEL = 2100;         // ground acceleration (units/s^2)
+const F_MAXV = 330;           // ground top speed
+const F_AIRACCEL = 640;       // reduced control while airborne
+const F_FRICTION = 9.2;       // ground damping when not pressing a direction
+const F_JUMP = 560;           // jump impulse
+const F_GRAV = 1750;          // gravity in the arena, a touch snappier than 2D
+const F_DASH = 780;           // dash impulse along the current facing
+const F_DASH_CD = 1.5;        // dash cooldown (seconds)
+
+const HP_MAX = 100;
+const SHOT_DMG = 25;          // four hits kill
+const SHOT_SPD = 1750;        // projectile speed (units/s)
+const SHOT_R = 6;
+const SHOT_LIFE = 1.6;
+const FIRE_CD = 0.22;         // between shots
+const RESPAWN_T = 2;          // seconds dead before respawning
+
+// Camera: behind and above the fighter's eye line.
+const CAM_DIST = 165;
+const CAM_LIFT = 34;
+const CAM_MIN_DIST = 46;      // when geometry crowds the camera in
+const MOUSE_SENS = 0.0026;    // radians per pixel of mouse movement
+const STICK_SENS = 2.4;       // radians per second at full stick deflection
+
+/** Is the 3D arena the live scene? */
+const isArena3D = () => game.scene === SCENE.ARENA3D && !!game.arena;
+
+/*
+  Cover layout. Four corner crates and a taller centre pillar: enough to break
+  sight lines and give the bot something to path around, few enough that the
+  painter's-algorithm sort stays exact (see the renderer).
+
+  Boxes are axis-aligned and never overlap, which is what lets collision be a
+  simple per-axis rejection and lets face sorting ignore interpenetration.
+*/
+function arenaCover() {
+  const c = [];
+  const crate = (x, z, w, h, d) => c.push({ x, y: h / 2, z, hw: w / 2, hh: h / 2, hd: d / 2 });
+  crate(-250, -250, 150, 96, 150);
+  crate(250, -250, 150, 96, 150);
+  crate(-250, 250, 150, 96, 150);
+  crate(250, 250, 150, 96, 150);
+  crate(0, 0, 120, 190, 120);          // centre pillar, too tall to shoot over
+  crate(-330, 0, 90, 62, 240);         // low side walls, waist height
+  crate(330, 0, 90, 62, 240);
+  return c;
+}
+
+/*
+  Spawn points, one per corner of the arena, inset clear of the crates. Two
+  fighters and four spawns means a death can always be answered with a spawn
+  away from the killer — see respawnFighter.
+*/
+function arenaSpawns() {
+  const d = 400;
+  return [
+    { x: -d, z: -d, yaw: Math.PI * 0.75 },
+    { x: d, z: -d, yaw: -Math.PI * 0.75 },
+    { x: -d, z: d, yaw: Math.PI * 0.25 },
+    { x: d, z: d, yaw: -Math.PI * 0.25 },
+  ];
+}
+
+/** A fighter for one seat, at the seat's opening spawn. */
+function makeFighter(seat, team) {
+  const sp = arenaSpawns()[seat === 0 ? 0 : 3];
+  return {
+    seat,
+    team,
+    x: sp.x, y: 0, z: sp.z,
+    vx: 0, vy: 0, vz: 0,
+    yaw: sp.yaw,
+    pitch: 0,
+    hp: HP_MAX,
+    onGround: true,
+    fireCD: 0,
+    dashCD: 0,
+    dead: false,
+    respawn: 0,
+    hurt: 0,             // >0 briefly after taking a hit, for the HUD flash
+    // Bot memory, only used when this seat is CPU-driven.
+    ai: null,
+  };
+}
+
+/**
+ * Put a fighter back in play at whichever spawn is furthest from the enemy.
+ *
+ * Respawning next to your killer is the fastest way to make a deathmatch feel
+ * unfair, so the spawn is chosen by distance rather than at random.
+ */
+function respawnFighter(f) {
+  const foe = game.arena.fighters.find((o) => o.seat !== f.seat);
+  const spawns = arenaSpawns();
+  let best = spawns[0], bestD = -1;
+  for (const s of spawns) {
+    // A dead opponent exerts no pressure, so any spawn will do; guard anyway
+    // so this never depends on the order deaths are resolved in.
+    const d = foe && !foe.dead ? Math.hypot(s.x - foe.x, s.z - foe.z) : 1;
+    if (d > bestD) { bestD = d; best = s; }
+  }
+  f.x = best.x; f.y = 0; f.z = best.z;
+  f.vx = f.vy = f.vz = 0;
+  f.yaw = best.yaw;
+  f.pitch = 0;
+  f.hp = HP_MAX;
+  f.dead = false;
+  f.respawn = 0;
+  f.onGround = true;
+  f.fireCD = 0;
+  f.dashCD = 0;
+}
+
+/**
+ * Begin a 3D deathmatch. Called from startMatch in place of kickoff.
+ *
+ * Builds `game.arena` from scratch every time: leaving state between matches is
+ * how a stale fighter or a live projectile from the previous round leaks into
+ * the next one.
+ */
+function startArena3D() {
+  const fighters = [makeFighter(0, TEAMS[game.sel[0]]), makeFighter(1, TEAMS[game.sel[1]])];
+  game.arena = {
+    fighters,
+    // One camera per seat, so split-screen is two independent views.
+    cam: [
+      { yaw: fighters[0].yaw, pitch: 0.06, dist: CAM_DIST, pos: v3(0, 0, 0) },
+      { yaw: fighters[1].yaw, pitch: 0.06, dist: CAM_DIST, pos: v3(0, 0, 0) },
+    ],
+    shots: [],
+    frags: [0, 0],
+    cover: arenaCover(),
+    hitFx: [],
+    // Two humans share the screen; one human plus a bot does not.
+    split: !game.cpu[0] && !game.cpu[1],
+  };
+  game.score = [0, 0];
+  game.particles = [];
+  game.scene = SCENE.ARENA3D;
+  game.suddenDeath = false;
+  game.clock = game.matchSecs;
+  // Cameras must be correct on the very first rendered frame, before any
+  // simulation step has run, or the match opens on a black screen.
+  updateArenaCameras();
+}
+
+/** Tear the arena down, so no other scene can read stale 3D state. */
+function endArena3D() {
+  game.arena = null;
+  releaseArenaLock();
+}
+
+/**
+ * Does the segment from `a` to `b` pass through any cover box?
+ *
+ * Used both to pull the camera in when a crate would hide the fighter, and by
+ * the bot to decide whether it has a clear shot. A slab test per box: cheap,
+ * exact for axis-aligned boxes, and it needs no square roots.
+ */
+function segmentHitsCover(a, b, pad = 0) {
+  const d = v3sub(b, a);
+  for (const c of game.arena.cover) {
+    const lo = [c.x - c.hw - pad, c.y - c.hh - pad, c.z - c.hd - pad];
+    const hi = [c.x + c.hw + pad, c.y + c.hh + pad, c.z + c.hd + pad];
+    const o = [a.x, a.y, a.z], dir = [d.x, d.y, d.z];
+    let t0 = 0, t1 = 1, miss = false;
+    for (let i = 0; i < 3; i++) {
+      if (Math.abs(dir[i]) < 1e-9) {
+        // Parallel to this slab: either wholly inside it or it cannot be hit.
+        if (o[i] < lo[i] || o[i] > hi[i]) { miss = true; break; }
+        continue;
+      }
+      let ta = (lo[i] - o[i]) / dir[i];
+      let tb = (hi[i] - o[i]) / dir[i];
+      if (ta > tb) { const s = ta; ta = tb; tb = s; }
+      t0 = Math.max(t0, ta);
+      t1 = Math.min(t1, tb);
+      if (t0 > t1) { miss = true; break; }
+    }
+    if (!miss) return true;
+  }
+  return false;
+}
+
+/**
+ * Place each seat's camera behind and above its fighter.
+ *
+ * The camera is pulled in when a wall or crate would come between it and the
+ * fighter: a third-person camera that clips into geometry hides the player from
+ * themselves, which is worse than being a little close.
+ */
+function updateArenaCameras() {
+  const A = game.arena;
+  for (let s = 0; s < A.fighters.length; s++) {
+    const f = A.fighters[s];
+    const cam = A.cam[s];
+    cam.yaw = f.yaw;
+    cam.pitch = clamp(f.pitch, -PITCH_MAX, PITCH_MAX);
+
+    const eye = v3(f.x, f.y + EYE_H, f.z);
+    const b = camBasis(cam);
+    // Ideal seat: straight back along the view axis, lifted a little.
+    let dist = CAM_DIST;
+    const wanted = v3add(v3sub(eye, v3scale(b.fwd, dist)), v3(0, CAM_LIFT, 0));
+
+    /*
+      Step the camera in until the sight line is clear. Eight samples is enough
+      to look smooth at this speed and costs far less than a true swept test.
+    */
+    if (segmentHitsCover(eye, wanted, 8) || outsideArena(wanted)) {
+      for (let i = 1; i <= 8; i++) {
+        const t = 1 - i / 9;
+        const d = CAM_MIN_DIST + (CAM_DIST - CAM_MIN_DIST) * t;
+        const p = v3add(v3sub(eye, v3scale(b.fwd, d)), v3(0, CAM_LIFT * t, 0));
+        if (!segmentHitsCover(eye, p, 8) && !outsideArena(p)) { dist = d; break; }
+        dist = CAM_MIN_DIST;
+      }
+    }
+    cam.dist = dist;
+    const bb = camBasis(cam);
+    cam.pos = v3add(v3sub(eye, v3scale(bb.fwd, dist)),
+                    v3(0, CAM_LIFT * (dist / CAM_DIST), 0));
+  }
+}
+
+/** Is this point outside the sealed arena box? Keeps the camera indoors. */
+function outsideArena(p) {
+  return p.x < -ARENA_HW + 6 || p.x > ARENA_HW - 6 ||
+         p.z < -ARENA_HD + 6 || p.z > ARENA_HD - 6 ||
+         p.y < 8 || p.y > ARENA_WALL_H - 6;
+}
+
+/* ---- mouse look ----------------------------------------------------------
+
+   Pointer lock is the only way to get unbounded mouse movement in a browser,
+   and a lock the player cannot escape looks exactly like a frozen game. So the
+   rules here are strict: the lock is only ever requested by a deliberate click
+   inside the arena, and it is released on EVERY path out of the mode — pause,
+   quit, match end, or any scene change at all.
+
+   The mode stays fully playable if the lock is refused (some browsers refuse it
+   outside a user gesture), because aim also has key bindings.
+*/
+
+const mouse = { dx: 0, dy: 0, locked: false, wantLock: false };
+
+/** True when this environment can lock the pointer at all. */
+const pointerLockSupported = () =>
+  typeof document !== "undefined" && typeof document.exitPointerLock === "function";
+
+function requestArenaLock() {
+  mouse.wantLock = true;
+  try {
+    if (cv && cv.requestPointerLock) cv.requestPointerLock();
+  } catch (e) { /* refused: the key bindings still work */ }
+}
+
+function releaseArenaLock() {
+  mouse.wantLock = false;
+  mouse.dx = 0;
+  mouse.dy = 0;
+  try {
+    if (typeof document !== "undefined" && document.exitPointerLock) {
+      document.exitPointerLock();
+    }
+  } catch (e) { /* nothing to release */ }
+  mouse.locked = false;
+}
+
+/**
+ * Consume the mouse movement accumulated since the last frame.
+ *
+ * Accumulated in the listener and drained exactly once per frame, so aim
+ * sensitivity does not vary with frame rate or with how many physics substeps
+ * a frame happens to run.
+ */
+function takeMouseDelta() {
+  const d = { dx: mouse.dx, dy: mouse.dy };
+  mouse.dx = 0;
+  mouse.dy = 0;
+  return d;
 }
 
 function step(dt) {
@@ -9921,6 +10240,13 @@ const PHYS = {
   v3, v3add, v3sub, v3scale, v3dot, v3cross, v3len, v3norm,
   camBasis, worldToCam, project, makeView, NEAR, PITCH_MAX,
   faceBatch, boxFaces, isBackFace, shadeFace, hexRGB, LIGHT_DIR, AMBIENT,
+  startArena3D, endArena3D, makeFighter, respawnFighter, arenaSpawns, arenaCover,
+  isArena3D, segmentHitsCover, updateArenaCameras, outsideArena,
+  mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
+  ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
+  HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
+  F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
+  CAM_DIST, CAM_LIFT, CAM_MIN_DIST, MOUSE_SENS, STICK_SENS,
   consts: { W, H, GROUND_Y, WALL, GOAL_BASE_TOP, GOAL_H, GRAVITY, DT, BALL_R, BALL_MAX_V, BALL_REST },
 };
 if (typeof window !== "undefined") window.PHYS = PHYS;
@@ -18455,6 +18781,211 @@ function runTests() {
 
     game.mode = savedMode;
     game.cpu = savedCpu;
+  }
+
+  // 24g. Arena state, spawns and the match lifecycle.
+  {
+    const saved = { mode: game.mode, scene: game.scene, arena: game.arena,
+                    players: game.players, ball: game.ball, cpu: [...game.cpu],
+                    sel: [...game.sel], score: [...game.score], clock: game.clock };
+
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    startMatch();
+
+    ok("starting a 3D match builds the arena", !!game.arena);
+    ok("and enters the 3D scene", game.scene === SCENE.ARENA3D);
+    ok("with two fighters", game.arena.fighters.length === 2);
+    ok("both at full health", game.arena.fighters.every((f) => f.hp === HP_MAX));
+    ok("both alive", game.arena.fighters.every((f) => !f.dead));
+    ok("nobody has fragged anybody yet",
+       game.arena.frags[0] === 0 && game.arena.frags[1] === 0);
+    ok("the scoreline starts level", game.score[0] === 0 && game.score[1] === 0);
+    ok("no projectiles are in flight", game.arena.shots.length === 0);
+    ok("the fighters carry the chosen teams",
+       game.arena.fighters[0].team === TEAMS[0] &&
+       game.arena.fighters[1].team === TEAMS[3]);
+    ok("each seat gets its own camera", game.arena.cam.length === 2);
+    ok("and the cameras are positioned before the first frame is drawn",
+       game.arena.cam.every((c) => c.pos && isFinite(c.pos.x) &&
+                                   isFinite(c.pos.y) && isFinite(c.pos.z)));
+    ok("one human against a bot is NOT split-screen", game.arena.split === false);
+    ok("the fighters start apart",
+       Math.hypot(game.arena.fighters[0].x - game.arena.fighters[1].x,
+                  game.arena.fighters[0].z - game.arena.fighters[1].z) > 400);
+    ok("both fighters start inside the arena",
+       game.arena.fighters.every((f) =>
+         Math.abs(f.x) < ARENA_HW && Math.abs(f.z) < ARENA_HD));
+    ok("and standing on the floor", game.arena.fighters.every((f) => f.y === 0));
+
+    // Two humans DO share the screen.
+    {
+      game.cpu = [false, false];
+      startMatch();
+      ok("two humans get split-screen", game.arena.split === true);
+      game.cpu = [false, true];
+    }
+
+    // Cover geometry must be sane, or collision and sorting both suffer.
+    {
+      const cover = arenaCover();
+      ok("the arena has cover to fight around", cover.length >= 4);
+      ok("every cover box has positive extent",
+         cover.every((c) => c.hw > 0 && c.hh > 0 && c.hd > 0));
+      ok("every cover box sits on the floor",
+         cover.every((c) => near(c.y, c.hh, 1e-9)));
+      ok("every cover box is inside the arena",
+         cover.every((c) => Math.abs(c.x) + c.hw <= ARENA_HW &&
+                            Math.abs(c.z) + c.hd <= ARENA_HD));
+      /*
+        No two boxes may overlap: collision resolves per axis and the painter
+        sort assumes no interpenetration, so an overlap would break both.
+      */
+      let overlap = null;
+      for (let i = 0; i < cover.length && !overlap; i++) {
+        for (let j = i + 1; j < cover.length; j++) {
+          const a = cover[i], b = cover[j];
+          if (Math.abs(a.x - b.x) < a.hw + b.hw &&
+              Math.abs(a.y - b.y) < a.hh + b.hh &&
+              Math.abs(a.z - b.z) < a.hd + b.hd) { overlap = `${i} and ${j}`; break; }
+        }
+      }
+      ok("no two cover boxes overlap", !overlap, overlap || "");
+    }
+
+    // Spawns must be clear of cover, or a fighter spawns inside a crate.
+    {
+      const spawns = arenaSpawns();
+      ok("there are four spawn points", spawns.length === 4);
+      const cover = arenaCover();
+      let inside = null;
+      for (const s of spawns) {
+        for (const c of cover) {
+          if (Math.abs(s.x - c.x) < c.hw + FIGHTER_R &&
+              Math.abs(s.z - c.z) < c.hd + FIGHTER_R) {
+            inside = `spawn ${s.x},${s.z} is inside cover`; break;
+          }
+        }
+        if (inside) break;
+      }
+      ok("no spawn point sits inside cover", !inside, inside || "");
+      ok("every spawn is inside the arena",
+         spawns.every((s) => Math.abs(s.x) < ARENA_HW - FIGHTER_R &&
+                             Math.abs(s.z) < ARENA_HD - FIGHTER_R));
+    }
+
+    /*
+      Respawn must move the victim AWAY from the killer. Respawning next to
+      whoever just killed you is the fastest way to make a deathmatch unfair.
+    */
+    {
+      startMatch();
+      const [me, foe] = game.arena.fighters;
+      const spawns = arenaSpawns();
+      // Park the enemy on the first spawn, then die there.
+      foe.x = spawns[0].x; foe.z = spawns[0].z; foe.dead = false;
+      me.x = spawns[0].x; me.z = spawns[0].z;
+      respawnFighter(me);
+      const dNew = Math.hypot(me.x - foe.x, me.z - foe.z);
+      let worst = 0;
+      for (const s of spawns) worst = Math.max(worst, Math.hypot(s.x - foe.x, s.z - foe.z));
+      ok("respawning picks the spawn furthest from the enemy",
+         near(dNew, worst, 1e-9), `${dNew.toFixed(0)} vs best ${worst.toFixed(0)}`);
+      ok("and restores full health", me.hp === HP_MAX);
+      ok("and clears the dead flag and its timer", !me.dead && me.respawn === 0);
+      ok("and stops all momentum", me.vx === 0 && me.vy === 0 && me.vz === 0);
+      ok("and lands on the floor", me.y === 0 && me.onGround);
+    }
+
+    // Leaving the mode must leave nothing behind.
+    {
+      startMatch();
+      ok("the arena exists while the mode runs", !!game.arena);
+      endArena3D();
+      ok("ending the mode clears the arena", game.arena === null);
+      // Twice, to prove teardown is idempotent and rebuild is clean.
+      startMatch();
+      const first = game.arena;
+      endArena3D();
+      startMatch();
+      ok("entering twice builds a fresh arena, not the old one",
+         game.arena !== first && game.arena.fighters.length === 2);
+      ok("and the second arena has no leftover projectiles",
+         game.arena.shots.length === 0);
+      endArena3D();
+      ok("tearing down twice is harmless",
+         (() => { endArena3D(); return game.arena === null; })());
+    }
+
+    // A 2D match must never leave 3D state lying around.
+    {
+      game.mode = MODE.SINGLE;
+      startMatch();
+      ok("starting a 2D match clears any 3D state", game.arena === null);
+      ok("and a 2D match still enters its countdown", game.scene === SCENE.COUNTDOWN);
+    }
+
+    Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 24h. The cover slab test, used by both the camera and the bot.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel] };
+    game.mode = MODE.ARENA3D;
+    game.cpu = [false, true];
+    game.sel = [0, 3];
+    startMatch();
+
+    // The centre pillar sits at the origin, 190 tall, 120 wide.
+    ok("a segment straight through the centre pillar is blocked",
+       segmentHitsCover(v3(-300, 40, 0), v3(300, 40, 0)));
+    ok("a segment passing well beside it is clear",
+       !segmentHitsCover(v3(-300, 40, 460), v3(300, 40, 460)));
+    ok("a segment passing over a waist-high crate is clear",
+       !segmentHitsCover(v3(-330, 180, -250), v3(-170, 180, -250)));
+    ok("a segment through a waist-high crate is blocked",
+       segmentHitsCover(v3(-330, 40, -250), v3(-170, 40, -250)));
+    ok("a zero-length segment outside cover is clear",
+       !segmentHitsCover(v3(-500, 40, -500), v3(-500, 40, -500)));
+    ok("a segment that stops short of cover is clear",
+       // Starts clear of the left crate (which spans x -375..-285) and stops
+       // before the centre pillar (x -60..60).
+       !segmentHitsCover(v3(-260, 40, 0), v3(-100, 40, 0)));
+    ok("a segment starting inside cover reports blocked",
+       segmentHitsCover(v3(-300, 40, 0), v3(-100, 40, 0)));
+    ok("the slab test is symmetric",
+       segmentHitsCover(v3(-300, 40, 0), v3(300, 40, 0)) ===
+       segmentHitsCover(v3(300, 40, 0), v3(-300, 40, 0)));
+
+    // Camera placement: never inside geometry, never outside the room.
+    {
+      let bad = null;
+      const f = game.arena.fighters[0];
+      // Sweep the fighter around the room, looking every which way.
+      for (let i = 0; i < 48 && !bad; i++) {
+        const a = (i / 48) * Math.PI * 2;
+        f.x = Math.cos(a) * 420;
+        f.z = Math.sin(a) * 420;
+        f.yaw = a;
+        f.pitch = (i % 5 - 2) * 0.4;
+        updateArenaCameras();
+        const cam = game.arena.cam[0];
+        if (!isFinite(cam.pos.x) || !isFinite(cam.pos.y) || !isFinite(cam.pos.z)) {
+          bad = `non-finite camera at ${i}`; break;
+        }
+        if (outsideArena(cam.pos)) bad = `camera left the room at ${i}`;
+        if (cam.dist < CAM_MIN_DIST - 1e-9) bad = `camera too close at ${i}`;
+        if (Math.abs(cam.pitch) > PITCH_MAX + 1e-9) bad = `pitch unclamped at ${i}`;
+      }
+      ok("the camera stays inside the room, sane and clamped, all the way round",
+         !bad, bad || "");
+    }
+
+    endArena3D();
+    Object.assign(game, saved);
   }
 
   // 23. Determinism: identical initial conditions give identical results.
