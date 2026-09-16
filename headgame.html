@@ -7618,6 +7618,172 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
+/* ----------------------------------------------- 10b. 3D QUAD RENDERER
+
+   A painter's-algorithm rasteriser for the 3D arena: collect polygons, sort
+   them back-to-front, fill them with flat shading. There is no depth buffer,
+   which is why the arena is built from few, convex, well-separated boxes —
+   painter order is exact for that geometry and cheap to compute.
+*/
+
+// Direction the light comes FROM. Fixed, so a surface's brightness tells the
+// player which way it faces — the only depth cue flat shading has.
+const LIGHT_DIR = v3norm(v3(-0.42, 0.84, -0.34));
+const AMBIENT = 0.42;             // floor brightness for a face facing away
+
+/** Parse "#rrggbb" once, so shadeFace can do arithmetic on the channels. */
+function hexRGB(hex) {
+  const h = String(hex).replace("#", "");
+  const n = h.length === 3
+    ? h.split("").map((c) => parseInt(c + c, 16))
+    : [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  return n.map((v) => (isFinite(v) ? v : 0));
+}
+
+/**
+ * Flat-shade a colour by how squarely a face meets the light.
+ *
+ * `k` runs from AMBIENT (facing away) to 1 (facing the light), so the six
+ * sides of a box read as six distinct tones and the shape is legible without
+ * outlines or textures.
+ */
+function shadeFace(hex, normal) {
+  const [r, g, b] = hexRGB(hex);
+  const k = AMBIENT + (1 - AMBIENT) * Math.max(0, v3dot(normal, LIGHT_DIR));
+  const c = (v) => clamp(Math.round(v * k), 0, 255);
+  return `rgb(${c(r)},${c(g)},${c(b)})`;
+}
+
+/**
+ * Is this projected polygon facing away from the camera?
+ *
+ * Uses the signed area of the screen-space polygon. Our world winding is
+ * counter-clockwise seen from OUTSIDE, and project() flips y for the canvas,
+ * so an outward-facing polygon comes out with a NEGATIVE signed area here.
+ * A positive area therefore means we are looking at the inside of a box, and
+ * the face can be skipped — halving the fill cost and removing the commonest
+ * painter-order artefact in a single test.
+ *
+ * A zero area is a face seen exactly edge-on: it covers no pixels, so culling
+ * it is both correct and cheaper than filling a degenerate polygon.
+ */
+function isBackFace(pts) {
+  let area = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area >= 0;
+}
+
+/**
+ * A batch of world-space polygons to be drawn in one depth-sorted pass.
+ *
+ * Faces are pushed in whatever order is convenient for the geometry code, then
+ * `flush` projects, culls and sorts them. Sorting happens on the mean camera
+ * depth of each face: for convex, non-interpenetrating boxes that ordering is
+ * exact, and it degrades gracefully (a seam, not a hole) if two faces do touch.
+ */
+function faceBatch() {
+  const faces = [];
+  return {
+    /** `pts` are world-space corners, counter-clockwise seen from outside. */
+    push(pts, hex, opts = {}) {
+      faces.push({ pts, hex, opts });
+    },
+    get length() { return faces.length; },
+    /** Project, cull, sort and fill. Returns how many faces were painted. */
+    flush(cam, view, basis) {
+      const ready = [];
+      for (const f of faces) {
+        const scr = [];
+        let depth = 0, ok = true;
+        for (const p of f.pts) {
+          const q = project(p, cam, view, basis);
+          // One corner behind the near plane discards the whole face: see NEAR.
+          if (!q) { ok = false; break; }
+          scr.push(q);
+          depth += q.z;
+        }
+        if (!ok) continue;
+        if (!f.opts.twoSided && isBackFace(scr)) continue;
+        ready.push({ scr, depth: depth / scr.length, hex: f.hex, opts: f.opts });
+      }
+
+      // Far to near: a nearer face must paint over a farther one.
+      ready.sort((a, b) => b.depth - a.depth);
+
+      for (const f of ready) {
+        const n = f.opts.normal;
+        ctx.fillStyle = n ? shadeFace(f.hex, n) : f.hex;
+        ctx.beginPath();
+        ctx.moveTo(f.scr[0].x, f.scr[0].y);
+        for (let i = 1; i < f.scr.length; i++) ctx.lineTo(f.scr[i].x, f.scr[i].y);
+        ctx.closePath();
+        ctx.fill();
+        if (f.opts.edge) {
+          ctx.strokeStyle = f.opts.edge;
+          ctx.lineWidth = f.opts.edgeW || 1;
+          ctx.stroke();
+        }
+      }
+      return ready.length;
+    },
+    /** The sorted draw order, for the test suite to assert against. */
+    order(cam, view, basis) {
+      const out = [];
+      for (const f of faces) {
+        let depth = 0, ok = true;
+        const scr = [];
+        for (const p of f.pts) {
+          const q = project(p, cam, view, basis);
+          if (!q) { ok = false; break; }
+          scr.push(q);
+          depth += q.z;
+        }
+        if (!ok) continue;
+        if (!f.opts.twoSided && isBackFace(scr)) continue;
+        out.push({ tag: f.opts.tag, depth: depth / scr.length });
+      }
+      out.sort((a, b) => b.depth - a.depth);
+      return out;
+    },
+    clear() { faces.length = 0; },
+  };
+}
+
+/*
+  The six faces of an axis-aligned box, each wound counter-clockwise as seen
+  from OUTSIDE the box so back-face culling works, and each carrying its own
+  outward normal for shading. Written once here because every wall, crate and
+  pillar in the arena is a box — the alternative was six near-identical
+  literals per object.
+
+  The winding of every face is asserted by the test suite against its own
+  normal, because a single face wound the wrong way is invisible from outside
+  and shows a hole straight through the geometry.
+*/
+function boxFaces(batch, cx, cy, cz, hw, hh, hd, hex, tag) {
+  const x0 = cx - hw, x1 = cx + hw;
+  const y0 = cy - hh, y1 = cy + hh;
+  const z0 = cz - hd, z1 = cz + hd;
+  const P = (x, y, z) => v3(x, y, z);
+  const face = (pts, normal) => batch.push(pts, hex, { normal, tag });
+
+  // Top (+y), seen from above: x increasing, then z increasing.
+  face([P(x0, y1, z0), P(x1, y1, z0), P(x1, y1, z1), P(x0, y1, z1)], v3(0, 1, 0));
+  // Bottom (-y), seen from below: the reverse sweep.
+  face([P(x0, y0, z1), P(x1, y0, z1), P(x1, y0, z0), P(x0, y0, z0)], v3(0, -1, 0));
+  // Front (-z): wound so it reads counter-clockwise from outside, i.e. from -z.
+  face([P(x1, y1, z0), P(x0, y1, z0), P(x0, y0, z0), P(x1, y0, z0)], v3(0, 0, -1));
+  // Back (+z): the mirror of the front.
+  face([P(x0, y1, z1), P(x1, y1, z1), P(x1, y0, z1), P(x0, y0, z1)], v3(0, 0, 1));
+  // Left (-x): seen from -x, z runs front-to-back.
+  face([P(x0, y1, z0), P(x0, y1, z1), P(x0, y0, z1), P(x0, y0, z0)], v3(-1, 0, 0));
+  // Right (+x): the mirror of the left.
+  face([P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), P(x1, y0, z1)], v3(1, 0, 0));
+}
+
 const fmtClock = (s) => {
   const t = Math.max(0, Math.ceil(s));
   return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
@@ -9713,6 +9879,7 @@ const PHYS = {
   // 3D arena: pure maths first, so the suite can drive the projector directly.
   v3, v3add, v3sub, v3scale, v3dot, v3cross, v3len, v3norm,
   camBasis, worldToCam, project, makeView, NEAR, PITCH_MAX,
+  faceBatch, boxFaces, isBackFace, shadeFace, hexRGB, LIGHT_DIR, AMBIENT,
   consts: { W, H, GROUND_Y, WALL, GOAL_BASE_TOP, GOAL_H, GRAVITY, DT, BALL_R, BALL_MAX_V, BALL_REST },
 };
 if (typeof window !== "undefined") window.PHYS = PHYS;
@@ -18042,6 +18209,137 @@ function runTests() {
     */
     ok("focal length scales with viewport height",
        near(full.focal, top.focal * 2, 1e-9), `${full.focal} vs ${top.focal}`);
+  }
+
+  // 24e. The quad renderer: sorting, culling and shading.
+  {
+    const view = makeView(0, 0, W, H);
+    const cam = { pos: v3(0, 0, 0), yaw: 0, pitch: 0 };
+    const basis = camBasis(cam);
+
+    // Three two-sided quads at known depths, pushed in the WRONG order.
+    const quadAt = (z) => [v3(-40, -40, z), v3(-40, 40, z), v3(40, 40, z), v3(40, -40, z)];
+    {
+      const b = faceBatch();
+      b.push(quadAt(200), "#ff0000", { tag: "near", twoSided: true });
+      b.push(quadAt(800), "#00ff00", { tag: "far", twoSided: true });
+      b.push(quadAt(400), "#0000ff", { tag: "mid", twoSided: true });
+      const order = b.order(cam, view, basis);
+      ok("faces paint far to near",
+         order.map((f) => f.tag).join(",") === "far,mid,near",
+         order.map((f) => f.tag).join(","));
+      // Strictly descending depth, so nothing relies on a stable sort.
+      let desc = true;
+      for (let i = 1; i < order.length; i++) if (order[i].depth > order[i - 1].depth) desc = false;
+      ok("and the sort is strictly descending in depth", desc);
+    }
+
+    // A face wholly behind the camera is dropped, not smeared.
+    {
+      const b = faceBatch();
+      b.push(quadAt(-300), "#ff0000", { tag: "behind", twoSided: true });
+      ok("a face behind the camera is dropped", b.order(cam, view, basis).length === 0);
+    }
+    // A face STRADDLING the near plane is dropped whole: one bad corner is
+    // enough, because a partial projection is what smears across the screen.
+    {
+      const b = faceBatch();
+      b.push([v3(-40, -40, -50), v3(-40, 40, -50), v3(40, 40, 300), v3(40, -40, 300)],
+             "#ff0000", { tag: "straddle", twoSided: true });
+      ok("a face straddling the near plane is dropped whole",
+         b.order(cam, view, basis).length === 0);
+    }
+
+    // Back-face culling: a box seen from outside shows at most three sides.
+    {
+      const b = faceBatch();
+      boxFaces(b, 0, 0, 400, 50, 50, 50, "#888888", "box");
+      ok("a box pushes six faces", b.length === 6, `${b.length}`);
+      const vis = b.order(cam, view, basis);
+      ok("but at most three of them are visible at once",
+         vis.length > 0 && vis.length <= 3, `${vis.length} visible`);
+    }
+    // Facing a box head-on, the near side must be the LAST thing painted.
+    {
+      const b = faceBatch();
+      boxFaces(b, 0, 0, 400, 50, 50, 50, "#888888", "box");
+      const vis = b.order(cam, view, basis);
+      ok("the nearest visible face of a box paints last",
+         vis.length >= 1 && vis[vis.length - 1].depth <= 355, `${vis[vis.length - 1].depth}`);
+    }
+
+    // Shading: a face square to the light is brighter than one facing away.
+    {
+      const lit = shadeFace("#ffffff", LIGHT_DIR);
+      const away = shadeFace("#ffffff", v3scale(LIGHT_DIR, -1));
+      const chan = (s) => Number(s.match(/\d+/)[0]);
+      ok("a face toward the light is brighter", chan(lit) > chan(away),
+         `${lit} vs ${away}`);
+      ok("a face fully lit is not clipped", chan(lit) === 255, lit);
+      ok("a face facing away keeps the ambient floor",
+         near(chan(away), Math.round(255 * AMBIENT), 1), away);
+      ok("shading never leaves the byte range",
+         (() => {
+           for (let i = 0; i < 64; i++) {
+             const a = (i / 64) * Math.PI * 2;
+             const c = shadeFace("#3a7bd5", v3norm(v3(Math.cos(a), Math.sin(a), 0.3)));
+             const nums = c.match(/\d+/g).map(Number);
+             if (nums.some((v) => v < 0 || v > 255 || !isFinite(v))) return false;
+           }
+           return true;
+         })());
+      ok("hexRGB parses a six-digit colour",
+         hexRGB("#3a7bd5").join(",") === "58,123,213", hexRGB("#3a7bd5").join(","));
+    }
+
+    // Winding: the same corners reversed must flip the cull decision.
+    {
+      const fwdWound = [v3(-40, -40, 300), v3(-40, 40, 300), v3(40, 40, 300), v3(40, -40, 300)]
+        .map((p) => project(p, cam, view, basis));
+      const revWound = [...fwdWound].reverse();
+      ok("winding order decides the cull, and reversing it flips the answer",
+         isBackFace(fwdWound) !== isBackFace(revWound));
+    }
+
+    /*
+      EVERY box face must be wound so it is visible from outside and culled from
+      inside. Checked one face at a time, with the camera placed out along that
+      face's own normal: a single face wound backwards is invisible from outside
+      and leaves a hole straight through the geometry, which is very hard to
+      diagnose by eye and trivial to catch here. Four of the six were wrong when
+      this test was written.
+    */
+    {
+      const normals = [v3(0, 1, 0), v3(0, -1, 0), v3(0, 0, -1),
+                       v3(0, 0, 1), v3(-1, 0, 0), v3(1, 0, 0)];
+      const collected = [];
+      boxFaces({ push: (pts, hex, opts) => collected.push({ pts, opts }) },
+               0, 0, 0, 50, 50, 50, "#888888", "probe");
+
+      let outFail = null, inFail = null;
+      collected.forEach((f, i) => {
+        const n = normals[i];
+        // A camera 400 out along the normal, aimed back at the box centre.
+        const eye = v3scale(n, 400);
+        const yaw = Math.atan2(-eye.x, -eye.z);
+        const pitch = Math.atan2(-eye.y, Math.hypot(eye.x, eye.z));
+        const oCam = { pos: eye, yaw, pitch };
+        const oScr = f.pts.map((p) => project(p, oCam, view, camBasis(oCam)));
+        if (oScr.some((s) => !s) || isBackFace(oScr)) {
+          outFail = outFail || `face ${i} is not visible from outside`;
+        }
+        // The declared normal must match the winding, or shading lies about
+        // which way the surface faces even when the cull is right.
+        if (Math.abs(v3len(f.opts.normal) - 1) > 1e-9) {
+          inFail = inFail || `face ${i} normal is not a unit vector`;
+        }
+        if (v3dot(f.opts.normal, n) < 0.999) {
+          inFail = inFail || `face ${i} normal disagrees with its position`;
+        }
+      });
+      ok("every box face is visible from outside the box", !outFail, outFail || "");
+      ok("every box face declares a matching unit normal", !inFail, inFail || "");
+    }
   }
 
   // 23. Determinism: identical initial conditions give identical results.

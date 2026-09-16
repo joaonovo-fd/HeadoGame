@@ -1,6 +1,8 @@
 const fs = require("fs");
 const vm = require("vm");
-const src = fs.readFileSync("headgame.html", "utf8");
+const path = require("path");
+const ROOT = path.join(__dirname, "..");
+const src = fs.readFileSync(path.join(ROOT, "headgame.html"), "utf8");
 const code = src.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // Minimal 2D-context stub: every canvas call is a no-op, measureText returns a
@@ -30,7 +32,7 @@ const sandbox = {
   addEventListener: () => {},
   removeEventListener: () => {},
   innerWidth: 1280, innerHeight: 800, devicePixelRatio: 1,
-  location: { search: "?test=1" },
+  location: { search: process.env.HG_NO_TEST ? "" : "?test=1" },
   localStorage: {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, String(v)),
@@ -79,3 +81,6 @@ try {
   console.error(e && e.stack && e.stack.split("\n").slice(0, 6).join("\n"));
   process.exit(2);
 }
+
+// Exported so a probe script can reuse these stubs instead of duplicating them.
+module.exports = { sandbox, PHYS: sandbox.PHYS };
