@@ -9928,8 +9928,18 @@ function relayFailureHint(url) {
     return "wss:// to a bare IP needs a certificate for that IP. " +
            "Try the address without https, or use a hostname.";
   }
-  return "could not reach the relay — check the address, and that " +
-         "'node tools/relay.js' is running on that machine";
+  if (/ngrok/i.test(u)) {
+    /*
+      ngrok pins its own CA bundle, so on a network that inspects TLS — a
+      corporate proxy such as Netskope or Zscaler — its agent cannot authenticate
+      at all and never establishes the tunnel. The failure is at the agent, before
+      any browser is involved, so the address itself may be perfectly fine.
+    */
+    return "ngrok cannot authenticate through a TLS-inspecting network " +
+           "(corporate proxy). Use tools/play-online.sh, which tunnels over SSH.";
+  }
+  return "could not reach the relay. Check the address, and that the host is " +
+         "running tools/play-online.sh (or node tools/relay.js).";
 }
 
 document.addEventListener("pointerlockerror", () => {
@@ -12341,9 +12351,9 @@ function drawOnline() {
       const iy = joining ? 266 : 222;
       if (!joining) {
         text("start the relay first:", W / 2, iy, 11, "#cddcf2", "center", 700);
-        text(`node tools/relay.js --port ${relayPort()}`,
-             W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
-        text("it prints the address to share", W / 2, iy + 36, 10, "#6b819e", "center", 600);
+        text("tools/play-online.sh", W / 2, iy + 18, 12, "#a7f3d0", "center", 900);
+        text("it opens a public tunnel and prints the address to share",
+             W / 2, iy + 36, 10, "#6b819e", "center", 600);
       } else {
         text("ask the host for their address and 4-letter code",
              W / 2, iy, 11, "#cddcf2", "center", 700);
@@ -24707,6 +24717,21 @@ function runTests() {
       ok("a wss-to-bare-IP failure mentions the certificate",
          /certificate/i.test(relayFailureHint("wss://10.0.0.5")),
          relayFailureHint("wss://10.0.0.5"));
+      /*
+        ngrok pins its own CA bundle, so on a TLS-inspecting corporate network its
+        agent never authenticates — the tunnel does not exist, however good the
+        address is. Worth naming, because the error the agent prints says nothing
+        about the game.
+      */
+      ok("an ngrok failure explains the TLS-inspection problem",
+         /TLS-inspecting|corporate/i.test(relayFailureHint("wss://x.ngrok-free.app")),
+         relayFailureHint("wss://x.ngrok-free.app"));
+      ok("and points at the tunnel that does work",
+         /play-online|SSH/i.test(relayFailureHint("wss://x.ngrok.io")));
+      // The tunnel the helper script uses must resolve to a secure socket.
+      ok("a localhost.run address resolves to wss",
+         relayUrl("abc123.lhr.life") === "wss://abc123.lhr.life",
+         relayUrl("abc123.lhr.life"));
       ok("any other failure suggests checking the relay is running",
          /relay\.js|relay/i.test(relayFailureHint("ws://10.0.0.5:8787")));
       ok("every hint is a usable sentence, not a code",
