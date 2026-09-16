@@ -2117,9 +2117,18 @@ addEventListener("copy", (e) => {
   `intent`, so a rebind or a gamepad needs no changes anywhere in the physics.
 */
 const SCHEME_DEFAULTS = [
-  { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", kick: "KeyF", wall: "KeyG" },
+  { left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", kick: "KeyF", wall: "KeyG",
+    /*
+      The 3D arena's aim keys. Blank for P1, who aims with the mouse — the
+      CONTROLS screen already renders an unbound action as an empty keycap, so a
+      player who prefers keys can simply bind them.
+    */
+    aimUp: "", aimDown: "", aimLeft: "", aimRight: "", dash: "ShiftLeft" },
   { left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown",
-    kick: "Enter", wall: "ShiftRight" },
+    kick: "Enter", wall: "ShiftRight",
+    // P2 has no mouse, so aim gets a key cluster beside the arrow keys.
+    aimUp: "KeyI", aimDown: "KeyK", aimLeft: "KeyJ", aimRight: "KeyL",
+    dash: "ControlRight" },
 ];
 const SCHEME = SCHEME_DEFAULTS.map((s) => ({ ...s }));
 
@@ -2130,7 +2139,17 @@ const ACTIONS = [
   { key: "up",    label: "JUMP" },
   { key: "down",  label: "FAST FALL" },
   { key: "kick",  label: "KICK / FIRE" },
-  { key: "wall",  label: "BUILD WALL" },
+  { key: "wall",  label: "BUILD WALL / JUMP" },
+  /*
+    3D-only actions. They sit at the end so the six 2D bindings keep the row
+    order players already know, and they are labelled "3D" so nobody hunts for
+    their effect in a soccer match.
+  */
+  { key: "aimUp",    label: "3D AIM UP" },
+  { key: "aimDown",  label: "3D AIM DOWN" },
+  { key: "aimLeft",  label: "3D AIM LEFT" },
+  { key: "aimRight", label: "3D AIM RIGHT" },
+  { key: "dash",     label: "3D DASH" },
 ];
 
 /** A readable name for a KeyboardEvent.code. */
@@ -2255,6 +2274,37 @@ function pollPads(edge) {
     // Edge-detect the buttons ourselves, since a pad has no keydown event.
     a.kickEdge = edge && kick && !pads.prev[seat].kick;
     a.wallEdge = edge && wall && !pads.prev[seat].wall;
+
+    /*
+      3D arena: the RIGHT stick aims, which is the layout every console shooter
+      has trained players to expect. A pad seat therefore needs no keyboard at
+      all, which is what makes split-screen work with one mouse between two
+      players — see arenaMouseSeat.
+    */
+    a.aimX = 0;
+    a.aimY = 0;
+    a.jump = false;
+    a.dashEdge = false;
+    if (isArena3D()) {
+      const rx = gp.axes && gp.axes.length > 2 ? gp.axes[2] : 0;
+      const ry = gp.axes && gp.axes.length > 3 ? gp.axes[3] : 0;
+      const dz = (v) => (Math.abs(v) < PAD_DEADZONE ? 0 : v);
+      a.aimX = dz(rx) * STICK_SENS * DT;
+      a.aimY = -dz(ry) * STICK_SENS * DT;      // stick down is aim down
+      a.jump = anyOf(PAD_BTN.jump);
+      // Dash on a shoulder button, edge-detected like the others.
+      const dash = btn(6) || btn(4);
+      a.dashEdge = edge && dash && !pads.prev[seat].dash;
+      if (edge) pads.prev[seat].dash = dash;
+      /*
+        In the arena the left stick must steer four-way movement, and jump has
+        its own button — so `up` must NOT double as jump the way it does in the
+        2D game, or pushing the stick forward would make the fighter hop.
+      */
+      const ay2 = gp.axes && gp.axes.length > 1 ? gp.axes[1] : 0;
+      a.up = ay2 < -PAD_DEADZONE || btn(12);
+      a.down = ay2 > PAD_DEADZONE || btn(13);
+    }
     if (edge) { pads.prev[seat].kick = kick; pads.prev[seat].wall = wall; }
   }
   return live;
@@ -2271,12 +2321,22 @@ function pollPads(edge) {
 */
 const intent = [
   { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
-    wallEdge: false },
+    wallEdge: false,
+    // 3D arena only: aim deltas in radians for this step, plus its two buttons.
+    aimX: 0, aimY: 0, jump: false, dashEdge: false },
   { left: false, right: false, up: false, down: false, kick: false, kickEdge: false,
-    wallEdge: false },
+    wallEdge: false,
+    aimX: 0, aimY: 0, jump: false, dashEdge: false },
 ];
 
 /** Pack a seat's intent into one byte, for the network. */
+/*
+  The 3D arena's aim, jump and dash are deliberately NOT packed: that mode is
+  local-only (see menuRows, which hides ONLINE for it), so spending wire bits on
+  fields no networked match can produce would be dead weight. Should the 3D mode
+  ever go online, aim needs more than a bit each and this wants a wider format
+  rather than a squeezed one.
+*/
 function packIntent(a) {
   return (a.left ? 1 : 0) | (a.right ? 2 : 0) | (a.up ? 4 : 0) |
          (a.down ? 8 : 0) | (a.kick ? 16 : 0) | (a.kickEdge ? 32 : 0) |
@@ -2326,7 +2386,53 @@ function gatherIntent(edge) {
     a.kick  = kickDown(i);
     a.kickEdge = edge && kickHit(i);
     a.wallEdge = edge && hit(S.wall);
+    /*
+      3D arena input. Read here rather than in the arena's own step so every
+      seat — keyboard, pad or CPU — reaches the simulation through the same
+      `intent` channel the 2D game established.
+
+      Aim is a per-step DELTA, so it is scaled by dt: holding a key must turn at
+      the same rate regardless of how many substeps a frame runs. The mouse is
+      added on top, already in pixels and so already frame-rate independent.
+    */
+    a.aimX = 0;
+    a.aimY = 0;
+    if (isArena3D()) {
+      const kx = (keys[S.aimRight] ? 1 : 0) - (keys[S.aimLeft] ? 1 : 0);
+      const ky = (keys[S.aimUp] ? 1 : 0) - (keys[S.aimDown] ? 1 : 0);
+      a.aimX = kx * STICK_SENS * DT;
+      a.aimY = ky * STICK_SENS * DT;
+      // Only the seat holding the pointer lock steers with the mouse, and only
+      // on the first substep of a frame, so one mouse movement turns once.
+      if (edge && mouse.locked && i === arenaMouseSeat()) {
+        const d = takeMouseDelta();
+        a.aimX += d.dx * MOUSE_SENS;
+        a.aimY -= d.dy * MOUSE_SENS;      // screen down is aim down
+      }
+      // Jump reuses the wall key, which builds nothing in this mode.
+      a.jump = !!keys[S.wall];
+      a.dashEdge = edge && hit(S.dash);
+    } else {
+      a.jump = false;
+      a.dashEdge = false;
+    }
   }
+}
+
+/**
+ * Which seat owns the mouse in the 3D arena?
+ *
+ * There is one mouse, so exactly one seat can use it: the first seat that is
+ * neither CPU-driven nor pad-driven. In split-screen that is P1, and P2 falls
+ * back to the aim keys or a pad's right stick.
+ */
+function arenaMouseSeat() {
+  for (let i = 0; i < 2; i++) {
+    if (game.cpu[i]) continue;
+    if (pads.active[i]) continue;
+    return i;
+  }
+  return -1;
 }
 
 /*
@@ -2815,7 +2921,7 @@ const MODE_HINT = {
   Records the geometry the drawing code actually produced, so the test suite can
   assert that every row landed on screen instead of re-deriving the maths.
 */
-const layoutProbe = { menu: null, pause: null };
+const layoutProbe = { menu: null, pause: null, controls: null };
 
 /*
   Counts what the renderer actually painted on the last frame. Assertions read
@@ -3519,6 +3625,12 @@ function finishMatch(winner, byTime) {
   game.byTime = !!byTime;
   game.scene = SCENE.WIN;
   game.timer = 0;
+  /*
+    Every route out of a match passes through here, so this is the one place that
+    can guarantee the 3D mode's pointer lock is released — whether the match ended
+    on frags, on the clock, or on a tournament tie being resolved.
+  */
+  releaseArenaLock();
   // A guest is only mirroring the host's world; the host records the result so
   // the same match is not counted twice on one machine.
   if (!netIsGuest()) recordResult(winner, game.score);
@@ -5950,10 +6062,18 @@ function openPause() {
   game.pauseRow = 0;
   game.scene = SCENE.PAUSE;
   releaseCPUKeys();
+  /*
+    Hand the mouse back the moment the game is paused. A pause overlay the player
+    cannot click away from, with the cursor still captured, is indistinguishable
+    from a frozen game — the single worst failure this mode could ship.
+  */
+  releaseArenaLock();
   // Drop any held input so a key held at the moment of pausing doesn't
   // keep steering when play resumes.
   for (const a of intent) {
     a.left = a.right = a.up = a.down = a.kick = a.kickEdge = false;
+    a.aimX = a.aimY = 0;
+    a.jump = a.dashEdge = false;
   }
 }
 
@@ -5982,6 +6102,9 @@ function quitToMenu() {
   game.locked = [false, false];
   game.suddenDeath = false;
   game.editing = -1;
+  // Quitting is an exit from the 3D mode too: drop the arena and the mouse.
+  game.arena = null;
+  releaseArenaLock();
   if (net.active) netReset();      // a match abandoned online drops the link
 }
 
@@ -7204,6 +7327,58 @@ function fitCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 addEventListener("resize", fitCanvas);
+
+/* ---- pointer lock listeners ----------------------------------------------
+
+   Registered once, and deliberately inert outside the 3D arena: a listener that
+   grabbed the mouse on any canvas click would break the 2D game's menus.
+*/
+
+cv.addEventListener("mousedown", (e) => {
+  if (!isArena3D()) return;
+  // Left click fires; it also acquires the lock the first time, since a browser
+  // only grants pointer lock inside a user gesture.
+  if (!mouse.locked) requestArenaLock();
+  if (e.button === 0) mouse.fireHeld = true;
+});
+
+addEventListener("mouseup", (e) => {
+  if (e.button === 0) mouse.fireHeld = false;
+});
+
+addEventListener("mousemove", (e) => {
+  if (!mouse.locked || !isArena3D()) return;
+  // Accumulated raw and drained once per frame by gatherIntent, so sensitivity
+  // never depends on how many mousemove events a frame happens to receive.
+  mouse.dx += e.movementX || 0;
+  mouse.dy += e.movementY || 0;
+});
+
+document.addEventListener("pointerlockchange", () => {
+  mouse.locked = document.pointerLockElement === cv;
+  if (!mouse.locked) {
+    // Escaping the lock (the player pressed ESC, or the browser dropped it)
+    // must not leave a half-consumed movement to be applied on return.
+    mouse.dx = 0;
+    mouse.dy = 0;
+    /*
+      The browser's own ESC handling releases the lock WITHOUT sending a keydown
+      the game can see. Treating that release as a pause is what stops the mode
+      appearing to swallow ESC: the player presses it once and gets the pause
+      overlay, exactly as in every other mode.
+    */
+    if (isArena3D() && mouse.wantLock) {
+      mouse.wantLock = false;
+      openPause();
+    }
+  }
+});
+
+document.addEventListener("pointerlockerror", () => {
+  // Refused. The mode stays playable on the aim keys, so this is not fatal.
+  mouse.locked = false;
+  mouse.wantLock = false;
+});
 
 function roundRect(x, y, w, h, r) {
   ctx.beginPath();
@@ -9558,8 +9733,17 @@ function drawControls() {
   }
 
   const bw = 560, bx = (W - bw) / 2;
-  const top = 128;
-  const gap = 38;
+  /*
+    Geometry scales to the number of actions. The 3D arena added five bindings,
+    which at the original 38px pitch pushed BACK and the gamepad status line off
+    the bottom of a 600px canvas. Measured: 13 rows at top 116 / gap 28 ends at
+    y 540 with the status line at 544, so everything lands on screen.
+  */
+  const rowsTotal = ACTIONS.length + 2;          // + RESET + BACK
+  const compact = rowsTotal > 9;
+  const top = compact ? 116 : 128;
+  const gap = compact ? 28 : 38;
+  const rowH = compact ? 24 : 32;
 
   ACTIONS.forEach((a, i) => {
     const y = top + i * gap;
@@ -9570,26 +9754,26 @@ function drawControls() {
 
     ctx.fillStyle = binding ? "rgba(251,191,36,0.18)"
                   : on ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.045)";
-    roundRect(bx, y, bw, 32, 8);
+    roundRect(bx, y, bw, rowH, 8);
     ctx.fill();
     if (on || binding) {
       ctx.strokeStyle = binding ? "#fbbf24" : "#7dd3fc";
       ctx.lineWidth = 2.5;
       ctx.stroke();
     }
-    text(a.label, bx + 20, y + 16, 12, "#cddcf2", "left", 800);
+    text(a.label, bx + 20, y + rowH / 2, compact ? 11 : 12, "#cddcf2", "left", 800);
 
     // The bound key, in a keycap.
     const code = SCHEME[game.ctrlSeat][a.key];
     const cap = binding ? "PRESS A KEY…" : keyLabel(code);
     const cw = Math.max(64, cap.length * 9 + 20);
     ctx.fillStyle = binding ? "#fbbf24" : code ? "rgba(15,23,42,0.9)" : "rgba(248,113,113,0.25)";
-    roundRect(bx + bw - cw - 16, y + 4, cw, 24, 5);
+    roundRect(bx + bw - cw - 16, y + 4, cw, rowH - 8, 5);
     ctx.fill();
     ctx.strokeStyle = binding ? "#fde68a" : "rgba(255,255,255,0.2)";
     ctx.lineWidth = 1.5;
     ctx.stroke();
-    text(cap, bx + bw - cw / 2 - 16, y + 16, 11,
+    text(cap, bx + bw - cw / 2 - 16, y + rowH / 2, 11,
          binding ? "#0b1220" : code ? "#a7f3d0" : "#fca5a5", "center", 900);
   });
 
@@ -9599,14 +9783,23 @@ function drawControls() {
     const y = top + i * gap;
     const on = game.ctrlRow === i;
     ctx.fillStyle = on ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.045)";
-    roundRect(bx + bw / 4, y, bw / 2, 32, 8);
+    roundRect(bx + bw / 4, y, bw / 2, rowH, 8);
     ctx.fill();
     if (on) { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke(); }
-    text(label, W / 2, y + 16, 13, on ? col : "#cddcf2", "center", 900);
+    text(label, W / 2, y + rowH / 2, 13, on ? col : "#cddcf2", "center", 900);
   });
 
   // Gamepad status, so a player knows whether a pad was seen.
-  const gy = top + (ACTIONS.length + 2) * gap + 8;
+  const gy = top + rowsTotal * gap + 8;
+  /*
+    Record what was actually painted, so the test suite can assert every row and
+    the status line landed on the canvas instead of re-deriving the arithmetic —
+    a test that recomputes the layout passes even when the layout is wrong.
+  */
+  layoutProbe.controls = {
+    rows: rowsTotal, top, gap, rowH, statusY: gy,
+    bottom: top + (rowsTotal - 1) * gap + rowH,
+  };
   if (!padsAvailable()) {
     text("gamepads: not supported by this browser", W / 2, gy, 10, "#6b819e", "center", 600);
   } else if (pads.active[0] || pads.active[1]) {
@@ -10569,6 +10762,7 @@ const PHYS = {
   mouse, requestArenaLock, releaseArenaLock, takeMouseDelta, pointerLockSupported,
   stepFighter, moveBasis, arenaBounds, fighterVsCover,
   fireShot, stepShots, shotVsFighter, applyDamage, arenaFrag, aimRay, fighterEye,
+  arenaMouseSeat,
   ARENA_HW, ARENA_HD, ARENA_WALL_H, FIGHTER_R, FIGHTER_H, EYE_H,
   HP_MAX, SHOT_DMG, SHOT_SPD, SHOT_R, SHOT_LIFE, FIRE_CD, RESPAWN_T,
   F_GRAV, F_JUMP, F_MAXV, F_ACCEL, F_DASH, F_DASH_CD,
@@ -16467,11 +16661,24 @@ function runTests() {
     const saved = { scene: game.scene, ctrlSeat: game.ctrlSeat, ctrlRow: game.ctrlRow,
                     ctrlBinding: game.ctrlBinding, cpu: [...game.cpu] };
 
-    ok("every action is listed for rebinding", ACTIONS.length === 6, `${ACTIONS.length}`);
-    ok("both seats have a default for every action",
-       SCHEME_DEFAULTS.every((sc) => ACTIONS.every((a) => sc[a.key])));
+    ok("every action is listed for rebinding", ACTIONS.length === 11, `${ACTIONS.length}`);
+    /*
+      Every action needs a default EXCEPT the 3D aim keys for seat 0, which are
+      deliberately blank: that seat aims with the mouse, and the controls screen
+      renders an unbound action as an empty keycap the player can fill in.
+    */
+    const AIM_ACTIONS = ["aimUp", "aimDown", "aimLeft", "aimRight"];
+    ok("both seats have a default for every action bar P1's mouse-driven aim",
+       SCHEME_DEFAULTS.every((sc, seat) =>
+         ACTIONS.every((a) => sc[a.key] ||
+                              (seat === 0 && AIM_ACTIONS.includes(a.key)))));
+    ok("and P1's aim keys are blank precisely because P1 uses the mouse",
+       AIM_ACTIONS.every((k) => SCHEME_DEFAULTS[0][k] === ""));
+    ok("while P2, who has no mouse, gets a full aim cluster",
+       AIM_ACTIONS.every((k) => !!SCHEME_DEFAULTS[1][k]));
     ok("the two seats do not share a default key",
-       ACTIONS.every((a) => SCHEME_DEFAULTS[0][a.key] !== SCHEME_DEFAULTS[1][a.key]));
+       ACTIONS.every((a) => !SCHEME_DEFAULTS[0][a.key] ||
+                            SCHEME_DEFAULTS[0][a.key] !== SCHEME_DEFAULTS[1][a.key]));
 
     // Key labels must be readable, never blank.
     {
@@ -19758,6 +19965,138 @@ function runTests() {
 
     endArena3D();
     Object.assign(game, saved);
+    game.particles = [];
+  }
+
+  // 24k. Input: pointer-lock discipline and the controls screen.
+  {
+    const saved = { arena: game.arena, mode: game.mode, scene: game.scene,
+                    players: game.players, cpu: [...game.cpu], sel: [...game.sel],
+                    ball: game.ball, ctrlSeat: game.ctrlSeat, ctrlRow: game.ctrlRow,
+                    ctrlFrom: game.ctrlFrom, pauseFrom: game.pauseFrom,
+                    goalsToWin: game.goalsToWin, score: [...game.score],
+                    winner: game.winner };
+
+    // The new actions exist and are reachable from the controls screen.
+    {
+      const keysOf = ACTIONS.map((a) => a.key);
+      ok("the aim actions are rebindable",
+         ["aimUp", "aimDown", "aimLeft", "aimRight"].every((k) => keysOf.includes(k)));
+      ok("and so is dash", keysOf.includes("dash"));
+      ok("a blank binding still renders a readable label", keyLabel("") === "—");
+      ok("the controls screen has a row for every action plus reset and back",
+         (() => { game.ctrlSeat = 0; game.ctrlRow = 0; game.ctrlFrom = null;
+                  layoutProbe.controls = null; drawControls();
+                  return layoutProbe.controls &&
+                         layoutProbe.controls.rows === ACTIONS.length + 2; })());
+    }
+
+    /*
+      The whole controls list must fit the canvas. Adding five actions overflowed
+      it at the original row pitch, and the probe records what was actually
+      painted so this cannot pass by re-deriving the same wrong arithmetic.
+    */
+    {
+      game.ctrlFrom = null;
+      layoutProbe.controls = null;
+      drawControls();
+      const p = layoutProbe.controls;
+      ok("every controls row lands on the canvas", p && p.bottom <= H,
+         p ? `bottom ${p.bottom} vs ${H}` : "no probe");
+      ok("and the gamepad status line lands on the canvas too",
+         p && p.statusY <= H - 8, p ? `${p.statusY}` : "no probe");
+      ok("and the list starts below the seat tabs", p && p.top >= 114, `${p && p.top}`);
+      ok("rows do not overlap each other", p && p.rowH <= p.gap,
+         p ? `rowH ${p.rowH} vs gap ${p.gap}` : "");
+    }
+
+    // Pointer lock must be released on EVERY path out of the mode.
+    {
+      game.mode = MODE.ARENA3D;
+      game.cpu = [false, true];
+      game.sel = [0, 3];
+
+      // 1. Pausing.
+      startMatch();
+      mouse.locked = true; mouse.wantLock = true; mouse.dx = 40; mouse.dy = 20;
+      openPause();
+      ok("pausing releases the pointer lock", !mouse.locked && !mouse.wantLock);
+      ok("and discards accumulated mouse movement",
+         mouse.dx === 0 && mouse.dy === 0);
+
+      // 2. Quitting to the menu.
+      startMatch();
+      mouse.locked = true; mouse.wantLock = true;
+      quitToMenu();
+      ok("quitting releases the pointer lock", !mouse.locked && !mouse.wantLock);
+      ok("and clears the arena", game.arena === null);
+
+      // 3. The match ending on frags.
+      startMatch();
+      game.goalsToWin = 1;
+      mouse.locked = true; mouse.wantLock = true;
+      {
+        const b = game.arena.fighters[1];
+        for (let i = 0; i < 4; i++) applyDamage(b, SHOT_DMG, 0);
+      }
+      ok("winning releases the pointer lock", !mouse.locked && !mouse.wantLock);
+      ok("and tears the arena down", game.arena === null);
+
+      // 4. The match ending on the clock, via the shared time-expiry path.
+      startMatch();
+      game.goalsToWin = 9;
+      mouse.locked = true; mouse.wantLock = true;
+      game.arena.frags = [2, 1];
+      game.score = [2, 1];
+      timeExpired();
+      ok("time expiry releases the pointer lock", !mouse.locked && !mouse.wantLock);
+      ok("and awards the match to the frag leader", game.winner === 0, `${game.winner}`);
+
+      // 5. Explicit teardown, however it is reached.
+      startMatch();
+      mouse.locked = true; mouse.wantLock = true;
+      endArena3D();
+      ok("tearing the arena down releases the pointer lock",
+         !mouse.locked && !mouse.wantLock);
+    }
+
+    // The mouse only steers the seat that owns it, and only in the 3D mode.
+    {
+      game.mode = MODE.ARENA3D;
+      game.cpu = [false, true];
+      pads.active[0] = pads.active[1] = false;
+      ok("the first human seat owns the mouse", arenaMouseSeat() === 0);
+      game.cpu = [true, false];
+      ok("and it follows the human when seat 0 is a bot", arenaMouseSeat() === 1);
+      game.cpu = [true, true];
+      ok("with no human seats, nobody owns the mouse", arenaMouseSeat() === -1);
+      game.cpu = [false, true];
+    }
+
+    // takeMouseDelta drains exactly once, so one movement turns the view once.
+    {
+      mouse.dx = 12; mouse.dy = -7;
+      const first = takeMouseDelta();
+      const second = takeMouseDelta();
+      ok("mouse movement is delivered once", first.dx === 12 && first.dy === -7);
+      ok("and not delivered twice", second.dx === 0 && second.dy === 0);
+    }
+
+    // Aim keys must not steer anything outside the 3D arena.
+    {
+      game.mode = MODE.SINGLE;
+      game.scene = SCENE.PLAY;
+      game.arena = null;
+      keys[SCHEME[1].aimLeft] = true;
+      gatherIntent(true);
+      ok("the aim keys do nothing in a 2D match",
+         intent[1].aimX === 0 && intent[1].aimY === 0);
+      ok("and neither does the 3D jump binding", intent[1].jump === false);
+      keys[SCHEME[1].aimLeft] = false;
+    }
+
+    Object.assign(game, saved);
+    for (const k in keys) keys[k] = false;
     game.particles = [];
   }
 
