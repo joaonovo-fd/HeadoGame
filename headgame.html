@@ -13627,7 +13627,20 @@ function drawSettings() {
       hint: "show the round trip during an online match" },
     { label: "BACK", accent: "#4ade80" },
   ];
-  drawMenuList(items, game.settingsRow, W / 2 - 260, 154, 520, 54, 10, (i) => {
+  /*
+    GEOMETRY SIZED TO THE ROW COUNT, not to a number that happened to fit.
+
+    At 54px rows with a 10px gap this list ran to y=656 on a 600px canvas the moment
+    an eighth row was added: BACK was pushed off the bottom, invisible and untappable,
+    and the screen still drew without error. Derived from items.length so adding the
+    next row shrinks the rows instead of silently losing the last one — and the
+    geometry is asserted against the canvas in the tests.
+  */
+  const listTop = 150, listBot = H - 14;
+  const gap = 8;
+  const rowH = Math.min(54,
+    Math.floor((listBot - listTop - gap * (items.length - 1)) / items.length));
+  drawMenuList(items, game.settingsRow, W / 2 - 260, listTop, 520, rowH, gap, (i) => {
     game.settingsRow = i;
     pressed.Space = true; keys.Space = true; tapKeys.push("Space");
   });
@@ -18240,8 +18253,12 @@ function runTests() {
       {
         game.settingsFrom = SCENE.MENU;
         game.settingsRow = 0;
-        clickRegions.length = 0;
-        const painted = capturePaint(() => drawSettings());
+        /*
+          Regions are collected into nextRegions and only become clickRegions when
+          commitRegions() runs at the end of a real draw pass, so the commit has to
+          happen here too — reading clickRegions without it sees the previous frame.
+        */
+        const painted = capturePaint(() => { drawSettings(); commitRegions(); });
 
         const off = painted.lines.filter((l) => l.y < 0 || l.y > H);
         ok("no settings row is painted off the canvas", off.length === 0,
