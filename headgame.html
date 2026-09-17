@@ -5449,6 +5449,33 @@ function relayControl(msg) {
   }
 }
 
+/**
+ * The address to offer by default.
+ *
+ * When the page was SERVED BY THE RELAY — the recommended way to play, since a
+ * file:// page is blocked from reaching localhost by some security software — its
+ * own origin is already the right answer, and needs no typing. This is also what
+ * makes a tunnel work with one URL: whoever opens it gets an address that points
+ * back through the same tunnel.
+ */
+function defaultRelayAddress() {
+  try {
+    if (typeof location !== "undefined" && /^https?:$/.test(location.protocol) &&
+        location.host) {
+      return location.host;
+    }
+  } catch (e) { /* no location: fall through */ }
+  return `localhost:${relayPort()}`;
+}
+
+/** Is the page being served by a relay, rather than opened from disk? */
+function servedFromRelay() {
+  try {
+    return typeof location !== "undefined" && /^https?:$/.test(location.protocol) &&
+           !!location.host;
+  } catch (e) { return false; }
+}
+
 /** Open a WebSocket to the relay, or report why not. */
 function relayConnect(address, onOpen) {
   const url = relayUrl(address);
@@ -7357,14 +7384,14 @@ function updateOnline(dt) {
     // B — browse the games open on a relay. Q — join one straight away.
     if (hit("KeyB")) {
       net.relayIntent = "browse";
-      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
+      net.relayAddr = net.relayAddr || defaultRelayAddress();
       net.editing = "addr";
       net.error = "";
       return;
     }
     if (hit("KeyQ")) {
       net.relayIntent = "quick";
-      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
+      net.relayAddr = net.relayAddr || defaultRelayAddress();
       net.editing = "addr";
       net.error = "";
       return;
@@ -7372,7 +7399,7 @@ function updateOnline(dt) {
     // T — host a TOURNAMENT by address, for up to 16 players.
     if (hit("KeyT")) {
       net.relayIntent = "tourney";
-      net.relayAddr = net.relayAddr || `localhost:${relayPort()}`;
+      net.relayAddr = net.relayAddr || defaultRelayAddress();
       net.editing = "addr";
       net.error = "";
       return;
@@ -10218,6 +10245,18 @@ function relayFailureHint(url) {
     return "ngrok cannot authenticate through a TLS-inspecting network " +
            "(corporate proxy). Use tools/play-online.sh, which tunnels over SSH.";
   }
+  /*
+    A file:// PAGE is the most common cause on a locked-down machine, and it is
+    fatal: some security software (a corporate proxy such as Netskope — measured on
+    the machine this was written on) refuses every request from a unique file://
+    origin to localhost, so the socket closes with 1006 before the relay sees it.
+    Serving the page from the relay puts both on one origin and sidesteps it.
+  */
+  if (!servedFromRelay()) {
+    return "this page was opened from a file, and some networks block a file:// " +
+           "page from reaching a local server. Run tools/play-online.sh and open " +
+           "the http:// address it prints, instead of the file.";
+  }
   return "could not reach the relay. Check the address, and that the host is " +
          "running tools/play-online.sh (or node tools/relay.js).";
 }
@@ -12639,7 +12678,7 @@ function drawOnline() {
              value ? "#ffffff" : "#5f7391", "left", 700);
       };
       field(152, finding ? "RELAY ADDRESS" : "HOST ADDRESS",
-            net.relayAddr, "addr", `localhost:${relayPort()}`);
+            net.relayAddr, "addr", defaultRelayAddress());
       if (joining) field(202, "GAME CODE", net.relayCode, "code", "ABCD");
       if (net.editing === "port") {
         field(joining ? 252 : 202, "DEFAULT PORT", net.portText, "port",
@@ -14924,6 +14963,7 @@ const PHYS = {
   // Relay transport: connect by address instead of pasting codes.
   relayUrl, relayHost, relayJoin, relayConnect, relayControl, relayChannelShim,
   relayFailureHint, relayPort, relayFail, relayPeer,
+  defaultRelayAddress, servedFromRelay,
   relayBrowse, relayQuick, relayRefresh, relayJoinCode, relayMarkStarted,
   onlineBack, onlineToOptions,
   RELAY_CONTROL, RELAY_PORT_DEFAULT, RELAY_TIMEOUT,
@@ -25157,8 +25197,20 @@ function runTests() {
       ok("a localhost.run address resolves to wss",
          relayUrl("abc123.lhr.life") === "wss://abc123.lhr.life",
          relayUrl("abc123.lhr.life"));
-      ok("any other failure suggests checking the relay is running",
-         /relay\.js|relay/i.test(relayFailureHint("ws://10.0.0.5:8787")));
+      /*
+        The generic hint depends on HOW the page was opened. From a file:// origin —
+        which the test harness simulates, and which is the common case on a
+        locked-down machine — the advice is to serve the page from the relay
+        instead, because some security software blocks a file:// page from reaching
+        a local server at all.
+      */
+      ok("any other failure gives advice naming something to run",
+         /play-online|relay\.js|relay/i.test(relayFailureHint("ws://10.0.0.5:8787")),
+         relayFailureHint("ws://10.0.0.5:8787"));
+      ok("and a file:// page is told to open the served address instead",
+         !servedFromRelay() &&
+         /open the http|play-online/i.test(relayFailureHint("ws://10.0.0.5:8787")),
+         relayFailureHint("ws://10.0.0.5:8787"));
       ok("every hint is a usable sentence, not a code",
          ["wss://x.trycloudflare.com", "wss://10.0.0.5", "ws://a:1"]
            .every((u) => relayFailureHint(u).length > 30));
@@ -25795,6 +25847,61 @@ function runTests() {
       netReset();
       Object.assign(net, savedNet);
       game.scene = savedScene;
+    }
+
+    /*
+      25d7. SERVED FROM THE RELAY. A page opened from disk has a unique file://
+      origin, and some security software refuses to let such a page reach a local
+      server at all — measured on the machine this was written on, where a browser
+      fetch failed and a WebSocket closed with 1006 before the relay saw anything,
+      while the identical request from node succeeded.
+
+      Nothing in the relay can fix that, because nothing arrives. Serving the page
+      from the relay puts both on ONE origin, so there is no cross-origin request
+      left to intercept — and the address then needs no typing at all.
+    */
+    {
+      const savedNet = { ...net };
+      const loc = typeof location !== "undefined" ? location : null;
+      const savedProto = loc && loc.protocol;
+      const savedHost = loc && loc.host;
+
+      if (loc) {
+        loc.protocol = "http:";
+        loc.host = "localhost:8787";
+        ok("a served page knows it was served", servedFromRelay() === true);
+        ok("and defaults to its own origin, so nothing needs typing",
+           defaultRelayAddress() === "localhost:8787", defaultRelayAddress());
+        ok("which resolves to an insecure socket for a local relay",
+           relayUrl(defaultRelayAddress()) === "ws://localhost:8787");
+
+        // Through a tunnel the same default must become wss, or the browser
+        // refuses it as mixed content.
+        loc.protocol = "https:";
+        loc.host = "abc123.lhr.life";
+        ok("a page served through a tunnel defaults to that tunnel",
+           defaultRelayAddress() === "abc123.lhr.life");
+        ok("and resolves to a secure socket",
+           relayUrl(defaultRelayAddress()) === "wss://abc123.lhr.life",
+           relayUrl(defaultRelayAddress()));
+
+        // From disk, the hint has to name the actual remedy.
+        loc.protocol = "file:";
+        loc.host = "";
+        ok("a page opened from disk knows it was not served",
+           servedFromRelay() === false);
+        ok("and falls back to a local default",
+           /^localhost:\d+$/.test(defaultRelayAddress()), defaultRelayAddress());
+        ok("and its failure hint says to open the served address instead",
+           /open the http|play-online/i.test(relayFailureHint("ws://localhost:8787")),
+           relayFailureHint("ws://localhost:8787"));
+
+        loc.protocol = savedProto;
+        loc.host = savedHost;
+      }
+
+      netReset();
+      Object.assign(net, savedNet);
     }
 
     // 25e. Failure and teardown must leave nothing behind.

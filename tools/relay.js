@@ -21,6 +21,14 @@
     node tools/relay.js --port 9000
     node tools/relay.js --host 127.0.0.1
 
+  IT ALSO SERVES THE GAME. Open http://localhost:8787/ rather than the .html
+  file: a page opened from disk has a unique file:// origin, and some security
+  software (a corporate proxy such as Netskope — measured, not guessed) will not
+  let such a page reach a local server at all, so the game cannot connect to its
+  own relay. Served from here, the page and the socket share one origin and
+  there is nothing left to intercept. A guest needs no copy of the file, and the
+  address field fills itself in.
+
   In the game, ONLINE offers:
     Q  quick connect — join whatever is open on the relay
     B  browse — see every open game, with its host, mode and how full it is
@@ -58,6 +66,11 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+/* The project root, so the relay can serve the game from the same origin. */
+const ROOT = path.resolve(__dirname, "..");
 
 const args = process.argv.slice(2);
 const argOf = (name, dflt) => {
@@ -298,9 +311,67 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
     return;
   }
-  res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-  res.end(`Head Game relay is running.\n\n${rooms.size} room(s) open.\n\n` +
-          `Point the game's ONLINE screen at this address.\n`);
+
+  /*
+    THE RELAY ALSO SERVES THE GAME.
+
+    Opening headgame.html from disk gives the page a file:// origin, which some
+    security software — a corporate proxy such as Netskope, measured on the machine
+    this was written on — will not let reach localhost at all: fetch fails and a
+    WebSocket closes with 1006 before the relay ever sees a connection. Nothing in
+    the relay can fix that, because nothing arrives.
+
+    Serving the page from here instead gives it the SAME ORIGIN as the socket it
+    wants to open, so there is no cross-origin request to intercept. It also means
+    a tunnel publishes the game and its relay together: one URL to share, and the
+    guest needs no copy of the file.
+  */
+  const rawPath = String(req.url || "/").split("?")[0];
+  const file = rawPath === "/" || rawPath === "/index.html"
+    ? "headgame.html"
+    : rawPath.replace(/^\/+/, "");
+  /*
+    Only files inside the project, and only the handful of types the game uses.
+    Path traversal is refused outright rather than normalised, so there is no
+    clever encoding to get wrong.
+  */
+  if (file.includes("..") || path.isAbsolute(file)) {
+    res.writeHead(403).end("no");
+    return;
+  }
+  const TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".css": "text/css",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
+    ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".wav": "audio/wav",
+    ".ico": "image/x-icon",
+  };
+  const ext = path.extname(file).toLowerCase();
+  if (!TYPES[ext]) { res.writeHead(404).end("not found"); return; }
+  const full = path.join(ROOT, file);
+  if (!full.startsWith(ROOT)) { res.writeHead(403).end("no"); return; }
+  fs.readFile(full, (err, body) => {
+    if (err) {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end(`not found: ${file}`);
+      log(`404 ${file}`);
+      return;
+    }
+    // Logged so it is obvious whether a browser is reaching the relay at all —
+    // the difference between "the page will not load" and "the socket will not
+    // open" is the whole diagnosis when something is intercepting traffic.
+    log(`served ${file} to ${req.socket.remoteAddress}`);
+    res.writeHead(200, {
+      "content-type": TYPES[ext],
+      // The file changes constantly during development; never cache it.
+      "cache-control": "no-store",
+    });
+    res.end(body);
+  });
+  return;
 });
 
 server.on("upgrade", (req, sock) => {
