@@ -3464,7 +3464,7 @@ const SCENE = {
   match back exactly where it was, including mid-countdown or mid-celebration.
 */
 const PAUSE_ITEMS = ["resume", "music", "settings", "board", "restart", "quit"];
-const SETTINGS_ITEMS = ["music", "shake", "particles", "flash", "sfxhint", "gamepad", "back"];
+const SETTINGS_ITEMS = ["music", "shake", "particles", "flash", "sfxhint", "gamepad", "ping", "back"];
 
 const MODE = {
   SINGLE: "single",
@@ -4033,6 +4033,12 @@ const game = {
     particles: true,    // burst effects
     flash: true,        // white flash on a goal
     hints: true,        // on-screen control reminders during play
+    /*
+      Show the measured round trip during an online match. On by default: it only
+      ever appears when actually connected, and knowing whether the connection or
+      the game is at fault is worth far more than the corner it occupies.
+    */
+    ping: true,
     music: true,        // background music
     gamepad: true,      // read connected controllers
     /*
@@ -5132,6 +5138,19 @@ const NET_SNAP_BUF = 24;
   seat this machine predicts — every other body is placed exactly as the host said.
 */
 const NET_RECONCILE = 12;
+/*
+  How often a machine measures the round trip, in Hz. Two a second: frequent enough
+  that the overlay reacts to a network that degrades mid-match, rare enough that the
+  probes themselves are a rounding error next to the snapshot stream.
+*/
+const NET_PING_HZ = 2;
+/*
+  A round trip longer than this is not believed. A reply can arrive absurdly late
+  after a stall, or be a duplicate of one already counted, and either would rewrite
+  a good reading with nonsense. Well above any playable latency, so a genuinely bad
+  connection still reports its real (terrible) number.
+*/
+const NET_PING_MAX = 4000;
 const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
 /*
   How often a machine with no seat to drive says "still here". Well inside
@@ -5696,6 +5715,9 @@ const net = {
   sendAcc: 0,             // snapshot rate limiter
   lastIntentByte: -1,     // guest: last input byte sent, so an unchanged one is not resent
   intentAcc: 0,           // guest: time since the last intent packet went out
+  pingAcc: 0,             // time since the last ping probe went out
+  pingWait: 0,            // stamp of the probe we are waiting on, 0 if none
+  pingAt: 0,              // when the newest reading was taken, for staleness
   snapPrev: null,         // guest: previous snapshot (for interpolation)
   snapNext: null,         // guest: latest snapshot
   snapBuf: [],            // guest: recent snapshots, each stamped with .at
@@ -5804,6 +5826,10 @@ function netReset() {
   */
   net.lastIntentByte = -1;
   net.intentAcc = 0;
+  net.pingMs = 0;
+  net.pingAcc = 0;
+  net.pingWait = 0;
+  net.pingAt = 0;
   net.snapT = 0;
   net.snapGap = 1 / NET_SNAP_HZ;
   net.snapAt = 0;
@@ -6694,6 +6720,44 @@ function netHandle(msg, peer) {
     }
     return;
   }
+  /*
+    PING. A probe is echoed back verbatim; the echo is what the sender times.
+
+    The stamp is the SENDER's own clock, never interpreted by the receiver — the two
+    machines share no clock, so only the sender can subtract. That makes the whole
+    measurement immune to clock skew, and means the relay needs to know nothing
+    about it: it forwards both messages like any other game traffic.
+  */
+  if (msg.t === "pi") {
+    if (typeof msg.s === "number") {
+      // Reply to the ASKER alone when we know who that was, or a hub host would
+      // answer one guest's probe to the whole room.
+      if (peer) netSendTo(peer, { t: "po", s: msg.s });
+      else netSend({ t: "po", s: msg.s });
+    }
+    return;
+  }
+  if (msg.t === "po") {
+    if (typeof msg.s !== "number") return;
+    const rtt = netClock() * 1000 - msg.s;
+    /*
+      Only a plausible reading is kept. A negative one means the stamp was not ours,
+      and an enormous one is a reply that arrived after a stall — believing either
+      would replace a good number with a meaningless one.
+    */
+    if (rtt >= 0 && rtt <= NET_PING_MAX) {
+      /*
+        Smoothed, because a single packet's round trip is noisy and a number that
+        flickers every reading is unreadable. A light average settles quickly while
+        still moving promptly when the connection genuinely changes.
+      */
+      net.pingMs = net.pingMs > 0 ? net.pingMs + (rtt - net.pingMs) * 0.35 : rtt;
+      net.pingAt = netClock();
+      if (peer) peer.pingMs = net.pingMs;
+    }
+    net.pingWait = 0;
+    return;
+  }
   // A spectator's "still here". The clocks are already reset by the channel
   // handler, so there is nothing more to do than not mistake it for rubbish.
   if (msg.t === "ka") return;
@@ -6731,6 +6795,29 @@ function netPump() {
   if (!netIsHub() && net.lastRecv > NET_TIMEOUT && net.state === "live") {
     net.state = "closed";
     net.error = "peer stopped responding";
+  }
+
+  /*
+    PING PROBE. Sent by BOTH roles, before the role split below, so a guest measures
+    its latency to the host and a host measures its own to the room — the overlay
+    then has a real number to show on either screen rather than only on one.
+
+    `pingWait` holds the outstanding stamp, so a probe is not re-sent while one is
+    still in flight; it is cleared by the echo, and abandoned after a while so a
+    dropped probe cannot wedge the measurement permanently.
+  */
+  if (net.state === "live") {
+    net.pingAcc = (net.pingAcc || 0) + DT;
+    if (net.pingAcc >= 1 / NET_PING_HZ) {
+      net.pingAcc = 0;
+      const now = netClock() * 1000;
+      // A probe still outstanding after two intervals is treated as lost.
+      if (net.pingWait && now - net.pingWait > (2000 / NET_PING_HZ)) net.pingWait = 0;
+      if (!net.pingWait) {
+        net.pingWait = now;
+        netSend({ t: "pi", s: now });
+      }
+    }
   }
 
   if (netIsGuest()) {
@@ -7903,6 +7990,7 @@ function updateSettings(dt) {
     case "particles": game.opt.particles = !game.opt.particles; saveOpts(game.opt); break;
     case "flash":     game.opt.flash = !game.opt.flash; saveOpts(game.opt); break;
     case "sfxhint":   game.opt.hints = !game.opt.hints; saveOpts(game.opt); break;
+    case "ping":      game.opt.ping = !game.opt.ping; saveOpts(game.opt); break;
     case "back":      if (go) leave(); break;
   }
 }
@@ -13535,6 +13623,8 @@ function drawSettings() {
       hint: "show the key reminder during play" },
     { label: "GAMEPAD", value: game.opt.gamepad,
       hint: "read connected controllers" },
+    { label: "PING METER", value: game.opt.ping,
+      hint: "show the round trip during an online match" },
     { label: "BACK", accent: "#4ade80" },
   ];
   drawMenuList(items, game.settingsRow, W / 2 - 260, 154, 520, 54, 10, (i) => {
@@ -14676,6 +14766,41 @@ function drawSelect() {
 }
 
 function drawOverlays() {
+  /*
+    PING METER. A small corner readout of the measured round trip.
+
+    WHY IT EARNS ITS SPACE: when an online match feels wrong, the first question is
+    always whether the network or the game is at fault, and there was no way to tell
+    from inside the game. A number here answers it immediately — and colours it, so
+    the answer is legible at a glance without reading the digits.
+
+    Only while genuinely connected, and only while a reading is FRESH: showing a
+    stale number during a stall is worse than showing nothing, because it claims the
+    connection is fine at the exact moment it is not.
+  */
+  if (game.opt.ping && net.active && net.state === "live" && net.pingMs > 0 &&
+      netClock() - (net.pingAt || 0) < 3) {
+    const ms = Math.round(net.pingMs);
+    /*
+      Thresholds chosen against what this game actually needs: the guest predicts
+      its own player, so its own input is unaffected, and what the round trip really
+      governs is how stale the OPPONENT and the ball are. Under ~60ms that is
+      imperceptible; past ~150ms the ball visibly lags behind the play.
+    */
+    const col = ms < 60 ? "#4ade80" : ms < 150 ? "#fbbf24" : "#f87171";
+    const label = `${ms} ms`;
+    const bw = 74, bh = 22, bx = 14, by = H - bh - 12;
+    ctx.fillStyle = "rgba(6,12,22,0.72)";
+    roundRect(bx, by, bw, bh, 7);
+    ctx.fill();
+    // A dot in the same colour, so the state reads even at a glance.
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(bx + 12, by + bh / 2, 4, 0, Math.PI * 2);
+    ctx.fill();
+    text(label, bx + 24, by + bh / 2 + 1, 11, col, "left", 800);
+  }
+
   /*
     Someone joined or dropped. Shown HERE, over live play, because a drop used to
     surface only on the ONLINE screen — which nobody is looking at mid-match, so
@@ -18031,7 +18156,8 @@ function runTests() {
       game.settingsFrom = SCENE.MENU;
       game.scene = SCENE.SETTINGS;
       for (const [row, key] of [["shake", "shake"], ["particles", "particles"],
-                                ["flash", "flash"], ["sfxhint", "hints"]]) {
+                                ["flash", "flash"], ["sfxhint", "hints"],
+                                ["ping", "ping"]]) {
         game.settingsRow = SETTINGS_ITEMS.indexOf(row);
         const before = game.opt[key];
         tapIn(SCHEME[0].right, updateSettings);
@@ -18101,6 +18227,40 @@ function runTests() {
         }
       }
       ok("the settings screen renders from both entry points", drew, err);
+
+      /*
+        EVERY SETTINGS ROW MUST BE ON THE CANVAS AND REACHABLE.
+
+        "It rendered without throwing" is not enough: adding a row to this
+        fixed-geometry list silently pushed BACK past the bottom of the canvas, where
+        it was both invisible and untappable — the screen still drew perfectly, and
+        every existing assertion still passed. Checked as real painted output and
+        real click targets, so the next row added cannot repeat it.
+      */
+      {
+        game.settingsFrom = SCENE.MENU;
+        game.settingsRow = 0;
+        clickRegions.length = 0;
+        const painted = capturePaint(() => drawSettings());
+
+        const off = painted.lines.filter((l) => l.y < 0 || l.y > H);
+        ok("no settings row is painted off the canvas", off.length === 0,
+           off.map((l) => `"${l.s}" at y=${l.y.toFixed(0)}`).join(", "));
+
+        // The list is only usable if every row can actually be clicked.
+        const rows = clickRegions.filter((r) => r.w >= 400);
+        ok("every settings row has a click target",
+           rows.length >= SETTINGS_ITEMS.length,
+           `${rows.length} targets for ${SETTINGS_ITEMS.length} rows`);
+        const offRow = rows.find((r) => r.y < 0 || r.y + r.h > H);
+        ok("and every one of them is inside the canvas", !offRow,
+           offRow && `row at y=${offRow.y} h=${offRow.h} (canvas ${H})`);
+
+        // BACK specifically: losing it is losing the only way off the screen.
+        ok("the BACK row is visible",
+           painted.lines.some((l) => /^BACK$/.test(l.s) && l.y >= 0 && l.y <= H),
+           painted.lines.map((l) => `${l.s}@${l.y.toFixed(0)}`).join(" | "));
+      }
 
       drew = true;
       for (const online of [false, true]) {
@@ -23618,6 +23778,139 @@ function runTests() {
       Object.assign(intent[1], savedIntent);
       netReset();
       Object.assign(net, savedNet);
+    }
+
+    /*
+      PING. `net.pingMs` existed as a field but nothing ever wrote to it, so the
+      number was always zero — worse than absent, because it looks like a reading.
+
+      Measured as a real round trip: send a stamped probe, the far end echoes it
+      back, and the elapsed time is the latency. That is the honest definition, and
+      it is what the overlay reports. Both roles measure, so the guest sees its lag
+      to the host and the host sees its lag to each guest.
+    */
+    {
+      const savedNet = { ...net };
+      const sent = [];
+      net.active = true; net.role = "guest";
+      net.localSeat = 1; net.remoteSeat = 0;
+      net.spectating = false;
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      // A real session is always "live" while it pings: there is nothing to measure
+      // before the connection is up, and probing a dead one would be noise.
+      net.state = "live";
+      net.pingMs = 0;
+      net.pingAcc = 0;
+      net.pingWait = 0;
+
+      // A probe goes out on its own schedule, without being asked.
+      for (let i = 0; i < Math.ceil(1 / DT); i++) netPump();
+      const probe = sent.find((m) => m.t === "pi");
+      ok("a ping probe is sent automatically", !!probe, JSON.stringify(sent.slice(0, 4)));
+      ok("and it carries a stamp to match the reply to", probe && typeof probe.s === "number");
+      ok("probes are not spammed", sent.filter((m) => m.t === "pi").length <= 4,
+         `${sent.filter((m) => m.t === "pi").length} in a second`);
+
+      /*
+        THE ECHO. A machine receiving a probe must reply with the SAME stamp, so the
+        sender can compute the round trip without either clock being shared.
+      */
+      sent.length = 0;
+      netHandle({ t: "pi", s: 12345 });
+      const echo = sent.find((m) => m.t === "po");
+      ok("a received probe is echoed straight back", !!echo);
+      ok("and the echo returns the original stamp", echo && echo.s === 12345,
+         echo && `${echo.s}`);
+
+      // And the reply must produce a plausible reading, not a zero.
+      net.pingMs = 0;
+      netHandle({ t: "po", s: netClock() * 1000 - 42 });
+      ok("an echo turns into a measured ping", net.pingMs > 0, `${net.pingMs}`);
+      ok("and the reading is in the right ballpark",
+         net.pingMs >= 30 && net.pingMs < 200, `${net.pingMs} ms`);
+
+      /*
+        A STALE echo — one whose stamp we never sent, or a duplicate arriving late —
+        must not be believed. Otherwise a delayed packet rewrites a good reading.
+      */
+      const good = net.pingMs;
+      netHandle({ t: "po", s: netClock() * 1000 - 9000 });
+      ok("an absurd round trip is rejected rather than displayed",
+         net.pingMs === good, `${net.pingMs} vs ${good}`);
+
+      // A ping probe must never be mistaken for a relay control message.
+      ok("the ping names do not collide with relay control names",
+         !RELAY_CONTROL.has("pi") && !RELAY_CONTROL.has("po"));
+
+      netReset();
+      ok("netReset clears the ping reading", net.pingMs === 0, `${net.pingMs}`);
+      Object.assign(net, savedNet);
+    }
+
+    /*
+      THE PING OVERLAY. It has to actually PAINT — a row that silently never draws
+      has shipped in this file before, so this reads the real output rather than
+      merely checking that drawing did not throw.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      const savedPing = game.opt.ping;
+      game.scene = SCENE.PLAY;
+      game.opt.ping = true;
+
+      net.active = true; net.role = "guest";
+      net.localSeat = 1; net.remoteSeat = 0;
+      net.state = "live";
+      net.transport = "relay";
+      net.pingMs = 42;
+      net.pingAt = netClock();
+
+      const shown = capturePaint(() => drawOverlays());
+      const hasPing = shown.lines.some((l) => /\b42\s*ms\b/i.test(l.s));
+      ok("the overlay paints the measured ping", hasPing,
+         shown.lines.map((l) => l.s).join(" | ") || "(nothing painted)");
+      ok("and it stays on the canvas",
+         shown.lines.every((l) => l.x >= 0 && l.x <= W && l.y >= 0 && l.y <= H),
+         JSON.stringify(shown.lines.find((l) => l.x < 0 || l.x > W || l.y < 0 || l.y > H)));
+
+      // OFFLINE there is no ping to report, so the overlay must not appear at all.
+      netReset();
+      game.scene = SCENE.PLAY;
+      const offline = capturePaint(() => drawOverlays());
+      ok("no ping is shown in an offline match",
+         !offline.lines.some((l) => /\bms\b/i.test(l.s)),
+         offline.lines.map((l) => l.s).join(" | "));
+
+      /*
+        And it must be possible to turn OFF: an overlay that cannot be dismissed is
+        a permanent imposition on everybody who does not want it.
+      */
+      net.active = true; net.role = "guest"; net.state = "live";
+      net.pingMs = 42; net.pingAt = netClock();
+      game.opt.ping = false;
+      const hidden = capturePaint(() => drawOverlays());
+      ok("the ping overlay can be switched off",
+         !hidden.lines.some((l) => /\b42\s*ms\b/.test(l.s)),
+         hidden.lines.map((l) => l.s).join(" | "));
+
+      /*
+        A reading that has STOPPED arriving must not keep displaying a stale number
+        as though it were current — that is actively misleading when a connection is
+        in trouble, which is exactly when the overlay matters most.
+      */
+      game.opt.ping = true;
+      net.pingMs = 42;
+      net.pingAt = netClock() - 10;          // ten seconds old
+      const stale = capturePaint(() => drawOverlays());
+      ok("a stale reading is not presented as current",
+         !stale.lines.some((l) => /\b42\s*ms\b/.test(l.s)),
+         stale.lines.map((l) => l.s).join(" | "));
+
+      game.opt.ping = savedPing;
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
     }
 
     /*
