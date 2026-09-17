@@ -27,6 +27,25 @@ process.env.PORT = String(PORT);
 const relay = require("./relay.js");
 relay.server.listen(PORT, "127.0.0.1", run);
 
+/*
+  The GUID from RFC 6455 §1.3, written out here INDEPENDENTLY of the relay's own
+  copy. That independence is the whole point: this suite used to skip past the
+  handshake headers without reading them, so a relay computing
+  Sec-WebSocket-Accept from a corrupted GUID passed every test while no browser
+  could connect — Chrome answered "Incorrect 'Sec-WebSocket-Accept' header value"
+  and closed with 1006. Importing the constant under test, or recomputing the
+  hash with it, would have reproduced the same typo and proved nothing.
+
+  Anchored to the published test vector below, so the constant itself is checked
+  rather than merely agreed with.
+*/
+const RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const acceptFor = (key) =>
+  crypto.createHash("sha1").update(key + RFC6455_GUID).digest("base64");
+
+/** Every handshake the clients below completed, for the assertions to check. */
+const handshakes = [];
+
 function client(name, onMsg) {
   return new Promise((resolve) => {
     const key = crypto.randomBytes(16).toString("base64");
@@ -42,6 +61,14 @@ function client(name, onMsg) {
       if (!upgraded) {
         const i = buf.indexOf("\r\n\r\n");
         if (i < 0) return;
+        /*
+          VALIDATE THE HANDSHAKE, as a browser does. A client that ignores this
+          header talks happily to a server no browser will accept.
+        */
+        const head = buf.slice(0, i).toString("latin1");
+        const got = (head.match(/^sec-websocket-accept:\s*(\S+)/im) || [])[1];
+        handshakes.push({ name, key, got, want: acceptFor(key),
+                          status: head.split("\r\n")[0] });
         upgraded = true;
         buf = buf.slice(i + 4);
         resolve({ send, sock });
@@ -75,12 +102,38 @@ const t0 = (x) => x;
 
 async function run() {
   const results = [];
+
+  /*
+    THE HANDSHAKE ITSELF, first — before any room logic, because everything below
+    is unreachable from a browser if this is wrong.
+
+    The published test vector from RFC 6455 §1.3: this exact key must produce this
+    exact accept value. It pins the GUID to the spec rather than to whatever the
+    relay happens to contain, which is how a transposed character in the constant
+    went unnoticed while every other test passed.
+  */
+  results.push(["the RFC 6455 test vector produces the published accept value",
+    acceptFor("dGhlIHNhbXBsZSBub25jZQ==") === "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+    acceptFor("dGhlIHNhbXBsZSBub25jZQ==")]);
+  results.push(["the relay's GUID is the one from the spec",
+    relay.WS_GUID === RFC6455_GUID, relay.WS_GUID]);
+
   let code = null, guestGot = [], hostGot = [];
   const host = await client("host", (t) => {
     const m = JSON.parse(t);
     hostGot.push(m);
     if (m.t === "hosting") code = m.code;
   });
+  /*
+    A BROWSER WOULD HAVE REFUSED THIS. Checked per connection rather than once,
+    since the accept value is derived from each client's own key.
+  */
+  results.push(["the relay replies 101 Switching Protocols",
+    handshakes[0] && /^HTTP\/1\.1 101 /.test(handshakes[0].status),
+    handshakes[0] && handshakes[0].status]);
+  results.push(["and a Sec-WebSocket-Accept a browser will accept",
+    handshakes[0] && handshakes[0].got === handshakes[0].want,
+    handshakes[0] && `got ${handshakes[0].got} want ${handshakes[0].want}`]);
   host.send({ t: "host", mode: "tournament", name: "TEST CUP" });
   await new Promise((r) => setTimeout(r, 120));
   results.push(["host receives a room code", !!code && /^[A-Z2-9]{4}$/.test(code), code]);

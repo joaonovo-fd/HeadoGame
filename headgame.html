@@ -5082,12 +5082,25 @@ function releaseCPUKeys() {
   connection carries them comfortably.
 */
 
-const NET_SNAP_HZ = 30;        // host snapshot rate
+/*
+  HOST SNAPSHOT RATE.
+
+  60 rather than 30: the interpolation buffer below is measured in send intervals,
+  so halving the interval halves the latency it costs without making the buffer any
+  more fragile. A snapshot is ~250 bytes, so this is ~15KB/s — cheap even through a
+  tunnel, and far cheaper than the 120 packets/second the GUEST used to send back
+  before netPump learned to only speak on change.
+*/
+const NET_SNAP_HZ = 60;
 /*
   A jump larger than this between two snapshots is a TELEPORT, not movement, so
   it is applied outright instead of being smoothed. Without this, a kickoff reset
   or a goal would slide everything across the pitch over a third of a second.
   Set above the furthest anything travels in one snapshot interval at full pace.
+
+  Deliberately NOT lowered alongside the faster snapshot rate: less ground is
+  covered per interval now, so the existing threshold is simply further clear of
+  real movement, and a genuine teleport is still nowhere near it.
 */
 const NET_SNAP_CUT = 220;
 /*
@@ -5098,10 +5111,27 @@ const NET_SNAP_CUT = 220;
 
   A little over one interval absorbs ordinary jitter. Larger is smoother but
   adds input latency, which matters because the guest also plays.
+
+  1.25 intervals, which at 60Hz is ~21ms — against 53ms at the old 30Hz × 1.6. It
+  stays above 1.0 on purpose: the buffer has to span a whole send interval, or one
+  late packet leaves nothing to interpolate toward and the guest visibly stalls.
+  Jitter absorption comes from the higher rate now, not from a deeper buffer.
 */
-const NET_LERP_DELAY = 1.6;
-/* Snapshots kept for interpolation. Enough to cover the delay plus jitter. */
-const NET_SNAP_BUF = 12;
+const NET_LERP_DELAY = 1.25;
+/*
+  Snapshots kept for interpolation. Enough to cover the delay plus jitter — and at
+  60Hz each one spans half as long, so this holds ~0.4s of history: still ample for
+  a bursty tunnel, where several packets can land at once after a pause.
+*/
+const NET_SNAP_BUF = 24;
+/*
+  How quickly a predicted player is pulled toward the host's version, per second.
+  The gap closes by roughly this fraction each second, so at 12 a disagreement is
+  ~85% gone in 160ms: fast enough that the guest never plays a materially different
+  position, slow enough that no single frame shows a jump. Only ever applied to the
+  seat this machine predicts — every other body is placed exactly as the host said.
+*/
+const NET_RECONCILE = 12;
 const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
 /*
   How often a machine with no seat to drive says "still here". Well inside
@@ -5228,6 +5258,32 @@ function relayChannelShim(ws) {
     if (msg && typeof msg.t === "string" && RELAY_CONTROL.has(msg.t)) {
       relayControl(msg);
       return;
+    }
+    /*
+      GAME TRAFFIC MEANS THE ROOM IS REALLY JOINED — so a GUEST goes live here.
+
+      The relay tells the HOST that somebody arrived ("peer-joined"), and that
+      branch sets net.active and net.state. Nothing equivalent reaches the joiner:
+      it is sent "joined", which only names the room, so a guest sat on "joining
+      the game…" indefinitely while the host displayed a connected match. Its own
+      netSendHello() was silently suppressed as well, since that returns early
+      unless net.active, so the host never learned the guest's name.
+
+      Promoted at the TRANSPORT level rather than inside the "hi" handler because
+      any message from the host is equally good proof the room is shared — and the
+      liveness rule then does not depend on which packet happens to arrive first.
+
+      `net.role`, NOT netIsGuest(): that helper is `net.active && role === "guest"`,
+      and net.active is precisely what is being set here, so using it would test
+      for the state it is meant to establish and never fire.
+    */
+    if (net.role === "guest" && net.transport === "relay" && net.relayCode &&
+        net.state !== "live") {
+      net.state = "live";
+      net.active = true;
+      net.lastRecv = 0;
+      net.error = "";
+      netSendHello();          // answer, so the host learns this guest's name
     }
     /*
       ATTRIBUTION. The relay stamps every forwarded message with the seat it came
@@ -5638,6 +5694,8 @@ const net = {
   error: "",
   lastRecv: 0,            // seconds since last message
   sendAcc: 0,             // snapshot rate limiter
+  lastIntentByte: -1,     // guest: last input byte sent, so an unchanged one is not resent
+  intentAcc: 0,           // guest: time since the last intent packet went out
   snapPrev: null,         // guest: previous snapshot (for interpolation)
   snapNext: null,         // guest: latest snapshot
   snapBuf: [],            // guest: recent snapshots, each stamped with .at
@@ -5739,6 +5797,13 @@ function netReset() {
   net.goalPhaseTarget = 0;
   net.goalPhaseHave = false;
   net.beatAcc = 0;
+  /*
+    Cleared, or the next match starts believing it already sent this byte and
+    swallows the first input that happens to match the last one of the old match.
+    -1 is "nothing sent yet", which no packIntent result can equal.
+  */
+  net.lastIntentByte = -1;
+  net.intentAcc = 0;
   net.snapT = 0;
   net.snapGap = 1 / NET_SNAP_HZ;
   net.snapAt = 0;
@@ -6249,6 +6314,17 @@ function netApplySnapshot(s) {
     if (!d) continue;
     if (!game.players[i] || TEAMS.indexOf(game.players[i].team) !== d[7]) {
       game.players[i] = new Player(i, TEAMS[d[7]] || TEAMS[0]);
+      /*
+        A BRAND-NEW player has no prediction worth keeping — it is sitting at its
+        spawn point, not at anything this machine simulated. Reconciliation must
+        therefore not ease it into place from there: seed it with the host's position
+        outright, or a guest joining mid-match starts several hundred pixels adrift
+        and slides slowly toward the truth.
+      */
+      game.players[i].x = d[0];
+      game.players[i].y = d[1];
+      game.players[i].vx = 0;
+      game.players[i].vy = 0;
     }
     const pl = game.players[i];
     pl.facing = d[3];
@@ -6300,6 +6376,68 @@ function netSyncGoalPhase(dt) {
   net.goalPhaseTarget += dt;             // the host's clock keeps running too
 }
 
+/**
+ * Is the guest predicting a given seat?
+ *
+ * Only its OWN, and only while it is really playing that seat. A spectator has no
+ * seat to predict, and the opponent must never be predicted — the guest cannot know
+ * what they are pressing, so a guess would be wrong as often as right and would
+ * fight the interpolated truth arriving from the host.
+ */
+function netPredicts(i) {
+  return net.role === "guest" && net.active && !net.spectating &&
+         game.scene === SCENE.PLAY && i === net.localSeat &&
+         !game.cpu[i] && !!game.players[i];
+}
+
+/**
+ * GUEST: simulate our own player from our own input, right now.
+ *
+ * WHY: the guest used to run no simulation at all, so pressing a key sent a byte
+ * and then waited for the host to apply it, snapshot it, and for that snapshot to
+ * cross the wire and clear the interpolation buffer. Over a tunnel that is 150ms+
+ * before your own head moves, which is the lag that made this unplayable. The
+ * opponent and the ball can afford to lag; the character under your hands cannot.
+ *
+ * Deliberately narrow. It reuses the REAL Player.update, so predicted motion obeys
+ * exactly the same physics the host will apply — accel, friction, air control,
+ * gravity, jump, the lot — which is what keeps prediction and truth close enough
+ * that corrections stay invisible. But it runs only the movement half: no ball
+ * contact, no kicks landing, no power-ups, no scoring. Those are host-authoritative
+ * and arrive in snapshots; predicting them would mean showing the player a goal
+ * that never happened.
+ */
+function netPredictSelf(dt) {
+  const i = net.localSeat;
+  if (!netPredicts(i)) return;
+  const me = game.players[i];
+  /*
+    Effect timers and superpower charge are the HOST's to run — it owns the clock
+    for them and streams the result. Snapshotting them here would double-tick
+    anything the snapshot also carries, so they are saved and restored around the
+    step, leaving only position and velocity predicted.
+  */
+  const keepEffects = { ...me.effects };
+  const keepSuperT = me.superT, keepCharge = me.charge;
+  const keepStun = me.stun, keepKickT = me.kickT, keepKickCD = me.kickCD;
+  const keepFireCD = me.fireCD, keepDashCD = me.dashCD, keepDashT = me.dashT;
+
+  // No `other`: body-vs-body shove is host-authoritative, and predicting it would
+  // let the guest push an opponent whose real position it does not yet know.
+  me.update(dt, null);
+
+  me.effects = keepEffects;
+  me.superT = keepSuperT; me.charge = keepCharge;
+  me.stun = keepStun; me.kickT = keepKickT; me.kickCD = keepKickCD;
+  me.fireCD = keepFireCD; me.dashCD = keepDashCD; me.dashT = keepDashT;
+
+  // The same solid world the host will enforce, so a prediction never walks
+  // through a wall and then gets yanked back out of it.
+  playerVsPlatforms(me);
+  playerVsWalls(me);
+  if (game.rules && game.rules.confine) confineToHalf(me);
+}
+
 /** Seconds on a monotonic clock, for measuring snapshot arrival gaps. */
 function netClock() {
   try { return performance.now() / 1000; } catch (e) { return 0; }
@@ -6313,9 +6451,36 @@ function netPlaceFrom(s) {
   for (let i = 0; i < 2; i++) {
     const d = s.p[i];
     if (!d || !game.players[i]) continue;
-    game.players[i].x = d[0];
-    game.players[i].y = d[1];
-    game.players[i].r = d[2];
+    const pl = game.players[i];
+    pl.r = d[2];
+    /*
+      RECONCILIATION for the seat this machine predicts.
+
+      Writing the interpolated position straight in would undo the prediction on
+      every frame — the player would move, then be dragged back to where the host
+      thought they were a round trip ago, which is worse than not predicting at all.
+      So the predicted seat KEEPS its own position and is only eased toward the
+      host's, closing the gap fast enough to stay honest and gently enough to be
+      invisible.
+
+      A large disagreement is a CUT, not drift — a goal reset, a mine launch, a
+      teleport — and is adopted outright, because easing across half the pitch would
+      look like the player sliding on ice and would leave them wrong for a long time.
+    */
+    if (netPredicts(i)) {
+      const gap = Math.hypot(d[0] - pl.x, d[1] - pl.y);
+      if (gap > NET_SNAP_CUT) {
+        pl.x = d[0]; pl.y = d[1];
+        pl.vx = 0; pl.vy = 0;
+      } else {
+        const k = clamp(net.reconcileK || 0, 0, 1);
+        pl.x += (d[0] - pl.x) * k;
+        pl.y += (d[1] - pl.y) * k;
+      }
+      continue;
+    }
+    pl.x = d[0];
+    pl.y = d[1];
   }
 }
 
@@ -6362,6 +6527,13 @@ function netInterpolate(dt) {
       net.renderT += drift * clamp(dt * 4, 0, 1);
     }
   }
+  /*
+    The reconciliation strength for THIS frame. Derived from dt so the pull is the
+    same per second at any frame rate — a 144Hz screen must not correct 2.4x harder
+    than a 60Hz one, or the two would feel different.
+  */
+  net.reconcileK = clamp(dt * NET_RECONCILE, 0, 1);
+
   const target = net.renderT;
 
   // Find the pair that brackets the target time.
@@ -6580,7 +6752,30 @@ function netPump() {
       }
       return;
     }
-    netSend({ t: "i", b: packIntent(intent[net.localSeat]) });
+    /*
+      SEND ON CHANGE, not on every substep.
+
+      netPump runs once per physics substep — 120 a second — and this used to emit
+      an intent packet every time. Holding a direction produces an identical byte,
+      so ~118 of those 120 frames a second were redundant. Over a tunnel that cost
+      real smoothness: the relay forwards each frame, TCP coalesces them into
+      bursts, and the bursts land as jitter on top of the genuine latency.
+
+      Three rules keep it correct rather than merely cheap:
+        - a CHANGED byte goes out at once, so input is never delayed;
+        - an EDGE byte (kick, wall) always goes out, because those are one-shot
+          and a dropped frame would be a lost action rather than a late one;
+        - and a floor of NET_BEAT_HZ resends the current byte even when nothing
+          changes, so a still player never looks silent to the host's timeout.
+    */
+    const b = packIntent(intent[net.localSeat]);
+    const edge = b & (32 | 64);             // kickEdge | wallEdge — never coalesce
+    net.intentAcc = (net.intentAcc || 0) + DT;
+    if (edge || b !== net.lastIntentByte || net.intentAcc >= 1 / NET_BEAT_HZ) {
+      net.lastIntentByte = b;
+      net.intentAcc = 0;
+      netSend({ t: "i", b });
+    }
     return;
   }
 
@@ -7369,7 +7564,14 @@ function updateOnline(dt) {
     // A — host by address. S — join by address. Both use the relay.
     if (hit("KeyA")) {
       net.relayIntent = "host";
-      net.relayAddr = net.relayAddr || `localhost:${RELAY_PORT_DEFAULT}`;
+      /*
+        The page's OWN ORIGIN, not a guessed port. This assumed 8787 while the
+        relay may be on any port — `play-online.sh 8788` was enough to break it —
+        so the socket went to a port with nothing listening while the page had been
+        served from the working one. Q, B and T were already right; these two were
+        not, which is why some options connected and others did not.
+      */
+      net.relayAddr = net.relayAddr || defaultRelayAddress();
       net.editing = "addr";
       net.error = "";
       return;
@@ -7377,6 +7579,9 @@ function updateOnline(dt) {
     if (hit("KeyS")) {
       net.relayIntent = "join";
       net.relayCode = "";
+      // Likewise, and it offered NOTHING at all — an empty field that reads as
+      // "could not reach the relay" the moment it is submitted unchanged.
+      net.relayAddr = net.relayAddr || defaultRelayAddress();
       net.editing = "addr";
       net.error = "";
       return;
@@ -9737,6 +9942,14 @@ function step(dt) {
       nothing and stops them stuttering at the snapshot rate.
     */
     netInterpolate(dt);
+    /*
+      PREDICT AFTER RECONCILING. netInterpolate has just eased our own player
+      toward the host's position; stepping our own input now carries that corrected
+      position forward, so input always applies to the freshest truth available.
+      Reversing the order would predict from a stale position and then immediately
+      overwrite the result.
+    */
+    netPredictSelf(dt);
     goalPhase += dt;
     netSyncGoalPhase(dt);
     for (const w of game.walls) {
@@ -22873,6 +23086,191 @@ function runTests() {
       net.renderT = 0;
     }
 
+    /*
+      CLIENT-SIDE PREDICTION: the guest's OWN player must answer its own keys
+      immediately, without waiting for the round trip.
+
+      The guest ran no simulation whatsoever, so pressing right sent a byte and
+      then waited: host applies it, host snapshots, snapshot crosses the wire, guest
+      interpolates it a further delay behind. Over a tunnel that is 150ms+ before
+      your own head moves — the "absurd lag" reported. Everything else on screen can
+      afford to be a little behind; the player's own character cannot.
+
+      So the guest now simulates ITS OWN seat locally and reconciles against each
+      snapshot. The opponent and the ball stay purely interpolated, because they are
+      host-authoritative and there is nothing to predict from.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      net.active = true; net.role = "guest";
+      net.localSeat = 1; net.remoteSeat = 0;
+      net.spectating = false;
+      game.scene = SCENE.PLAY;
+      game.cpu = [false, false];
+
+      const me = game.players[1], them = game.players[0];
+      const savedIntent = { ...intent[1] };
+      for (const k in intent[1]) intent[1][k] = false;
+
+      // One authoritative snapshot, so the world is defined and the buffer is warm.
+      net.snapBuf = []; net.renderT = 0;
+      const base = netSnapshot();
+      base.at = netClock();
+      net.snapBuf.push(base);
+
+      /*
+        A STEADY stream that says NOBODY IS MOVING. This is the honest test: with
+        the host reporting both players stationary, interpolation alone can only
+        hold them still, so any movement of the guest's own player is prediction and
+        nothing else. Feeding no snapshots at all would not prove it — a starved
+        buffer makes netPlaceFrom pin both players to stored positions, which reads
+        as movement while actually being the opposite.
+      */
+      const HOLD_X = 600, THEIR_X = 300;
+      const still = (at) => {
+        const s = netSnapshot();
+        s.p[0] = [THEIR_X, them.y, them.r, 1, 0, 0, them.ammo, TEAMS.indexOf(them.team)];
+        s.p[1] = [HOLD_X, me.y, me.r, 1, 0, 0, me.ammo, TEAMS.indexOf(me.team)];
+        s.at = at;
+        return s;
+      };
+      const gap2 = 1 / NET_SNAP_HZ;
+      let w2 = 0;
+      net.snapBuf = []; net.renderT = 0;
+      me.x = HOLD_X; me.vx = 0; me.vy = 0; me.onGround = true;
+      them.x = THEIR_X; them.vx = 0; them.vy = 0; them.onGround = true;
+      for (let k = 0; k < 6; k++) { net.snapBuf.push(still(w2)); w2 += gap2; }
+      const myX0 = me.x, theirX0 = them.x;
+
+      // Hold right. The host keeps insisting nobody moved.
+      intent[1].right = true;
+      let lt = 0;
+      for (let i = 0; i < 12; i++) {
+        step(DT);
+        lt += DT;
+        while (w2 <= lt + gap2 * 2) {
+          net.snapBuf.push(still(w2));
+          while (net.snapBuf.length > NET_SNAP_BUF) net.snapBuf.shift();
+          w2 += gap2;
+        }
+      }
+      ok("the guest's own player moves before any snapshot confirms it",
+         me.x > myX0 + 1, `moved ${(me.x - myX0).toFixed(2)}px`);
+      /*
+        The OPPONENT must not be predicted: the guest has no idea what they are
+        pressing, so guessing would produce motion that is wrong as often as right.
+      */
+      ok("but the opponent is not predicted from thin air",
+         Math.abs(them.x - theirX0) < 1.5, `moved ${(them.x - theirX0).toFixed(3)}px`);
+
+      // Jump must work locally too — it is the most latency-sensitive input.
+      me.x = HOLD_X; me.vx = 0; me.vy = 0; me.onGround = true;
+      const myY0 = me.y;
+      intent[1].right = false; intent[1].up = true;
+      for (let i = 0; i < 6; i++) {
+        step(DT);
+        lt += DT;
+        while (w2 <= lt + gap2 * 2) {
+          net.snapBuf.push(still(w2));
+          while (net.snapBuf.length > NET_SNAP_BUF) net.snapBuf.shift();
+          w2 += gap2;
+        }
+      }
+      ok("a predicted jump leaves the ground immediately", me.y < myY0 - 1,
+         `rose ${(myY0 - me.y).toFixed(2)}px`);
+      intent[1].up = false;
+
+      /*
+        RECONCILIATION. The host is authoritative: when a snapshot disagrees with
+        the prediction, the guest must end up where the HOST says — not drift off on
+        its own. Checked with a big disagreement so there is no ambiguity.
+      */
+      me.x = 600; me.vx = 0; me.vy = 0;
+      const corrective = netSnapshot();
+      corrective.p[1] = [200, me.y, me.r, 1, 0, 0, me.ammo, TEAMS.indexOf(me.team)];
+      corrective.at = netClock();
+      netApplySnapshot(corrective);
+      for (let i = 0; i < 90; i++) step(DT);
+      ok("the host's correction wins, so prediction cannot drift",
+         Math.abs(me.x - 200) < 60, `guest at ${me.x.toFixed(0)}, host said 200`);
+
+      /*
+        And a correction must not TELEPORT the player: a small disagreement is eased
+        away, or every packet would visibly snap the character.
+      */
+      me.x = 400; me.vx = 0;
+      const nudge = netSnapshot();
+      nudge.p[1] = [412, me.y, me.r, 1, 0, 0, me.ammo, TEAMS.indexOf(me.team)];
+      nudge.at = netClock();
+      netApplySnapshot(nudge);
+      const beforeNudge = me.x;
+      step(DT);
+      ok("a small correction is eased in, not snapped",
+         Math.abs(me.x - beforeNudge) < 12,
+         `jumped ${Math.abs(me.x - beforeNudge).toFixed(2)}px in one frame`);
+
+      /*
+        A GUEST ARRIVING MID-MATCH has predicted nothing yet, so there is nothing to
+        ease from: a freshly built player sits at its spawn point, and easing from
+        there would start it hundreds of pixels adrift and slide it slowly into place.
+        Caught by the existing snapshot-restore test the moment reconciliation was
+        added, and pinned here as its own case.
+      */
+      {
+        const arrive = netSnapshot();
+        arrive.p[1] = [815, 300, me.r, -1, 0, 0, 0, TEAMS.indexOf(me.team)];
+        arrive.at = netClock();
+        game.players = [null, null];         // as a guest that has just joined
+        net.snapBuf = []; net.renderT = 0;
+        netApplySnapshot(arrive);
+        ok("a guest joining mid-match is seeded exactly where the host says",
+           game.players[1] && Math.abs(game.players[1].x - 815) < 0.2,
+           game.players[1] && `${game.players[1].x}`);
+      }
+
+      Object.assign(intent[1], savedIntent);
+      net.snapBuf = []; net.renderT = 0;
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
+    }
+
+    /*
+      THE LATENCY BUDGET, asserted as milliseconds rather than as the constants
+      that produce them — so retuning either NET_SNAP_HZ or NET_LERP_DELAY stays
+      free, while the thing the player actually feels stays pinned.
+
+      The guest renders NET_LERP_DELAY intervals behind the newest snapshot. That
+      buffer is pure added latency on everything it draws, and at 30Hz with a delay
+      of 1.6 it was 53ms — on top of a real round trip, which over a tunnel is
+      another 60-160ms. It was the largest term this code controls.
+    */
+    {
+      const bufferMs = (1000 / NET_SNAP_HZ) * NET_LERP_DELAY;
+      ok("the interpolation buffer is well under 30ms", bufferMs < 30,
+         `${bufferMs.toFixed(1)} ms`);
+      /*
+        But NOT so small that ordinary jitter starves it: the buffer must still
+        span more than one whole send interval, or a single late packet leaves the
+        guest with nothing to interpolate toward and it visibly stalls.
+      */
+      ok("yet still covers a full send interval, so jitter cannot starve it",
+         NET_LERP_DELAY >= 1, `${NET_LERP_DELAY}`);
+      ok("and the buffer holds enough snapshots to cover that delay",
+         NET_SNAP_BUF > NET_LERP_DELAY * 2, `${NET_SNAP_BUF}`);
+      /*
+        The teleport cut must stay above the furthest anything travels in one
+        interval, or fast movement gets mistaken for a teleport and stops being
+        smoothed at all. A faster snapshot rate means less travel per interval, so
+        this is checked rather than assumed.
+      */
+      const fastest = 900;                       // px/s, comfortably above dash
+      ok("a teleport cut still exceeds one interval of fast travel",
+         NET_SNAP_CUT > fastest / NET_SNAP_HZ,
+         `cut ${NET_SNAP_CUT} vs ${(fastest / NET_SNAP_HZ).toFixed(0)}px of travel`);
+    }
+
     // ---- the music must not leak audio nodes -----------------------------
     {
       /*
@@ -23156,6 +23554,70 @@ function runTests() {
       netHandle({ t: "me", e: "two" });
       ok("a non-numeric identity is refused", net.myEntrant === 1);
       netReset();
+    }
+
+    /*
+      A GUEST MUST NOT FLOOD THE RELAY.
+
+      netPump runs once per PHYSICS SUBSTEP — 120 a second — and the guest sent an
+      intent packet on every one. That is 120 WebSocket frames a second carrying a
+      single byte, four times the host's snapshot rate, and over a tunnel it is
+      actively harmful: the relay has to forward each one, TCP then coalesces them
+      into clumps, and the clumping arrives as jitter on top of the real latency.
+
+      Holding a direction produces the SAME byte every substep, so almost all of
+      that is redundant. Only changes need sending — plus a floor so the host's
+      timeout never fires during a long still moment.
+    */
+    {
+      const sent = [];
+      const savedNet = { ...net };
+      const savedIntent = { ...intent[1] };
+      net.active = true; net.role = "guest";
+      net.localSeat = 1; net.remoteSeat = 0;
+      net.spectating = false;
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      for (const k in intent[1]) intent[1][k] = false;
+
+      // Holding right for a second: one byte, unchanged, 120 substeps.
+      intent[1].right = true;
+      for (let i = 0; i < Math.ceil(1 / DT); i++) netPump();
+      ok("a guest holding one direction does not send 120 packets a second",
+         sent.length <= 12, `${sent.length} in a second`);
+      ok("but it does send at least once, so the host hears the input",
+         sent.some((m) => m.t === "i"), JSON.stringify(sent.slice(0, 3)));
+
+      // A CHANGE must go out promptly — this is the input path, not a heartbeat.
+      const before = sent.length;
+      intent[1].left = true; intent[1].right = false;
+      netPump();
+      ok("a change of direction is sent immediately", sent.length === before + 1,
+         `${sent.length - before}`);
+
+      /*
+        AN EDGE IS ONE-SHOT and must never be deduplicated away: kick and wall are
+        edge-triggered, so a dropped frame is a lost action, not a late one.
+      */
+      const preKick = sent.length;
+      intent[1].kickEdge = true;
+      netPump();
+      const kicked = sent[sent.length - 1];
+      ok("a kick edge is always sent", sent.length === preKick + 1);
+      ok("and carries the kick bit", !!(kicked && (kicked.b & 32)),
+         kicked && `${kicked.b}`);
+
+      // A guest that stops touching anything still has to say so, once.
+      intent[1].kickEdge = false; intent[1].left = false;
+      const preIdle = sent.length;
+      for (let i = 0; i < Math.ceil(1 / DT); i++) netPump();
+      ok("an idle guest keeps the connection alive", sent.length > preIdle,
+         `${sent.length - preIdle}`);
+      ok("without flooding while idle", sent.length - preIdle <= 12,
+         `${sent.length - preIdle} in a second`);
+
+      Object.assign(intent[1], savedIntent);
+      netReset();
+      Object.assign(net, savedNet);
     }
 
     /*
@@ -25899,6 +26361,119 @@ function runTests() {
         loc.protocol = savedProto;
         loc.host = savedHost;
       }
+
+      netReset();
+      Object.assign(net, savedNet);
+    }
+
+    /*
+      25d7. EVERY OPTION MUST DEFAULT TO THE PAGE'S OWN ORIGIN.
+
+      A relay on any port but 8787 broke A and S while Q, B and T worked, which is
+      the signature of a hardcoded default rather than a network problem: the socket
+      went to `localhost:8787` — a port with nothing on it — while the page itself
+      had been served from the relay's real port. The address is offered to the
+      player before they can correct it, so a wrong default IS the bug.
+
+      Driven through the real key handler rather than by calling the helper, because
+      the defect was in the handler and a test of defaultRelayAddress() alone passed
+      throughout.
+    */
+    {
+      const savedNet = { ...net };
+      const savedScene = game.scene;
+      const loc = typeof location !== "undefined" ? location : null;
+      const savedProto = loc && loc.protocol;
+      const savedHost = loc && loc.host;
+
+      if (loc) {
+        // Served from a relay on a NON-default port: the case that failed.
+        loc.protocol = "http:";
+        loc.host = "192.168.1.71:8788";
+        /*
+          A FRESH arrival at the option list. `editing` and `relayAddr` survive
+          netReset deliberately — a player who typed an address should not lose it —
+          so both are cleared here to model someone opening the screen for the
+          first time, which is when the default is what they get.
+        */
+        const offered = (code) => {
+          game.scene = SCENE.ONLINE;
+          netReset();
+          net.relayAddr = "";
+          net.editing = null;
+          net.relayIntent = null;
+          pressed[code] = true;
+          edgeFrame = true;
+          updateOnline(0);
+          delete pressed[code];
+          return net.relayAddr;
+        };
+        for (const [code, what] of [["KeyA", "hosting a match"],
+                                    ["KeyS", "joining by address"],
+                                    ["KeyQ", "quick connect"],
+                                    ["KeyB", "browsing"],
+                                    ["KeyT", "hosting a tournament"]]) {
+          const got = offered(code);
+          ok(`${what} offers the address the page came from`,
+             got === "192.168.1.71:8788", `${code}: ${got}`);
+        }
+
+        // And through a tunnel, where a hardcoded localhost is doubly wrong.
+        loc.protocol = "https:";
+        loc.host = "abc123.lhr.life";
+        for (const code of ["KeyA", "KeyS", "KeyQ", "KeyB", "KeyT"]) {
+          const got = offered(code);
+          ok(`${code} offers the tunnel through which the page was served`,
+             got === "abc123.lhr.life", `${code}: ${got}`);
+        }
+
+        loc.protocol = savedProto;
+        loc.host = savedHost;
+      }
+
+      netReset();
+      Object.assign(net, savedNet);
+      game.scene = savedScene;
+    }
+
+    /*
+      25d8. THE GUEST MUST ACTUALLY GO LIVE.
+
+      A guest that joined a room sat on "joining the game…" forever while the host
+      showed a connected match. The relay's routing was right — the guest gets
+      "joined", the host gets "peer-joined" — but only the HOST's branch set
+      net.active and net.state, so on the guest nothing ever promoted the socket
+      from "connecting" to "live". Its own netSendHello() was suppressed too, since
+      that returns early unless net.active, so the host never learned its name
+      either.
+
+      The host's first game message is what proves the room is really joined, so
+      that is where the guest goes live.
+    */
+    {
+      const savedNet = { ...net };
+      WebSocketSpy.made.length = 0;
+
+      relayJoin("localhost:8787", "ABCD");
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ws._recv({ t: "joined", code: "ABCD", seat: 1, name: "a game", mode: "match" });
+      ok("a joined guest is waiting to connect", net.state === "connecting", net.state);
+      ok("and is not yet claiming a live match", net.active === false, `${net.active}`);
+
+      // The host says hello. That is the moment the match is really joined.
+      ws._recv({ t: "hi", n: "HOSTNAME", v: VERSION });
+      ok("the host's hello takes the guest live", net.state === "live", net.state);
+      ok("and marks the session active", net.active === true, `${net.active}`);
+      ok("and records the host's name", game.remoteName === "HOSTNAME",
+         game.remoteName);
+      /*
+        And the guest must ANSWER, or the host never learns its name — the reason
+        this was gated on net.active in the first place.
+      */
+      const said = ws.sent.map((s) => { try { return JSON.parse(s); } catch (e) { return {}; } });
+      ok("and the guest introduces itself back",
+         said.some((m) => m.t === "hi"), JSON.stringify(said));
 
       netReset();
       Object.assign(net, savedNet);

@@ -80,8 +80,19 @@ const argOf = (name, dflt) => {
 const PORT = Number(argOf("--port", process.env.PORT || 8787));
 const HOST = argOf("--host", "0.0.0.0");
 
-/** WebSocket GUID from RFC 6455, used to prove we speak the protocol. */
-const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F";
+/*
+  WebSocket GUID from RFC 6455 §1.3, used to prove we speak the protocol.
+
+  EXACTLY these characters, ending -C5AB0DC85B11. It was written here as
+  -5AB0DC85B11F — the C transposed to the far end — which made every
+  Sec-WebSocket-Accept wrong, and no browser could ever connect: Chrome reported
+  "Incorrect 'Sec-WebSocket-Accept' header value" and closed with 1006 before the
+  relay saw a single frame. The whole end-to-end suite passed throughout, because
+  its hand-written client skipped the response headers instead of checking them,
+  and a second implementation of the same typo would have agreed with the first
+  anyway. It is now pinned to the published test vector in tools/test-relay.js.
+*/
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /*
   Rooms, keyed by a short code. The FIRST socket to arrive is the host; the rest
@@ -633,4 +644,6 @@ function start() {
 if (require.main === module) start();
 
 module.exports = { readFrames, encodeFrame, encodeClose, makeCode, rooms, start,
-                   server, cleanRoomName, cleanRoomMode, lobbyList, ROOM_MAX };
+                   server, cleanRoomName, cleanRoomMode, lobbyList, ROOM_MAX,
+                   // Exported so the tests can check it against the spec itself.
+                   WS_GUID };
