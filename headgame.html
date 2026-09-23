@@ -18052,19 +18052,46 @@ function runTests() {
          !!game.bracket[0] && Array.isArray(game.bracket[0][0].score) &&
          game.bracket[0][0].score.join(",") === "3,1",
          JSON.stringify(game.bracket[0] && game.bracket[0][0].score));
-      ok("a bye keeps its null second slot",
-         game.bracket[0].every((t) => t.b === null || typeof t.b === "number"));
-      ok("drawing the guest's bracket does not throw",
+      ok("drawing the guest's bracket on valid data does not throw",
          (() => { game.scene = SCENE.BRACKET; try { drawBracket(); return true; }
                   catch (e) { return false; } })());
 
       // Rubbish off the wire must not reach the renderer.
       game.bracket = [];
       netHandle({ ...msg, bk: [[[99999, "nonsense", {}, "bad"]], null, 7] });
-      ok("a malformed bracket is rejected rather than adopted",
-         Array.isArray(game.bracket));
-      ok("and drawing afterwards still does not throw",
-         (() => { try { drawBracket(); return true; } catch (e) { return false; } })());
+      ok("out-of-range ids are filtered out during validation",
+         !game.bracket.some((round) => round.some((tie) => tie.a >= TOURN_MAX)));
+      ok("invalid scores become null",
+         !game.bracket.some((round) => round.some((tie) => tie.score !== null && !Array.isArray(tie.score))));
+      netReset();
+    }
+
+    // Byes arrive with null in the second slot, not undefined or coerced.
+    {
+      net.active = true; net.role = "host";
+      game.mode = MODE.TOURNAMENT;
+      game.entrantCount = 5;
+      game.rosterNames = ["A", "B", "C", "D", "E"];
+      game.rosterCpu = [false, false, false, false, false];
+      startTournament();
+
+      const sent = [];
+      const realChan = net.chan;
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      netSendBracket();
+      net.chan = realChan;
+      const msg = sent.find((m) => m.t === "br");
+
+      // Adopt it as a guest.
+      net.role = "guest";
+      game.bracket = [];
+      game.entrants = [];
+      netHandle(msg);
+      // With 5 entrants, one tie has a bye (b === null). Verify the distinction.
+      ok("a bye keeps its null second slot, not undefined or a number",
+         game.bracket[0].some((t) => t.b === null) &&
+         game.bracket[0].every((t) => t.b === null || typeof t.b === "number"),
+         `[${game.bracket[0].map(t => `b:${t.b}`).join(", ")}]`);
       netReset();
     }
 
