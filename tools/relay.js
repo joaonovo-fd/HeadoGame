@@ -507,7 +507,9 @@ server.on("upgrade", (req, sock) => {
         // Fullest first, so players collect into one game rather than scattering
         // across several half-empty ones.
         .sort((a, b) => b.players - a.players)[0];
-      msg = { t: "join", code: pick.code };
+      // The resume token rides along, or a quick-connect guest who drops right
+      // after joining would have no way back into the room it just picked.
+      msg = { t: "join", code: pick.code, resume: msg.resume };
       // Falls through to the join handler below.
     }
     /*

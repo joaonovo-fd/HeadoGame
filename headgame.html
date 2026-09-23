@@ -5773,8 +5773,11 @@ function relayQuick(address, mode) {
   net.localSeat = 1;
   net.remoteSeat = 0;
   net.lobbyIntent = "quick";
+  // Same token as every other guest join, so a drop right after a quick
+  // connect can still reclaim its seat instead of falling back to a new one.
+  const resume = netResumeToken();
   relayConnect(address, (ws) =>
-    ws.send(JSON.stringify(mode ? { t: "quick", mode } : { t: "quick" })));
+    ws.send(JSON.stringify(mode ? { t: "quick", mode, resume } : { t: "quick", resume })));
 }
 
 /** Ask for a fresh listing. Used by the browser's refresh. */
@@ -18624,6 +18627,60 @@ function runTests() {
       netReset();
     }
 
+    /*
+      TWO PLAYERS AWAY AT ONCE must not cross wires on return.
+
+      relayPeer used to pick the LOWEST FREE entrant slot for every returning
+      guest, ignoring which entrant netResume had actually just handed back. With
+      only one player ever away that happened to be the same number, so the bug
+      was invisible — but with two away simultaneously, the SECOND one to return
+      found entrant 1 free (the first one hadn't come back yet) and got bound to
+      it, even though the reservation was unambiguously for entrant 2. Their
+      input would then have driven entrant 1's player, not their own.
+    */
+    {
+      netReset();
+      net.active = true; net.role = "host"; net.localSeat = 0;
+      game.mode = MODE.TOURNAMENT;
+      game.entrantCount = 4;
+      game.rosterNames = ["HOSTY", "ALICE", "BOB", "CARL"];
+      game.rosterCpu = [false, false, false, false];
+      startTournament();
+
+      const alice = { id: 8, entrantId: 1, relaySeat: 1, name: "ALICE", chan: null,
+                       lastRecv: 0, resume: "tok-alice" };
+      const bob   = { id: 9, entrantId: 2, relaySeat: 2, name: "BOB", chan: null,
+                       lastRecv: 0, resume: "tok-bob" };
+      const carl  = { id: 10, entrantId: 3, relaySeat: 3, name: "CARL", chan: null,
+                       lastRecv: 0, resume: "tok-carl" };
+      net.peers = [alice, bob, carl];
+      game.seats = [0, 1];
+      game.cpu = [false, false];
+
+      // Alice and Bob drop — Carl (entrant 3) stays connected throughout, exactly
+      // like a third player who was never away. Entrant 1 is now the lowest free
+      // slot, and stays that way until Alice herself returns.
+      netDropPeer(alice);
+      netDropPeer(bob);
+      ok("both reservations are held",
+         !!net.reserved["tok-alice"] && !!net.reserved["tok-bob"],
+         JSON.stringify(Object.keys(net.reserved)));
+
+      // Bob — not Alice — is the one who comes back, over a NEW relay
+      // connection, exactly as relayControl's "peer-joined" case sees it.
+      relayControl({ t: "peer-joined", seat: 2, resume: "tok-bob" });
+
+      const rejoined = net.peers.find((p) => p.relaySeat === 2);
+      ok("the returning peer is recognised as a reconnection, not a new joiner",
+         !!rejoined, JSON.stringify(net.peers.map((p) => p.relaySeat)));
+      ok("and is bound to the entrant the reservation actually held (Bob's, not the lowest free slot)",
+         !!rejoined && rejoined.entrantId === 2,
+         `entrantId=${rejoined && rejoined.entrantId}`);
+      ok("Bob's reservation is consumed", !net.reserved["tok-bob"]);
+      ok("Alice's reservation is untouched by Bob's return", !!net.reserved["tok-alice"]);
+      netReset();
+    }
+
     // The guest retries a lost connection instead of ending the match.
     {
       netReset();
@@ -18639,6 +18696,49 @@ function runTests() {
          `${netResumeDelay(1)} ${netResumeDelay(3)} ${netResumeDelay(5)}`);
       ok("and is capped so it never waits absurdly long",
          netResumeDelay(99) <= NET_GRACE_SEC, `${netResumeDelay(99)}`);
+      netReset();
+    }
+
+    /*
+      A SECOND drop must get a FRESH window, not the first drop's leftovers.
+      Without resetting net.resumeAt/net.resumeTries at go-live, a match that
+      survived one drop would have its second drop measured against the FIRST
+      drop's clock (so the grace-window guard could read as already expired)
+      and its backoff picking up from an inflated retry count instead of
+      starting short again — even though the connection had been perfectly
+      healthy in between.
+    */
+    {
+      netReset();
+      net.active = true; net.role = "guest"; net.state = "live";
+      net.relayCode = "ABCD";
+      net.resumeToken = "tok-g2";
+
+      // Simulate what a real first outage leaves behind: some retries spent,
+      // and the clock parked at whenever that outage began.
+      net.resumeTries = 4;
+      net.resumeAt = netClock() - 1000;   // ancient, as an expired outage would be
+
+      // The connection comes back — exactly what net.onmessage's relay-transport
+      // branch and relayControl's "peer-joined" case both do on a real reconnect.
+      netGoLive();
+
+      ok("a successful reconnect clears the retry count",
+         net.resumeTries === 0, `${net.resumeTries}`);
+      ok("and clears the outage clock, so the NEXT drop starts its own window",
+         net.resumeAt === 0, `${net.resumeAt}`);
+
+      // Prove it in the actual guard's own terms (headgame.html's ws.onclose):
+      // net.resumeAt === 0 is a SENTINEL meaning "no outage in progress", not a
+      // timestamp to diff against directly — the guard re-stamps it to "now" the
+      // moment it sees the sentinel, THEN compares. A drop right now, long after
+      // netGoLive ran, must re-stamp to a fresh "now" and so measure a full
+      // window, not read as already expired.
+      if (net.resumeAt === 0) net.resumeAt = netClock();
+      const freshDrop = netClock();
+      ok("so a drop right now would measure a fresh window, not an expired one",
+         freshDrop - net.resumeAt < NET_GRACE_SEC,
+         `${freshDrop} - ${net.resumeAt}`);
       netReset();
     }
 
@@ -26909,6 +27009,12 @@ function runTests() {
       ok("joining from the browser asks for that room",
          joinMsg.t === "join" && joinMsg.code === "BBBB", ws.sent.join());
       ok("and claims the guest seat", net.role === "guest" && net.localSeat === 1);
+      // Without a resume token the relay has no way to hand this seat back to
+      // this same guest after a drop — the browser is one of the two paths most
+      // players actually join through, so it must carry one like relayJoin does.
+      ok("and carries a resume token, so a later drop can reclaim this seat",
+         typeof joinMsg.resume === "string" && joinMsg.resume.length > 0,
+         ws.sent.join());
       ws._recv({ t: "joined", code: "BBBB", seat: 3 });
       ok("and the relay confirms it", net.state === "connecting");
 
@@ -26925,6 +27031,11 @@ function runTests() {
          JSON.parse(q.sent[0]).t === "quick", q.sent.join());
       ok("and sends no mode filter when none was chosen",
          JSON.parse(q.sent[0]).mode === undefined);
+      // Same as browse/typed-code joins: without this, a guest who drops right
+      // after a quick connect has no token to reclaim its seat with.
+      ok("and carries a resume token too",
+         typeof JSON.parse(q.sent[0]).resume === "string" &&
+         JSON.parse(q.sent[0]).resume.length > 0, q.sent.join());
       q._recv({ t: "joined", code: "ZZZZ", seat: 1 });
       q._recv({ t: "peer-joined", seat: 0 });
       ok("and a match becomes live", net.state === "live" && net.active);
