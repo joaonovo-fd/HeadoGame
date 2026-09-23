@@ -5158,6 +5158,36 @@ const NET_TIMEOUT = 6;         // seconds without traffic before we call it dead
   mid-tournament for the crime of watching.
 */
 const NET_BEAT_HZ = 4;
+/*
+  SEND-QUEUE HIGH WATER MARK, in bytes.
+
+  Above this the link is not keeping up, and a snapshot is DROPPED rather than
+  queued. Queueing was the bug: nothing ever shed load, so the backlog grew
+  monotonically and every snapshot waited behind everything already in it —
+  latency climbed for as long as the match lasted and never came back down.
+
+  Dropping is safe precisely because a snapshot is idempotent and superseded by
+  the next one, and netInterpolate already holds its nearest frame rather than
+  extrapolating when the buffer has a gap. 64KB is a few snapshots' worth: high
+  enough that ordinary jitter does not trip it, low enough to bound the delay.
+*/
+const NET_SEND_HIGH_WATER = 64 * 1024;
+/*
+  The snapshot rates to walk between when the link cannot sustain the top one.
+  Stepping down sheds bandwidth deliberately instead of letting the queue do it
+  arbitrarily. NET_LERP_DELAY is measured in send INTERVALS, so the guest's
+  render clock adapts to each step on its own with no change to interpolation.
+  Nothing below 30Hz: past that the interpolation buffer's own delay becomes the
+  dominant latency and stepping further would hurt more than it helps.
+*/
+const NET_RATE_STEPS = [60, 40, 30];
+/*
+  Consecutive drops before stepping down, and clear sends before stepping back
+  up. Asymmetric on purpose: react quickly to a link that is failing, return
+  slowly so a brief clear patch does not flap the rate back and forth.
+*/
+const NET_RATE_DOWN_AFTER = 8;
+const NET_RATE_UP_AFTER = 240;
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 /*
@@ -5260,6 +5290,12 @@ function relayChannelShim(ws) {
     binaryType: "arraybuffer",
     onopen: null, onclose: null, onerror: null, onmessage: null,
     get readyState() { return ws.readyState === 1 ? "open" : "closed"; },
+    /*
+      The socket's unsent backlog, so netSend can shed snapshots rather than
+      queue them. Without forwarding it the shim always looked clear, which
+      left backpressure blind on the relay — the transport most players use.
+    */
+    get bufferedAmount() { return ws.bufferedAmount || 0; },
     send(data) {
       // The relay forwards text; the game already sends JSON strings.
       if (ws.readyState === 1) ws.send(data);
@@ -5831,6 +5867,11 @@ function netReset() {
   net.pingWait = 0;
   net.pingAt = 0;
   net.snapT = 0;
+  net.rateIdx = 0;
+  net.rateDown = 0;
+  net.rateUp = 0;
+  net.snapDropped = 0;
+  net.snapSent = 0;
   net.snapGap = 1 / NET_SNAP_HZ;
   net.snapAt = 0;
   net.copied = false;
@@ -6089,14 +6130,45 @@ function netChannels() {
   return net.chan && net.chan.readyState === "open" ? [net.chan] : [];
 }
 
-/** Broadcast to every connected peer. */
-const netSend = (obj) => {
+/**
+ * The largest unsent backlog across open channels, in bytes.
+ *
+ * The LARGEST, not the sum: with a hub the slowest peer is what decides whether
+ * the host is keeping up, and summing would make eight healthy connections look
+ * saturated. A channel that cannot report a backlog counts as 0 — treating
+ * "unknown" as "full" would throttle a transport that was working fine.
+ */
+function netBuffered() {
+  let worst = 0;
+  for (const c of netChannels()) {
+    const n = c.bufferedAmount;
+    if (typeof n === "number" && Number.isFinite(n) && n > worst) worst = n;
+  }
+  return worst;
+}
+
+/**
+ * Broadcast to every connected peer. Returns whether it was actually sent.
+ *
+ * `droppable` marks a message that may be SHED when the link is behind — only
+ * snapshots, which are idempotent and superseded by the next one. Everything
+ * else (hello, config, bracket, seat assignment, goodbye, and any intent byte
+ * carrying an edge) is reliable and goes out regardless: dropping those loses
+ * an action or a screen's worth of state rather than merely a frame.
+ */
+const netSend = (obj, droppable = false) => {
   const chans = netChannels();
-  if (!chans.length) return;
+  if (!chans.length) return false;
+  if (droppable && netBuffered() > NET_SEND_HIGH_WATER) {
+    net.snapDropped = (net.snapDropped || 0) + 1;
+    return false;
+  }
   const txt = JSON.stringify(obj);          // serialise once, not per peer
   for (const c of chans) {
     try { c.send(txt); } catch (e) { /* that peer dropped; the rest still get it */ }
   }
+  if (droppable) net.snapSent = (net.snapSent || 0) + 1;
+  return true;
 };
 
 /** Send to ONE peer — used for anything peer-specific, like its assigned seat. */
@@ -6887,11 +6959,35 @@ function netPump() {
     return;
   }
 
-  // Host: broadcast a snapshot at a fixed rate rather than every substep.
+  /*
+    Host: broadcast a snapshot at the current rate rather than every substep.
+
+    The rate walks NET_RATE_STEPS rather than being fixed. A link that cannot
+    carry 60Hz will otherwise have the surplus taken out of it as queue depth,
+    which is latency; stepping down spends the same shortfall as a lower update
+    rate instead, which interpolation already hides.
+  */
   net.sendAcc += DT;
-  if (net.sendAcc >= 1 / NET_SNAP_HZ) {
+  const hz = NET_RATE_STEPS[net.rateIdx] || NET_RATE_STEPS[0];
+  if (net.sendAcc >= 1 / hz) {
     net.sendAcc = 0;
-    netSend(netSnapshot());
+    const sent = netSend(netSnapshot(), true);
+    if (sent) {
+      net.rateDown = 0;
+      net.rateUp = (net.rateUp || 0) + 1;
+      if (net.rateUp >= NET_RATE_UP_AFTER && net.rateIdx > 0) {
+        net.rateIdx--;
+        net.rateUp = 0;
+      }
+    } else {
+      net.rateUp = 0;
+      net.rateDown = (net.rateDown || 0) + 1;
+      if (net.rateDown >= NET_RATE_DOWN_AFTER &&
+          net.rateIdx < NET_RATE_STEPS.length - 1) {
+        net.rateIdx++;
+        net.rateDown = 0;
+      }
+    }
   }
 }
 
@@ -18093,6 +18189,75 @@ function runTests() {
          game.bracket[0].every((t) => t.b === null || typeof t.b === "number"),
          `[${game.bracket[0].map(t => `b:${t.b}`).join(", ")}]`);
       netReset();
+    }
+
+    // BACKPRESSURE. A saturated link must shed stale snapshots rather than
+    // queue them: queueing is what made latency climb without ever recovering.
+    {
+      netReset();
+      net.active = true; net.role = "host"; net.state = "live";
+      let buffered = 0;
+      const sentNow = [];
+      net.chan = {
+        readyState: "open",
+        get bufferedAmount() { return buffered; },
+        send: (d) => sentNow.push(JSON.parse(d)),
+      };
+
+      ok("an idle link reports no backlog", netBuffered() === 0);
+
+      // Under the mark everything goes out.
+      buffered = 0;
+      sentNow.length = 0;
+      ok("a snapshot is sent when the link is clear",
+         netSend({ t: "s" }, true) === true && sentNow.length === 1);
+
+      // Over the mark a droppable message is shed.
+      buffered = NET_SEND_HIGH_WATER + 1;
+      sentNow.length = 0;
+      ok("a snapshot is dropped when the link is saturated",
+         netSend({ t: "s" }, true) === false && sentNow.length === 0);
+
+      // But a reliable one is not.
+      sentNow.length = 0;
+      ok("a reliable message is never dropped",
+         netSend({ t: "cfg" }) === true && sentNow.length === 1);
+      sentNow.length = 0;
+      ok("and neither is a bracket",
+         netSend({ t: "br" }, false) === true && sentNow.length === 1);
+
+      // The rate steps DOWN while the link stays hot.
+      net.rateIdx = 0;
+      buffered = NET_SEND_HIGH_WATER + 1;
+      for (let i = 0; i < 400; i++) { net.sendAcc = 1; netPump(); }
+      ok("a saturated link steps the send rate down", net.rateIdx > 0,
+         `rateIdx ${net.rateIdx}`);
+      ok("the rate never falls off the ladder",
+         net.rateIdx < NET_RATE_STEPS.length);
+      ok("the slowest step is still a playable rate",
+         NET_RATE_STEPS[NET_RATE_STEPS.length - 1] >= 30);
+
+      // And recovers when it drains.
+      buffered = 0;
+      for (let i = 0; i < 2000; i++) { net.sendAcc = 1; netPump(); }
+      ok("a drained link recovers the send rate", net.rateIdx === 0,
+         `rateIdx ${net.rateIdx}`);
+
+      // A channel that cannot report a backlog must not be treated as saturated.
+      net.chan = { readyState: "open", send: () => {} };
+      ok("an unknown backlog is treated as clear", netBuffered() === 0);
+      ok("and its snapshots still go out", netSend({ t: "s" }, true) === true);
+      netReset();
+    }
+
+    // The relay shim must forward bufferedAmount, or backpressure is blind on
+    // the transport most players actually use.
+    {
+      const fake = { readyState: 1, bufferedAmount: 4242, send: () => {}, close: () => {} };
+      const shim = relayChannelShim(fake);
+      ok("the relay shim reports the socket's backlog", shim.bufferedAmount === 4242);
+      fake.bufferedAmount = 0;
+      ok("and tracks it as it drains", shim.bufferedAmount === 0);
     }
 
     // A full online bracket must still crown exactly one champion.
