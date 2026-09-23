@@ -6667,6 +6667,27 @@ function netHandle(msg, peer) {
         : null,
     }));
     game.roundPairs = msg.rp;
+    /*
+      The recorded history. Validated rather than trusted: drawBracket indexes
+      entrants by these ids, so a bogus one would reach the renderer. An absent
+      or malformed `bk` leaves the bracket as an empty array, which draws the
+      placeholder tree — the old behaviour, so an older host still interoperates.
+    */
+    const okId = (v) => typeof v === "number" && Number.isInteger(v) &&
+                        v >= 0 && v < TOURN_MAX;
+    game.bracket = Array.isArray(msg.bk)
+      ? msg.bk.map((round) => Array.isArray(round)
+          ? round.filter((t) => Array.isArray(t) && okId(t[0])).map((t) => ({
+              a: t[0],
+              b: okId(t[1]) ? t[1] : null,
+              winner: okId(t[2]) ? t[2] : null,
+              score: Array.isArray(t[3]) &&
+                     typeof t[3][0] === "number" && Number.isFinite(t[3][0]) &&
+                     typeof t[3][1] === "number" && Number.isFinite(t[3][1])
+                ? [t[3][0], t[3][1]] : null,
+            }))
+          : [])
+      : [];
     game.tieIndex = msg.ti;
     game.round = msg.rd;
     game.seats = msg.st;
@@ -6901,6 +6922,19 @@ function netSendBracket() {
     ch: game.champion ? game.champion.id : -1,
     lr: game.lastResult,
     ec: game.entrantCount,
+    /*
+      THE BRACKET HISTORY, so the guest can draw the tree rather than an empty
+      skeleton. `roundPairs` alone only describes the round in progress; every
+      completed tie's winner and score lives here, and without it drawBracket
+      took its "unreached tie" placeholder branch for every card on the guest's
+      screen. Flattened to plain arrays because the wire carries JSON, not the
+      record shape the renderer reads.
+    */
+    bk: (game.bracket || []).map((round) =>
+      (round || []).map((tie) => [
+        tie.a, tie.b ?? null, tie.winner ?? null,
+        Array.isArray(tie.score) ? [tie.score[0], tie.score[1]] : null,
+      ])),
   });
 }
 
@@ -17977,6 +18011,61 @@ function runTests() {
       ok("the guest gets the pairings", game.roundPairs.length === 2);
       ok("the guest can tell which tie is online",
          (() => { game.seats = [0, 1]; return tieIsOnline(); })());
+    }
+
+    // The bracket HISTORY round-trips, so the guest can draw the tree. Without
+    // `bk` every tie fell into drawBracket's placeholder branch and the guest
+    // saw an empty skeleton for the whole tournament.
+    {
+      net.active = true; net.role = "host";
+      game.mode = MODE.TOURNAMENT;
+      game.entrantCount = 4;
+      game.rosterNames = ["AY", "BEE", "CEE", "DEE"];
+      game.rosterCpu = [false, false, false, false];
+      startTournament();
+
+      // Decide the first tie, so there is real history to carry.
+      game.seats = [game.roundPairs[0][0], game.roundPairs[0][1]];
+      game.score = [3, 1];
+      resolveTie(0, false);
+      const winId = game.seats[0];
+
+      const sent = [];
+      const realChan = net.chan;
+      net.chan = { readyState: "open", send: (d) => sent.push(JSON.parse(d)) };
+      netSendBracket();
+      net.chan = realChan;
+      const msg = sent.find((m) => m.t === "br");
+      ok("the bracket message carries the history", !!msg && Array.isArray(msg.bk));
+
+      // Adopt it as a guest with nothing of its own.
+      net.role = "guest";
+      game.bracket = [];
+      game.entrants = [];
+      netHandle(msg);
+      ok("the guest rebuilds the bracket rounds", game.bracket.length >= 1,
+         `${game.bracket.length}`);
+      ok("the guest sees the decided winner",
+         !!game.bracket[0] && game.bracket[0][0].winner === winId,
+         `${game.bracket[0] && game.bracket[0][0].winner} want ${winId}`);
+      ok("the guest sees the tie score",
+         !!game.bracket[0] && Array.isArray(game.bracket[0][0].score) &&
+         game.bracket[0][0].score.join(",") === "3,1",
+         JSON.stringify(game.bracket[0] && game.bracket[0][0].score));
+      ok("a bye keeps its null second slot",
+         game.bracket[0].every((t) => t.b === null || typeof t.b === "number"));
+      ok("drawing the guest's bracket does not throw",
+         (() => { game.scene = SCENE.BRACKET; try { drawBracket(); return true; }
+                  catch (e) { return false; } })());
+
+      // Rubbish off the wire must not reach the renderer.
+      game.bracket = [];
+      netHandle({ ...msg, bk: [[[99999, "nonsense", {}, "bad"]], null, 7] });
+      ok("a malformed bracket is rejected rather than adopted",
+         Array.isArray(game.bracket));
+      ok("and drawing afterwards still does not throw",
+         (() => { try { drawBracket(); return true; } catch (e) { return false; } })());
+      netReset();
     }
 
     // A full online bracket must still crown exactly one champion.
