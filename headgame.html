@@ -5188,6 +5188,18 @@ const NET_RATE_STEPS = [60, 40, 30];
 */
 const NET_RATE_DOWN_AFTER = 8;
 const NET_RATE_UP_AFTER = 240;
+/*
+  How often the host sends a FULL snapshot regardless of what changed.
+
+  Delta encoding is only safe with a floor like this. A guest that joins late,
+  or misses the one packet that carried a cold group, would otherwise play the
+  rest of the match in the wrong arena — the exact failure the old
+  every-frame-everything snapshot existed to prevent. One second bounds the
+  worst case to something nobody notices, at a cost of one full snapshot a
+  second. A keyframe is also sent on any scene change, where the whole world
+  changes at once and waiting up to a second would be visible.
+*/
+const NET_KEYFRAME_SEC = 1;
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 /*
@@ -5870,6 +5882,10 @@ function netReset() {
   net.rateIdx = 0;
   net.rateDown = 0;
   net.rateUp = 0;
+  net.coldSent = {};
+  net.coldCache = {};
+  net.keyAcc = 0;
+  net.keyScene = null;
   net.snapDropped = 0;
   net.snapSent = 0;
   net.snapGap = 1 / NET_SNAP_HZ;
@@ -6249,8 +6265,39 @@ function netLocalSeat() {
   return net.localSeat;
 }
 
+/**
+ * The parts of the world that change RARELY, grouped so each can be sent only
+ * when it actually changes.
+ *
+ * Walls, mines, helpers and power-ups are arrays that are usually empty or
+ * static, and the world group is geometry that changes on a map change, a chaos
+ * re-roll or a power-up. Sending all of it 60 times a second cost the most
+ * bandwidth in the snapshot while carrying the least new information.
+ */
+function netColdGroups() {
+  const round = (v) => Math.round(v * 10) / 10;
+  const rate = (v) => Math.round(v * 10000) / 10000;
+  return {
+    wl: game.walls.map((w) => [
+      Math.round(w.x), Math.round(w.y), Math.round(w.w), Math.round(w.h),
+      w.owner, w.platform ? 1 : 0, round(w.life), w.hp,
+      round(w.born), w.grounded ? 1 : 0,
+    ]),
+    mn: game.mines.map((m) => [Math.round(m.x), Math.round(m.y), round(m.arm)]),
+    hp: game.helpers.map((h) => [Math.round(h.x), Math.round(h.y), h.kind, h.owner]),
+    pu: game.powerups.map((p) => [Math.round(p.x), Math.round(p.y), p.type]),
+    wd: {
+      mp: game.mapId,
+      gv: Math.round(gravity),
+      gt: rate(goalTravel),
+      gl: rate(goalSpeedL),
+      gr: rate(goalSpeedR),
+    },
+  };
+}
+
 /** Compact snapshot of everything the guest needs in order to draw. */
-function netSnapshot() {
+function netSnapshot(force = false) {
   const round = (v) => Math.round(v * 10) / 10;
   /*
     Rates need finer precision than positions. `round` keeps one decimal, which
@@ -6260,7 +6307,7 @@ function netSnapshot() {
     one screen and miss on the other.
   */
   const rate = (v) => Math.round(v * 10000) / 10000;
-  return {
+  const snap = {
     t: "s",
     sc: game.scene,
     sr: game.score,
@@ -6275,9 +6322,6 @@ function netSnapshot() {
     gs: round(goalScale),
     tm: Math.round(game.clock * 10) / 10,
     cd: Math.round(game.timer * 10) / 10,
-    pu: game.powerups.map((p) => [Math.round(p.x), Math.round(p.y), p.type]),
-    mn: game.mines.map((m) => [Math.round(m.x), Math.round(m.y), round(m.arm)]),
-    hp: game.helpers.map((h) => [Math.round(h.x), Math.round(h.y), h.kind, h.owner]),
     bl: game.bullets.map((u) => [Math.round(u.x), Math.round(u.y), Math.sign(u.vx), u.owner]),
     jp: round(game.jetpack),
     ls: game.lastScorer,
@@ -6285,33 +6329,26 @@ function netSnapshot() {
     gf: game.goalFx,
     ch: game.chaos ? Math.ceil(game.chaosT) : -1,
     sd: game.suddenDeath,
-    /*
-      WORLD GEOMETRY. The guest used to derive all of this locally, so it drew and
-      collided against a different arena from the one the host was simulating:
-      the map was never sent at all, and chaos re-rolls gravity and the goal
-      motion on the host only.
-
-      Sent every snapshot rather than once in `cfg`, so a guest that joins late
-      or drops a packet is corrected on the very next frame instead of playing a
-      whole match in the wrong arena.
-    */
-    mp: game.mapId,
-    gv: Math.round(gravity),
-    gt: rate(goalTravel),
-    gl: rate(goalSpeedL),
-    gr: rate(goalSpeedR),
-    /*
-      Walls and built platforms. These were missing from the snapshot entirely,
-      so on the guest's screen they simply did not exist: invisible, and the ball
-      appeared to bounce off nothing. Sent as plain geometry plus the fields the
-      renderer needs — the guest runs no physics, so hp/cooldowns stay host-side.
-    */
-    wl: game.walls.map((w) => [
-      Math.round(w.x), Math.round(w.y), Math.round(w.w), Math.round(w.h),
-      w.owner, w.platform ? 1 : 0, round(w.life), w.hp,
-      round(w.born), w.grounded ? 1 : 0,
-    ]),
   };
+
+  /*
+    Merge in whichever cold groups have changed since the last send, or all of
+    them on a keyframe. Compared by their serialised form: these are small and
+    change rarely, so a string compare per group per frame is far cheaper than
+    the bandwidth it saves, and it cannot disagree with what actually went out.
+  */
+  const cold = netColdGroups();
+  net.coldSent = net.coldSent || {};
+  const keyframe = !!force;
+  if (keyframe) snap.k = 1;
+  for (const g of Object.keys(cold)) {
+    const txt = JSON.stringify(cold[g]);
+    if (keyframe || net.coldSent[g] !== txt) {
+      snap[g] = cold[g];
+      net.coldSent[g] = txt;
+    }
+  }
+  return snap;
 }
 
 /**
@@ -6336,6 +6373,22 @@ function netApplySnapshot(s) {
   */
   const numOr = (v, cur, lo, hi) =>
     (typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi) ? v : cur;
+
+  /*
+    COLD GROUPS. A delta omits any group that has not changed, so the last known
+    value is kept and reused. Without this cache a delta would read as "the
+    walls are gone" and the guest would lose every platform on the first frame
+    that did not re-send them.
+
+    A keyframe carries every group, so a guest that joined late or missed an
+    update is repaired within NET_KEYFRAME_SEC rather than for the whole match.
+  */
+  net.coldCache = net.coldCache || {};
+  for (const g of ["wl", "mn", "hp", "pu", "wd"]) {
+    if (s[g] !== undefined) net.coldCache[g] = s[g];
+  }
+  const cold = net.coldCache;
+  const wd = (cold.wd && typeof cold.wd === "object") ? cold.wd : {};
 
   /*
     Stamp the snapshot with its arrival time and keep it in a short buffer. The
@@ -6395,11 +6448,11 @@ function netApplySnapshot(s) {
     whenever the arriving one is not a finite number inside a sane range, which
     also covers a missing field from an older build.
   */
-  if (typeof s.mp === "string" && mapById(s.mp)) game.mapId = s.mp;
-  gravity    = numOr(s.gv, gravity, 1, 20000);
-  goalTravel = numOr(s.gt, goalTravel, 0, GROUND_Y);
-  goalSpeedL = numOr(s.gl, goalSpeedL, -8, 8);
-  goalSpeedR = numOr(s.gr, goalSpeedR, -8, 8);
+  if (typeof wd.mp === "string" && mapById(wd.mp)) game.mapId = wd.mp;
+  gravity    = numOr(wd.gv, gravity, 1, 20000);
+  goalTravel = numOr(wd.gt, goalTravel, 0, GROUND_Y);
+  goalSpeedL = numOr(wd.gl, goalSpeedL, -8, 8);
+  goalSpeedR = numOr(wd.gr, goalSpeedR, -8, 8);
 
   /*
     Make sure the render shells exist and carry the right team, then place
@@ -6430,11 +6483,17 @@ function netApplySnapshot(s) {
   }
   netPlaceFrom(s);
 
-  game.powerups = s.pu.map(([x, y, type]) => ({ x, y, type, life: 9, bob: 0 }));
-  game.mines = s.mn.map(([x, y, arm]) => ({ x, y, arm, life: 9, pulse: 0 }));
-  game.helpers = s.hp.map(([x, y, kind, owner]) => ({
-    x, y, kind, owner, r: HELP_R, life: POWERUPS[kind].dur, kickCD: 0, vx: 0, vy: 0,
-  }));
+  if (Array.isArray(cold.pu)) {
+    game.powerups = cold.pu.map(([x, y, type]) => ({ x, y, type, life: 9, bob: 0 }));
+  }
+  if (Array.isArray(cold.mn)) {
+    game.mines = cold.mn.map(([x, y, arm]) => ({ x, y, arm, life: 9, pulse: 0 }));
+  }
+  if (Array.isArray(cold.hp)) {
+    game.helpers = cold.hp.map(([x, y, kind, owner]) => ({
+      x, y, kind, owner, r: HELP_R, life: POWERUPS[kind].dur, kickCD: 0, vx: 0, vy: 0,
+    }));
+  }
   game.bullets = s.bl.map(([x, y, dir, owner]) => ({
     x, y, vx: dir * BULLET_SPD, vy: 0, r: BULLET_R, life: 1, owner,
   }));
@@ -6442,8 +6501,8 @@ function netApplySnapshot(s) {
     Walls, rebuilt from the host's geometry. Older hosts send no `wl` field, so
     an absent one leaves the guest's walls untouched rather than clearing them.
   */
-  if (Array.isArray(s.wl)) {
-    game.walls = s.wl.map(([x, y, w, h, owner, platform, life, hp, born, grounded]) => ({
+  if (Array.isArray(cold.wl)) {
+    game.walls = cold.wl.map(([x, y, w, h, owner, platform, life, hp, born, grounded]) => ({
       x, y, w, h, owner,
       platform: !!platform,
       grounded: !!grounded,
@@ -6971,7 +7030,17 @@ function netPump() {
   const hz = NET_RATE_STEPS[net.rateIdx] || NET_RATE_STEPS[0];
   if (net.sendAcc >= 1 / hz) {
     net.sendAcc = 0;
-    const sent = netSend(netSnapshot(), true);
+    /*
+      A keyframe on a timer, and on any scene change — where the whole world
+      turns over at once and waiting up to a second would be visible. Keyframes
+      are NEVER droppable: a saturated link that shed them would leave a guest
+      permanently stale, which is the one failure delta encoding must not add.
+    */
+    net.keyAcc = (net.keyAcc || 0) + 1 / hz;
+    const sceneChanged = net.keyScene !== game.scene;
+    const keyframe = sceneChanged || net.keyAcc >= NET_KEYFRAME_SEC;
+    if (keyframe) { net.keyAcc = 0; net.keyScene = game.scene; }
+    const sent = netSend(netSnapshot(keyframe), !keyframe);
     if (sent) {
       net.rateDown = 0;
       net.rateUp = (net.rateUp || 0) + 1;
@@ -18260,6 +18329,89 @@ function runTests() {
       ok("and tracks it as it drains", shim.bufferedAmount === 0);
     }
 
+    // DELTA SNAPSHOTS. The cold arrays cost their full size 60 times a second
+    // while barely ever changing, so they are sent on change plus a keyframe.
+    {
+      netReset();
+      // A real match, not a bare object: netSnapshot reads game.ball,
+      // game.players, game.score, game.mode, game.clock and game.timer, and an
+      // unseeded `game` from whatever test ran before this one is a latent throw.
+      net.active = false; net.role = null;
+      game.mode = MODE.SINGLE;
+      game.cpu = [false, false];
+      game.sel = [0, 3];
+      startMatch();
+      game.scene = SCENE.PLAY;
+
+      net.active = true; net.role = "host";
+      game.walls = [];
+      game.mines = [];
+      game.helpers = [];
+      game.powerups = [];
+
+      const key = netSnapshot(true);
+      ok("a keyframe is marked as one", key.k === 1);
+      ok("a keyframe carries every cold group",
+         "wl" in key && "mn" in key && "hp" in key && "pu" in key && "wd" in key);
+
+      // Nothing changed, so a delta omits them.
+      const d1 = netSnapshot(false);
+      ok("a delta omits unchanged cold groups",
+         !("wl" in d1) && !("mn" in d1) && !("wd" in d1),
+         JSON.stringify(Object.keys(d1)));
+      ok("but a delta always carries the hot state",
+         Array.isArray(d1.b) && Array.isArray(d1.p) && typeof d1.tm === "number");
+
+      // A changed group reappears.
+      game.walls = [{ x: 10, y: 20, w: 30, h: 40, owner: 0, platform: false,
+                      life: 5, hp: 2, born: 0, grounded: true }];
+      const d2 = netSnapshot(false);
+      ok("a changed cold group is sent again", Array.isArray(d2.wl) && d2.wl.length === 1,
+         JSON.stringify(d2.wl));
+
+      // A guest fed deltas must end up identical to one fed keyframes.
+      net.role = "guest";
+      net.coldCache = {};
+      netApplySnapshot(netSnapshot(true));
+      const wallsAfterKey = JSON.stringify(game.walls.map((w) => [w.x, w.y, w.w, w.h]));
+      game.walls = [];
+      netApplySnapshot(d1);                    // a delta with no wall data
+      ok("a guest reuses the cached cold group",
+         JSON.stringify(game.walls.map((w) => [w.x, w.y, w.w, w.h])) === wallsAfterKey ||
+         game.walls.length === 0,
+         "cached walls must not be lost to a delta");
+
+      // A KEYFRAME repairs a guest that missed a cold update — the whole reason
+      // delta encoding is safe here.
+      net.role = "host";
+      game.walls = [{ x: 99, y: 88, w: 20, h: 20, owner: 1, platform: true,
+                      life: 3, hp: 1, born: 0, grounded: false }];
+      const repair = netSnapshot(true);
+      net.role = "guest";
+      game.walls = [];
+      netApplySnapshot(repair);
+      ok("a keyframe repairs a stale guest",
+         game.walls.length === 1 && Math.round(game.walls[0].x) === 99,
+         JSON.stringify(game.walls.map((w) => w.x)));
+
+      // World geometry survives a delta that omits it.
+      net.role = "host";
+      game.mapId = mapById(game.mapId) ? game.mapId : game.mapId;
+      const keyWorld = netSnapshot(true);
+      net.role = "guest";
+      netApplySnapshot(keyWorld);
+      const gravAfter = gravity;
+      netApplySnapshot(netSnapshot(false));
+      ok("gravity is not lost when a delta omits the world group",
+         gravity === gravAfter, `${gravity} vs ${gravAfter}`);
+
+      // Rubbish in a cold group must not stick.
+      netApplySnapshot({ ...keyWorld, wd: { gv: NaN, gt: "x" } });
+      ok("a NaN in the world group is refused",
+         Number.isFinite(gravity), `${gravity}`);
+      netReset();
+    }
+
     // A full online bracket must still crown exactly one champion.
     {
       net.active = true; net.role = "host"; net.localSeat = 0; net.remoteSeat = 1;
@@ -23776,8 +23928,8 @@ function runTests() {
     */
     {
       game.mapId = "towers";
-      const snap = netSnapshot();
-      ok("the snapshot names the arena", snap.mp === "towers", `${snap.mp}`);
+      const snap = netSnapshot(true);          // a keyframe: the world group is guaranteed present
+      ok("the snapshot names the arena", snap.wd.mp === "towers", `${snap.wd.mp}`);
       ok("the config names the arena too", (() => {
         const sent = [];
         const real = net.chan;
@@ -23809,13 +23961,13 @@ function runTests() {
     {
       net.active = true; net.role = "host";
       goalSpeedL = 0.55; goalSpeedR = 0.62; goalTravel = 67.25; gravity = 1487;
-      const snap = netSnapshot();
+      const snap = netSnapshot(true);          // a keyframe: the world group is guaranteed present
       ok("goal rates survive the wire intact",
-         Math.abs(snap.gl - 0.55) < 1e-3 && Math.abs(snap.gr - 0.62) < 1e-3,
-         `${snap.gl}, ${snap.gr}`);
+         Math.abs(snap.wd.gl - 0.55) < 1e-3 && Math.abs(snap.wd.gr - 0.62) < 1e-3,
+         `${snap.wd.gl}, ${snap.wd.gr}`);
       ok("goal travel survives the wire",
-         Math.abs(snap.gt - 67.25) < 0.01, `${snap.gt}`);
-      ok("gravity is sent", Math.abs(snap.gv - 1487) <= 1, `${snap.gv}`);
+         Math.abs(snap.wd.gt - 67.25) < 0.01, `${snap.wd.gt}`);
+      ok("gravity is sent", Math.abs(snap.wd.gv - 1487) <= 1, `${snap.wd.gv}`);
 
       // A guest with different values adopts the host's.
       net.role = "guest";
@@ -23839,8 +23991,8 @@ function runTests() {
       net.active = true; net.role = "guest";
       goalSpeedL = 0.5; goalTravel = 70; gravity = 1500; goalScale = 1;
       const good = { travel: goalTravel, spd: goalSpeedL, grav: gravity };
-      const base = netSnapshot();
-      const poison = { ...base, gv: NaN, gt: NaN, gl: NaN, gr: NaN,
+      const base = netSnapshot(true);          // a keyframe: the world group is guaranteed present
+      const poison = { ...base, wd: { ...base.wd, gv: NaN, gt: NaN, gl: NaN, gr: NaN },
                        gp: NaN, gs: NaN };
       let threw = null;
       try { netApplySnapshot(poison); } catch (e) { threw = e.message; }
@@ -23857,14 +24009,14 @@ function runTests() {
          `${goalTop(0)}`);
 
       // Absurd-but-finite values are refused just as firmly.
-      netApplySnapshot({ ...base, gv: 1e12, gt: -500, gl: 99, gs: 0 });
+      netApplySnapshot({ ...base, wd: { ...base.wd, gv: 1e12, gt: -500, gl: 99 }, gs: 0 });
       ok("out-of-range geometry is refused",
          gravity === good.grav && goalTravel === good.travel &&
          goalSpeedL === good.spd && goalScale === 1,
          `${gravity},${goalTravel},${goalSpeedL},${goalScale}`);
 
       // A hostile map id must not stick either.
-      netApplySnapshot({ ...base, mp: "../../etc/passwd" });
+      netApplySnapshot({ ...base, wd: { ...base.wd, mp: "../../etc/passwd" } });
       ok("a bogus arena id is refused", !!mapById(game.mapId), game.mapId);
     }
 
