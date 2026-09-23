@@ -271,6 +271,113 @@ async function run() {
                   lateGot.some((m) => m.t === "room-started"),
                   JSON.stringify(lateGot.slice(0, 2))]);
 
+    // RESUME. A dropped player must be able to return to a started room, and be
+    // recognised as the player who left rather than seated as a newcomer.
+    {
+      let code4 = null;
+      const rhost = await client("rhost", (m) => {
+        const p = JSON.parse(t0(m));
+        if (p.t === "hosting") code4 = p.code;
+      });
+      rhost.send({ t: "host", mode: "tournament", name: "RESUMEY" });
+      await new Promise((r) => setTimeout(r, 250));
+
+      let rgGot = [];
+      const rguest = await client("rguest", (m) => rgGot.push(JSON.parse(t0(m))));
+      rguest.send({ t: "join", code: code4 });
+      await new Promise((r) => setTimeout(r, 200));
+      const firstSeat = (rgGot.find((m) => m.t === "joined") || {}).seat;
+      results.push(["a guest joins an open room and gets a seat",
+                    typeof firstSeat === "number", JSON.stringify(rgGot.slice(0, 2))]);
+
+      // The match starts, then the guest drops.
+      rhost.send({ t: "room-state", started: true });
+      await new Promise((r) => setTimeout(r, 150));
+      rguest.sock.destroy();
+      await new Promise((r) => setTimeout(r, 250));
+
+      // A plain join is still refused...
+      let plainGot = [];
+      const plain = await client("plain", (m) => plainGot.push(JSON.parse(t0(m))));
+      plain.send({ t: "join", code: code4 });
+      await new Promise((r) => setTimeout(r, 200));
+      results.push(["a started room still refuses a plain joiner",
+                    plainGot.some((m) => m.t === "room-started"),
+                    JSON.stringify(plainGot.slice(0, 2))]);
+
+      // ...but a RESUME join is admitted, and can ask for its old seat back.
+      let backGot = [];
+      const back = await client("back", (m) => backGot.push(JSON.parse(t0(m))));
+      back.send({ t: "join", code: code4, resume: "tok-abc", seat: firstSeat });
+      await new Promise((r) => setTimeout(r, 200));
+      const rejoined = backGot.find((m) => m.t === "joined");
+      results.push(["a resume join is admitted to a started room", !!rejoined,
+                    JSON.stringify(backGot.slice(0, 2))]);
+      results.push(["and is given back the seat it asked for",
+                    !!rejoined && rejoined.seat === firstSeat,
+                    `${rejoined && rejoined.seat} want ${firstSeat}`]);
+
+      // A resume join must not steal a seat somebody is sitting in.
+      let thiefGot = [];
+      const thief = await client("thief", (m) => thiefGot.push(JSON.parse(t0(m))));
+      thief.send({ t: "join", code: code4, resume: "tok-xyz", seat: firstSeat });
+      await new Promise((r) => setTimeout(r, 200));
+      const thiefJoined = thiefGot.find((m) => m.t === "joined");
+      results.push(["an occupied seat is not handed to a second claimant",
+                    !thiefJoined || thiefJoined.seat !== firstSeat,
+                    `${thiefJoined && thiefJoined.seat}`]);
+
+      rhost.sock.destroy(); plain.sock.destroy();
+      back.sock.destroy(); thief.sock.destroy();
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
+    // RESUME INTO AN EMPTIED ROOM. The block above never let room.sockets reach
+    // zero — rhost stayed connected the whole time — so the held-room path (the
+    // emptyAt hold in dropSocket, the reaper's early check, and the join
+    // handler's lazy expiry) never actually ran. Here BOTH players leave, so
+    // the room is genuinely empty, and a resume still has to find it waiting.
+    {
+      let code5 = null;
+      const rhost2 = await client("rhost2", (m) => {
+        const p = JSON.parse(t0(m));
+        if (p.t === "hosting") code5 = p.code;
+      });
+      rhost2.send({ t: "host", mode: "tournament", name: "EMPTYCUP" });
+      await new Promise((r) => setTimeout(r, 250));
+
+      let rg2Got = [];
+      const rguest2 = await client("rguest2", (m) => rg2Got.push(JSON.parse(t0(m))));
+      rguest2.send({ t: "join", code: code5 });
+      await new Promise((r) => setTimeout(r, 200));
+      const seat5 = (rg2Got.find((m) => m.t === "joined") || {}).seat;
+
+      rhost2.send({ t: "room-state", started: true });
+      await new Promise((r) => setTimeout(r, 150));
+
+      // BOTH leave — nobody at all is left in the room.
+      rguest2.sock.destroy();
+      rhost2.sock.destroy();
+      await new Promise((r) => setTimeout(r, 250));
+      const held = relay.rooms.get(code5);
+      results.push(["an emptied started room is held rather than deleted",
+                    !!held && held.sockets.length === 0 && !!held.emptyAt,
+                    held ? JSON.stringify({ n: held.sockets.length, emptyAt: held.emptyAt }) : "gone"]);
+
+      // A returning player still finds it, inside the grace window.
+      let ret2Got = [];
+      const returnee = await client("returnee", (m) => ret2Got.push(JSON.parse(t0(m))));
+      returnee.send({ t: "join", code: code5, resume: "tok-empty", seat: seat5 });
+      await new Promise((r) => setTimeout(r, 200));
+      const rejoined2 = ret2Got.find((m) => m.t === "joined");
+      results.push(["a resume join is admitted to a room that emptied out entirely",
+                    !!rejoined2 && rejoined2.seat === seat5,
+                    JSON.stringify(ret2Got.slice(0, 2))]);
+
+      returnee.sock.destroy();
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
     // A PRIVATE room is never advertised, but its code still works.
     let code3 = null;
     const host3 = await client("host3", (m) => {

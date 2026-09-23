@@ -106,6 +106,13 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 */
 const rooms = new Map();
 const ROOM_MAX = 16;
+/*
+  How long a started room is held after its last socket leaves, so a player
+  whose connection dropped has something to come back to. Must match
+  NET_GRACE_SEC in the game: if the relay forgot the room first, a guest would
+  still be retrying into nothing.
+*/
+const GRACE_MS = 30 * 1000;
 
 /**
  * Sanitise a room name supplied by a host.
@@ -301,8 +308,19 @@ function dropSocket(sock) {
               why: "the other player disconnected" });
   }
   if (room.sockets.length === 0) {
-    rooms.delete(code);
-    log(`room ${code} closed`);
+    /*
+      A STARTED room is kept for a short while after its last socket leaves, so
+      a player whose connection dropped has something to come back to. An open
+      room is still deleted at once — nobody is mid-match in it, and lingering
+      would advertise a game with no host.
+    */
+    if (room.started) {
+      room.emptyAt = Date.now();
+      log(`room ${code} empty, held for a return`);
+    } else {
+      rooms.delete(code);
+      log(`room ${code} closed`);
+    }
   } else {
     log(`#${sock.hgId} left room ${code}`);
   }
@@ -512,13 +530,39 @@ server.on("upgrade", (req, sock) => {
     if (msg.t === "join") {
       const code = String(msg.code || "").toUpperCase().trim();
       const room = rooms.get(code);
+      if (room && room.sockets.length === 0 && room.emptyAt &&
+          Date.now() - room.emptyAt > GRACE_MS) {
+        rooms.delete(code);
+        send(sock, { t: "no-room", code });
+        return;
+      }
       if (!room) { send(sock, { t: "no-room", code }); return; }
       if (room.sockets.length >= (room.max || ROOM_MAX)) {
         send(sock, { t: "room-full", code });
         return;
       }
-      if (room.started) { send(sock, { t: "room-started", code }); return; }
-      sock.hgSeat = room.nextSeat++;
+      /*
+        A STARTED room refuses a newcomer but admits a RETURNING player.
+
+        Without this a dropped connection ended a match permanently: the game
+        retried, the relay said "room-started", and there was nowhere to go
+        back to. A resume join carries a token the host issued, so the room can
+        tell "I was in this match" from "let me into your match".
+      */
+      const resume = typeof msg.resume === "string" && msg.resume.length
+        ? msg.resume.slice(0, 64) : null;
+      if (room.started && !resume) { send(sock, { t: "room-started", code }); return; }
+      /*
+        A returning player asks for the seat it had, so the host recognises it as
+        the same machine rather than seating it as a newcomer. Granted only if
+        that seat is genuinely vacant — otherwise it would evict whoever is
+        sitting there, which a wrong or stale token would do by accident.
+      */
+      const want = Number(msg.seat);
+      const vacant = Number.isInteger(want) && want >= 0 &&
+                     !room.sockets.some((s) => s.hgSeat === want);
+      sock.hgSeat = (resume && vacant) ? want : room.nextSeat++;
+      if (resume) sock.hgResume = resume;
       room.sockets.push(sock);
       sock.hgRoom = code;
       send(sock, { t: "joined", code, seat: sock.hgSeat,
@@ -530,7 +574,8 @@ server.on("upgrade", (req, sock) => {
         unchanged.
       */
       for (const s of room.sockets) {
-        if (s !== sock) send(s, { t: "peer-joined", seat: sock.hgSeat });
+        if (s !== sock) send(s, { t: "peer-joined", seat: sock.hgSeat,
+                                  resume: sock.hgResume || null });
       }
       log(`#${sock.hgId} joined room ${code} as seat ${sock.hgSeat}`);
       return;
@@ -590,6 +635,17 @@ server.on("upgrade", (req, sock) => {
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
+    /*
+      A room held open for a returning player, whose window has closed. Reaped
+      here so a long-running relay does not accumulate one dead room per
+      dropped match.
+    */
+    if (room.sockets.length === 0 && room.emptyAt &&
+        now - room.emptyAt > GRACE_MS) {
+      rooms.delete(code);
+      log(`room ${code} closed (nobody returned)`);
+      continue;
+    }
     if (room.sockets.length === 1 && now - room.created > 30 * 60 * 1000) {
       for (const s of room.sockets) send(s, { t: "expired" });
       rooms.delete(code);

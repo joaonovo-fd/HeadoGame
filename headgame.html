@@ -5200,6 +5200,20 @@ const NET_RATE_UP_AFTER = 240;
   changes at once and waiting up to a second would be visible.
 */
 const NET_KEYFRAME_SEC = 1;
+/*
+  How long a dropped player may take to come back.
+
+  ONE constant, shared by the host's reservation deadline and the guest's retry
+  budget: if the two disagreed, a guest would still be trying to rejoin a room
+  that had already given its entrant away for good, or give up while its seat
+  was still being held. Thirty seconds covers a phone changing network or a
+  laptop waking, without leaving a CPU in a human's seat long enough to decide
+  a tie that the human might have won.
+
+  Must match GRACE_MS in tools/relay.js: if the game gave up first, the relay
+  would hold a room nobody was ever going to return to.
+*/
+const NET_GRACE_SEC = 30;
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 /*
@@ -5482,6 +5496,8 @@ function relayControl(msg) {
       net.relayCode = msg.code;
       net.state = "connecting";
       net.error = "";
+      // Remembered so a later drop can ask the relay for this same seat back.
+      if (typeof msg.seat === "number") net.relaySeat = msg.seat;
       break;
     case "peer-joined": {
       /*
@@ -5492,6 +5508,16 @@ function relayControl(msg) {
       net.state = "live";
       net.active = true;
       net.lastRecv = 0;
+
+      /*
+        A RETURNING player, not a new one. Reclaiming first means they get
+        their own entrant back rather than being seated as a fresh joiner
+        alongside the CPU that has been covering for them.
+      */
+      if (typeof msg.resume === "string" && netResume(msg.resume) !== null) {
+        net.joinNote = "a player reconnected";
+        net.joinNoteT = 3;
+      }
 
       /*
         A TOURNAMENT needs a peer TABLE, not one channel: the bracket code seats
@@ -5506,6 +5532,8 @@ function relayControl(msg) {
         if (!net.peers.some((p) => p.relaySeat === msg.seat)) {
           const peer = relayPeer(msg.seat);
           net.peers.push(peer);
+          // The token this machine will present if it has to come back.
+          if (typeof msg.resume === "string") peer.resume = msg.resume.slice(0, 64);
           net.joinNote = `${peer.name || "a player"} joined`;
           net.joinNoteT = 2.2;
           netSendTo(peer, { t: "me", e: peer.entrantId });
@@ -5627,7 +5655,34 @@ function relayConnect(address, onOpen) {
   ws.onerror = () => { if (!net.relayCode) relayFail(url); };
   ws.onclose = () => {
     if (!net.relayCode) { relayFail(url); return; }
-    if (net.state === "live") { net.state = "closed"; net.active = false; }
+    /*
+      A LIVE match does not end here any more. The socket dropping is usually a
+      blip — a phone changing network, a laptop waking, a tunnel reconnecting —
+      and ending the match for it threw away a tournament run over two seconds.
+      Retry with backoff until the grace window the host is holding our entrant
+      for has passed, then fail exactly as before.
+    */
+    if (net.state === "live" && net.resumeToken) {
+      net.state = "resuming";
+      net.resumeTries = (net.resumeTries || 0) + 1;
+      if (net.resumeAt === 0) net.resumeAt = netClock();
+      if (netClock() - net.resumeAt < NET_GRACE_SEC) {
+        const wait = netResumeDelay(net.resumeTries);
+        setTimeout(() => {
+          if (net.state !== "resuming") return;
+          relayConnect(net.relayAddr, (s) => s.send(JSON.stringify({
+            t: "join", code: net.relayCode,
+            resume: net.resumeToken, seat: net.relaySeat,
+          })));
+        }, wait * 1000);
+        return;
+      }
+      net.error = "lost the connection";
+    }
+    if (net.state === "live" || net.state === "resuming") {
+      net.state = "closed";
+      net.active = false;
+    }
   };
   ws.onopen = () => {
     /*
@@ -5744,7 +5799,14 @@ function relayJoin(address, code) {
   net.remoteSeat = 0;
   const room = String(code || "").toUpperCase().trim();
   if (!room) { net.error = "enter the 4-letter game code"; net.state = "failed"; return; }
-  relayConnect(address, (ws) => ws.send(JSON.stringify({ t: "join", code: room })));
+  // A token of our own, so a reconnect can prove it is the same machine coming
+  // back rather than a stranger asking for somebody's seat.
+  if (!net.resumeToken) {
+    net.resumeToken = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  }
+  relayConnect(address, (ws) => ws.send(JSON.stringify({
+    t: "join", code: room, resume: net.resumeToken,
+  })));
 }
 
 const net = {
@@ -5903,6 +5965,11 @@ function netReset() {
   net.lobbyIntent = null;
   // net.relayAddr is deliberately KEPT: it is what the player typed, and having
   // to retype the host's address after every failed attempt is needless friction.
+  net.reserved = {};
+  net.resumeToken = "";
+  net.resumeTries = 0;
+  net.resumeAt = 0;
+  net.relaySeat = -1;
 }
 
 /*
@@ -6238,9 +6305,53 @@ function netDropPeer(peer) {
     const seat = game.seats.indexOf(e.id);
     if (seat >= 0 && netIsHost()) game.cpu[seat] = true;
   }
+  /*
+    RESERVE the entrant rather than giving it away for good.
+
+    The CPU above still takes the seat at once, so an eight-player bracket never
+    waits for somebody who may not be coming back. But the entrant is held
+    against this peer's resume token for NET_GRACE_SEC, so a player whose
+    connection blipped gets their tournament run back instead of losing it to a
+    two-second gap. Once the deadline passes the reservation is dropped and the
+    CPU keeps the seat permanently.
+  */
+  if (e && peer.resume) {
+    net.reserved = net.reserved || {};
+    net.reserved[peer.resume] = {
+      entrantId: e.id,
+      seat: peer.relaySeat != null ? peer.relaySeat : -1,
+      deadline: netClock() + NET_GRACE_SEC,
+    };
+  }
   net.joinNote = `${who} disconnected — the computer takes over`;
   net.joinNoteT = 6;
   if (netIsHost()) netSendBracket();        // everyone learns the new owner
+}
+
+/**
+ * HOST: hand a reserved entrant back to a returning player.
+ *
+ * Returns the entrant id on success, or null when there is nothing to give —
+ * an unknown token, or one whose grace window has closed. Only the bracket is
+ * sent here; the returning machine's world state repairs itself on the next
+ * keyframe tick (NET_KEYFRAME_SEC), which the host already sends on a timer
+ * and on every scene change — a second send here would just duplicate it.
+ */
+function netResume(token) {
+  const held = net.reserved && net.reserved[token];
+  if (!held) return null;
+  if (netClock() > held.deadline) {
+    delete net.reserved[token];
+    return null;
+  }
+  const e = entrantById(held.entrantId);
+  if (!e) { delete net.reserved[token]; return null; }
+  e.owner = "guest";
+  const seat = game.seats.indexOf(e.id);
+  if (seat >= 0) game.cpu[seat] = false;
+  delete net.reserved[token];
+  netSendBracket();
+  return e.id;
 }
 
 function netSeatFor(peer) {
@@ -6598,6 +6709,18 @@ function netPredictSelf(dt) {
 /** Seconds on a monotonic clock, for measuring snapshot arrival gaps. */
 function netClock() {
   try { return performance.now() / 1000; } catch (e) { return 0; }
+}
+
+/**
+ * Seconds to wait before retry number `n`.
+ *
+ * Exponential with jitter, capped at the grace window. Jittered because two
+ * players dropped by the same network event would otherwise retry in lockstep
+ * forever, and a fixed interval would hammer a relay that is coming back up.
+ */
+function netResumeDelay(n) {
+  const base = Math.min(0.5 * Math.pow(2, Math.max(0, n - 1)), 8);
+  return Math.min(base + Math.random() * 0.3, NET_GRACE_SEC);
 }
 
 /** GUEST: place ball, players and walls exactly as one snapshot describes. */
@@ -18409,6 +18532,68 @@ function runTests() {
       netApplySnapshot({ ...keyWorld, wd: { gv: NaN, gt: "x" } });
       ok("a NaN in the world group is refused",
          Number.isFinite(gravity), `${gravity}`);
+      netReset();
+    }
+
+    // RECONNECT. A dropped player's entrant is RESERVED for a grace window: a
+    // CPU covers the seat so the bracket never stalls, and the human takes it
+    // back if they return in time.
+    {
+      netReset();
+      net.active = true; net.role = "host"; net.localSeat = 0;
+      game.mode = MODE.TOURNAMENT;
+      game.entrantCount = 4;
+      game.rosterNames = ["HOSTY", "AWAY", "CEE", "DEE"];
+      game.rosterCpu = [false, false, false, false];
+      startTournament();
+
+      const peer = { id: 7, entrantId: 1, name: "AWAY", chan: null,
+                     lastRecv: 0, resume: "tok-1" };
+      net.peers = [peer];
+      game.seats = [0, 1];
+      game.cpu = [false, false];
+
+      netDropPeer(peer);
+      ok("a dropped player's seat is covered by a cpu", game.cpu[1] === true);
+      ok("and the bracket carries on", game.scene !== SCENE.MENU);
+      ok("the entrant is reserved rather than surrendered",
+         !!net.reserved && !!net.reserved["tok-1"],
+         JSON.stringify(Object.keys(net.reserved || {})));
+      ok("the reservation remembers which entrant",
+         net.reserved["tok-1"].entrantId === 1);
+
+      // Returning inside the window reclaims it.
+      const got = netResume("tok-1");
+      ok("a return inside the window reclaims the entrant", got === 1, `${got}`);
+      ok("and the cpu hands the seat back", game.cpu[1] === false);
+      ok("the reservation is consumed", !net.reserved["tok-1"]);
+
+      // Returning too late does not.
+      net.peers = [peer];
+      game.cpu = [false, false];
+      netDropPeer(peer);
+      net.reserved["tok-1"].deadline = -1;         // the window has passed
+      ok("a return after the window is refused", netResume("tok-1") === null);
+      ok("an unknown token is refused", netResume("nonsense") === null);
+      ok("the cpu keeps the seat once the window closes", game.cpu[1] === true);
+      netReset();
+    }
+
+    // The guest retries a lost connection instead of ending the match.
+    {
+      netReset();
+      net.active = true; net.role = "guest"; net.state = "live";
+      net.relayCode = "ABCD";
+      net.resumeToken = "tok-g";
+      ok("a guest starts with no retries spent", (net.resumeTries || 0) === 0);
+      ok("the grace window is a usable length",
+         NET_GRACE_SEC >= 5 && NET_GRACE_SEC <= 120, `${NET_GRACE_SEC}`);
+      ok("the backoff grows rather than hammering",
+         netResumeDelay(1) < netResumeDelay(3) &&
+         netResumeDelay(3) < netResumeDelay(5),
+         `${netResumeDelay(1)} ${netResumeDelay(3)} ${netResumeDelay(5)}`);
+      ok("and is capped so it never waits absurdly long",
+         netResumeDelay(99) <= NET_GRACE_SEC, `${netResumeDelay(99)}`);
       netReset();
     }
 
