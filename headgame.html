@@ -5364,6 +5364,7 @@ function relayChannelShim(ws) {
       net.active = true;
       net.lastRecv = 0;
       net.error = "";
+      netGoLive();             // this outage is over; the next one gets a fresh window
       netSendHello();          // answer, so the host learns this guest's name
     }
     /*
@@ -5415,10 +5416,20 @@ const RELAY_CONTROL = new Set([
  * the bracket code reads — entrantId, state, lastRecv — is the same shape the
  * WebRTC path produces, so the tournament logic cannot tell them apart.
  */
-function relayPeer(seat) {
-  // Entrant 0 is always the host, so guests start at 1 and fill the lowest gap.
-  let slot = 1;
-  while (net.peers.some((p) => p.entrantId === slot)) slot++;
+function relayPeer(seat, knownEntrant) {
+  /*
+    A RECLAIMED entrant must keep its own id — a returning player who held
+    entrant 2 has to stay entrant 2, even if entrant 1 is the lowest free
+    slot right now, or their input would drive somebody else's player (see
+    netSeatFor, which looks the peer up by entrantId). Only a genuinely NEW
+    joiner gets the lowest-free-slot scan.
+  */
+  let slot = knownEntrant;
+  if (slot == null) {
+    // Entrant 0 is always the host, so guests start at 1 and fill the lowest gap.
+    slot = 1;
+    while (net.peers.some((p) => p.entrantId === slot)) slot++;
+  }
   return {
     id: net.nextPeerId++,
     relaySeat: seat,
@@ -5508,13 +5519,18 @@ function relayControl(msg) {
       net.state = "live";
       net.active = true;
       net.lastRecv = 0;
+      netGoLive();             // this outage is over; the next one gets a fresh window
 
       /*
         A RETURNING player, not a new one. Reclaiming first means they get
         their own entrant back rather than being seated as a fresh joiner
-        alongside the CPU that has been covering for them.
+        alongside the CPU that has been covering for them. The reclaimed id
+        is kept, not discarded: the peer created below must carry THIS
+        entrant, not whichever slot happens to be lowest-free right now — with
+        more than one player away, those can disagree.
       */
-      if (typeof msg.resume === "string" && netResume(msg.resume) !== null) {
+      const reclaimed = typeof msg.resume === "string" ? netResume(msg.resume) : null;
+      if (reclaimed !== null) {
         net.joinNote = "a player reconnected";
         net.joinNoteT = 3;
       }
@@ -5530,7 +5546,7 @@ function relayControl(msg) {
       */
       if (netIsHost() && game.mode === MODE.TOURNAMENT && msg.seat !== undefined) {
         if (!net.peers.some((p) => p.relaySeat === msg.seat)) {
-          const peer = relayPeer(msg.seat);
+          const peer = relayPeer(msg.seat, reclaimed);
           net.peers.push(peer);
           // The token this machine will present if it has to come back.
           if (typeof msg.resume === "string") peer.resume = msg.resume.slice(0, 64);
@@ -5778,7 +5794,11 @@ function relayJoinCode(code) {
   net.localSeat = 1;
   net.remoteSeat = 0;
   net.relayCode = String(code || "").toUpperCase();
-  net.ws.send(JSON.stringify({ t: "join", code: net.relayCode }));
+  // Same token every guest join carries, so a drop from QUICK CONNECT or the
+  // lobby browser can reclaim its seat exactly like one from a typed code.
+  net.ws.send(JSON.stringify({
+    t: "join", code: net.relayCode, resume: netResumeToken(),
+  }));
   net.state = "connecting";
   return true;
 }
@@ -5791,6 +5811,20 @@ function relayMarkStarted() {
   net.ws.send(JSON.stringify({ t: "room-state", started: true }));
 }
 
+/*
+  A token of this machine's own, so a reconnect can prove it is the same
+  machine coming back rather than a stranger asking for somebody's seat.
+  Minted once and kept for the rest of the match (netReset clears it for the
+  next one) — lifted out to one place so every guest join path arms the same
+  reconnect machinery rather than each needing its own copy of this line.
+*/
+function netResumeToken() {
+  if (!net.resumeToken) {
+    net.resumeToken = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  }
+  return net.resumeToken;
+}
+
 /** JOIN over the relay: connect and ask for a room by code. */
 function relayJoin(address, code) {
   netReset();
@@ -5799,13 +5833,8 @@ function relayJoin(address, code) {
   net.remoteSeat = 0;
   const room = String(code || "").toUpperCase().trim();
   if (!room) { net.error = "enter the 4-letter game code"; net.state = "failed"; return; }
-  // A token of our own, so a reconnect can prove it is the same machine coming
-  // back rather than a stranger asking for somebody's seat.
-  if (!net.resumeToken) {
-    net.resumeToken = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-  }
   relayConnect(address, (ws) => ws.send(JSON.stringify({
-    t: "join", code: room, resume: net.resumeToken,
+    t: "join", code: room, resume: netResumeToken(),
   })));
 }
 
@@ -5973,6 +6002,21 @@ function netReset() {
 }
 
 /*
+  Mark the connection healthy right now, clearing whatever retry bookkeeping
+  the LAST drop left behind. net.resumeAt/net.resumeTries track one outage at
+  a time; without clearing them here, a match that survives its first drop
+  would have its second drop measured against the first drop's clock (so the
+  grace window could already read as expired) and its backoff continuing from
+  wherever the first outage's retry count left off, instead of starting short
+  again. Called at every point a connection actually goes live, not just once,
+  so the fix does not depend on which transport or code path got there first.
+*/
+function netGoLive() {
+  net.resumeAt = 0;
+  net.resumeTries = 0;
+}
+
+/*
   Codes are base64 of the SDP, which is long. We strip it to the fields that
   matter and rebuild on the far side, so the code a player copies is short
   enough to paste into a chat window.
@@ -6030,6 +6074,7 @@ function netAttachChannel(chan, peer) {
     net.active = true;
     net.lastRecv = 0;
     net.error = "";
+    netGoLive();              // this outage is over; the next one gets a fresh window
     netSendHello();          // exchange names immediately
   };
   chan.onclose = () => {

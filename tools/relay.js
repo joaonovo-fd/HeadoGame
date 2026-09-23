@@ -569,13 +569,23 @@ server.on("upgrade", (req, sock) => {
                    name: room.name, mode: room.mode });
       broadcastLobby();
       /*
-        Tell the host who arrived. `seat` is what lets a tournament host keep its
+        Tell the room who arrived. `seat` is what lets a tournament host keep its
         players apart — with a single opponent it is ignored, so the 1v1 flow is
         unchanged.
+
+        The RESUME TOKEN goes to the host alone (room.sockets[0], which is always
+        the host — set at "host" time and never displaced, since every later join
+        is pushed onto the end). It is the secret that proves a later reconnect is
+        the same machine coming back; broadcasting it to every other guest as well
+        would let any of them replay it as their own resume request and steal the
+        seat the moment the real owner drops. Everyone else still learns a seat
+        joined, which is all the non-host peers ever legitimately needed.
       */
+      const host = room.sockets[0];
       for (const s of room.sockets) {
-        if (s !== sock) send(s, { t: "peer-joined", seat: sock.hgSeat,
-                                  resume: sock.hgResume || null });
+        if (s === sock) continue;
+        send(s, { t: "peer-joined", seat: sock.hgSeat,
+                  resume: (s === host && sock.hgResume) || null });
       }
       log(`#${sock.hgId} joined room ${code} as seat ${sock.hgSeat}`);
       return;

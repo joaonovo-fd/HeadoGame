@@ -378,6 +378,47 @@ async function run() {
       await new Promise((r) => setTimeout(r, 150));
     }
 
+    // THE RESUME TOKEN IS A SECRET BETWEEN ONE GUEST AND THE HOST. If every
+    // socket in the room learned it, any other guest could replay a victim's
+    // token the moment that victim dropped and steal their seat back from the
+    // relay before the real owner's own retry got there. Only room.sockets[0]
+    // (the host) may ever see a `resume` field on a peer-joined notice.
+    {
+      let code6 = null;
+      let hostGot = [];
+      const thost = await client("thost", (m) => {
+        const p = JSON.parse(t0(m));
+        hostGot.push(p);
+        if (p.t === "hosting") code6 = p.code;
+      });
+      thost.send({ t: "host", mode: "tournament", name: "TOKENCUP" });
+      await new Promise((r) => setTimeout(r, 250));
+
+      let g1Got = [];
+      const tg1 = await client("tg1", (m) => g1Got.push(JSON.parse(t0(m))));
+      tg1.send({ t: "join", code: code6 });
+      await new Promise((r) => setTimeout(r, 200));
+
+      const tg2 = await client("tg2", () => {});
+      tg2.send({ t: "join", code: code6, resume: "tok-secret" });
+      await new Promise((r) => setTimeout(r, 200));
+
+      // There are two peer-joined notices by now (tg1's own join, then tg2's) —
+      // the one under test is tg2's, so match on the seat it was given.
+      const hostSaw = hostGot.filter((m) => m.t === "peer-joined").pop();
+      results.push(["the host's peer-joined notice carries the resume token",
+                    !!hostSaw && hostSaw.resume === "tok-secret",
+                    JSON.stringify(hostSaw)]);
+
+      const guestSaw = g1Got.filter((m) => m.t === "peer-joined").pop();
+      results.push(["a non-host peer's notice does not carry that token",
+                    !!guestSaw && !guestSaw.resume,
+                    JSON.stringify(guestSaw)]);
+
+      thost.sock.destroy(); tg1.sock.destroy(); tg2.sock.destroy();
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
     // A PRIVATE room is never advertised, but its code still works.
     let code3 = null;
     const host3 = await client("host3", (m) => {
