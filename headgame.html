@@ -5676,9 +5676,10 @@ function relayConnect(address, onOpen) {
       blip — a phone changing network, a laptop waking, a tunnel reconnecting —
       and ending the match for it threw away a tournament run over two seconds.
       Retry with backoff until the grace window the host is holding our entrant
-      for has passed, then fail exactly as before.
+      for has passed, then fail exactly as before. See netRetryable() for why
+      this checks more than just net.state === "live".
     */
-    if (net.state === "live" && net.resumeToken) {
+    if (netRetryable()) {
       net.state = "resuming";
       net.resumeTries = (net.resumeTries || 0) + 1;
       if (net.resumeAt === 0) net.resumeAt = netClock();
@@ -6759,6 +6760,22 @@ function netClock() {
   try { return performance.now() / 1000; } catch (e) { return 0; }
 }
 
+/*
+  Is a dropped relay socket still within the retry ladder? Not just "live": a
+  retry's own relayConnect() call sets net.state to "creating" on its way back
+  out, and a successful relay reply moves it on to "connecting" before a peer
+  message ever promotes it back to "live" — so a SECOND failure in a row lands
+  on one of those states, not "live", and must still count as retryable or the
+  guest wedges on "connecting to the relay…" forever. Pulled out to one place
+  so ws.onclose's guard and the NET_TIMEOUT backstop below test the exact same
+  thing the retry ladder itself did to get here.
+*/
+function netRetryable() {
+  return !!net.resumeToken &&
+    (net.state === "live" || net.state === "resuming" ||
+     net.state === "creating" || net.state === "connecting");
+}
+
 /**
  * Seconds to wait before retry number `n`.
  *
@@ -7118,6 +7135,23 @@ function netPump() {
   if (!netIsHub() && net.lastRecv > NET_TIMEOUT && net.state === "live") {
     net.state = "closed";
     net.error = "peer stopped responding";
+  }
+
+  /*
+    The retry ladder's grace-window check (relayConnect's ws.onclose) only runs
+    when a socket actually closes. A retry whose new socket opens but then hears
+    nothing back — the relay silently drops the join, or the network accepts the
+    handshake but delivers nothing further — never closes again, so that check
+    never re-fires either, and net.active would stay true with nothing left
+    trying to revive it. Repeat the same grace comparison here, every tick, as a
+    backstop so a hung retry still gives up once its window is spent.
+  */
+  if (net.active && net.resumeToken && net.resumeAt &&
+      (net.state === "resuming" || net.state === "creating" || net.state === "connecting") &&
+      netClock() - net.resumeAt > NET_GRACE_SEC) {
+    net.state = "closed";
+    net.active = false;
+    net.error = "lost the connection";
   }
 
   /*
@@ -17964,7 +17998,7 @@ function runTests() {
       game.bullets.push({ owner: 0, x: 500, y: 300, vx: BULLET_SPD, vy: 0,
                           r: BULLET_R, life: 1 });
 
-      const snap = netSnapshot();
+      const snap = netSnapshot(true); // a keyframe: the world group is guaranteed present
       ok("a snapshot carries the scene and score",
          snap.sc === SCENE.PLAY && snap.sr[0] === 2 && snap.sr[1] === 1);
       ok("a snapshot carries the ball", snap.b.length === 3 && snap.b[0] > 420);
@@ -18739,6 +18773,68 @@ function runTests() {
       ok("so a drop right now would measure a fresh window, not an expired one",
          freshDrop - net.resumeAt < NET_GRACE_SEC,
          `${freshDrop} - ${net.resumeAt}`);
+      netReset();
+    }
+
+    /*
+      A SECOND consecutive failure — the retry's OWN reconnect attempt also
+      failing — must schedule ANOTHER retry rather than wedge. relayConnect's
+      ws.onclose sets net.state to "creating" while it dials back out, so a
+      guard that recognised only "live" would see the second close land on
+      "creating" and do nothing at all, leaving net.active true forever with no
+      timer left to revive it. Exercised here through the real netRetryable()
+      predicate that ws.onclose itself calls — not a copy of its condition —
+      so reverting the fix there fails this test too. The scheduling itself is
+      replicated in the guard's own terms, exactly as the two tests above do,
+      rather than by driving a real socket through a real setTimeout (which the
+      test harness does not provide).
+    */
+    {
+      netReset();
+      net.active = true; net.role = "guest"; net.resumeToken = "tok-g3";
+      net.relayCode = "ABCD";
+
+      // First failure: as ws.onclose does, from "live".
+      net.state = "live";
+      let tries = 0;
+      if (netRetryable()) {
+        net.state = "resuming";
+        tries = net.resumeTries = (net.resumeTries || 0) + 1;
+        if (net.resumeAt === 0) net.resumeAt = netClock();
+      }
+      ok("a first failure schedules one retry", tries === 1, `${tries}`);
+      const firstWait = netResumeDelay(net.resumeTries);
+
+      // The retry's own relayConnect() call sets state to "creating" while the
+      // new socket dials out — exactly what really happens, per relayConnect's
+      // `net.state = "creating";` line, before any reply promotes it further.
+      net.state = "creating";
+
+      // SECOND failure, landing on "creating" rather than "live" or "resuming".
+      if (netRetryable()) {
+        net.state = "resuming";
+        tries = net.resumeTries = (net.resumeTries || 0) + 1;
+        if (net.resumeAt === 0) net.resumeAt = netClock();
+      }
+      ok("and a second failure from mid-retry schedules another",
+         tries === 2 && net.state === "resuming", `${tries} ${net.state}`);
+      const secondWait = netResumeDelay(net.resumeTries);
+      ok("with a longer backoff than the first",
+         secondWait >= firstWait, `${firstWait} -> ${secondWait}`);
+
+      /*
+        Once the grace window is spent, the connection must end closed and
+        inactive rather than hang — even if the socket never closes again to
+        re-run ws.onclose's own check (a retry whose new socket opens but then
+        hears nothing back). This drives the REAL netPump() backstop rather
+        than replicating its arithmetic, so a break in that code fails here.
+      */
+      net.state = "creating";               // still mid-retry, socket not yet closed
+      net.resumeAt = netClock() - (NET_GRACE_SEC + 1);
+      netPump();
+      ok("and once the grace window is exhausted netPump ends the match, not hangs",
+         net.state === "closed" && net.active === false,
+         `${net.state} active=${net.active}`);
       netReset();
     }
 
@@ -23903,7 +23999,7 @@ function runTests() {
       const built = buildWall(pl);
       ok("a wall exists to send", !!built);
 
-      const snap = netSnapshot();
+      const snap = netSnapshot(true); // a keyframe: the world group is guaranteed present
       ok("the snapshot carries walls", Array.isArray(snap.wl) && snap.wl.length === 1,
          JSON.stringify(snap.wl));
 
@@ -24358,7 +24454,7 @@ function runTests() {
     {
       net.active = true; net.role = "host";
       game.mapId = "terraces";
-      const snap = netSnapshot();
+      const snap = netSnapshot(true); // a keyframe: the world group is guaranteed present
       net.role = "guest";
       game.mapId = "classic";
       let threw = null;
