@@ -467,7 +467,35 @@ async function run() {
       results.push(["eg1's own seat is untouched by its own failed eject",
                     relay.rooms.get(code7).sockets.some((s) => s.hgSeat === eg1Seat)]);
 
-      ehost.sock.destroy(); eg1.sock.destroy();
+      /*
+        A GUEST PROMOTED BY THE HOST'S DEPARTURE must not inherit the privilege.
+
+        dropSocket rebuilds room.sockets with a filter, so once the host's socket
+        goes, the surviving guest is sockets[0]. Authorising on that position
+        would hand it the right to kick everyone else — and because a started
+        room is deliberately held open after its last socket leaves, this is a
+        state the design expects rather than a freak race.
+      */
+      let eg3Got = [];
+      const eg3 = await client("eg3", (m) => eg3Got.push(JSON.parse(t0(m))));
+      eg3.send({ t: "join", code: code7 });
+      await new Promise((r) => setTimeout(r, 200));
+      const eg3Seat = (eg3Got.find((m) => m.t === "joined") || {}).seat;
+
+      ehost.sock.destroy();                     // the host leaves; eg1 moves to front
+      await new Promise((r) => setTimeout(r, 250));
+      const promoted = relay.rooms.get(code7);
+      results.push(["the host's departure promotes a guest to the front",
+                    !!promoted && promoted.sockets[0] && promoted.sockets[0].hgSeat === eg1Seat,
+                    promoted ? JSON.stringify(promoted.sockets.map((s) => s.hgSeat)) : "gone"]);
+
+      eg1.send({ t: "eject", seat: eg3Seat });
+      await new Promise((r) => setTimeout(r, 200));
+      results.push(["but that guest still cannot eject anyone",
+                    relay.rooms.get(code7).sockets.some((s) => s.hgSeat === eg3Seat),
+                    JSON.stringify(relay.rooms.get(code7).sockets.map((s) => s.hgSeat))]);
+
+      eg1.sock.destroy(); eg3.sock.destroy();
       await new Promise((r) => setTimeout(r, 150));
     }
 

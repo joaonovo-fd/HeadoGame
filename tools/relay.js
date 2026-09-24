@@ -465,6 +465,18 @@ server.on("upgrade", (req, sock) => {
         private: !!msg.private,            // hidden from the listing
       });
       sock.hgRoom = code;
+      /*
+        WHO THE HOST IS, marked on the socket once and never recomputed.
+
+        Everything else here infers "host" from being first in room.sockets, which
+        is fine for routing but wrong for AUTHORISATION: dropSocket rebuilds that
+        array with a filter, so when the host's own socket leaves, the next guest
+        becomes sockets[0] — and a started room is deliberately held open after
+        its last socket goes, so that promotion is a designed-for state rather
+        than a freak race. The eject handler is the first thing here to grant a
+        privilege, so it tests this flag instead of a position that moves.
+      */
+      sock.hgIsHost = true;
       send(sock, { t: "hosting", code });
       log(`room ${code} opened by #${sock.hgId} (${msg.mode || "match"})`);
       broadcastLobby();
@@ -544,7 +556,9 @@ server.on("upgrade", (req, sock) => {
     */
     if (msg.t === "eject") {
       const room = rooms.get(sock.hgRoom);
-      if (!room || room.sockets[0] !== sock) return;   // guests may not eject
+      // hgIsHost, not sockets[0]: see where it is set. A guest promoted to the
+      // front of the array by the host's departure must not inherit this.
+      if (!room || !sock.hgIsHost) return;              // guests may not eject
       const target = room.sockets.find((s) => s.hgSeat === msg.seat);
       if (target) { dropSocket(target); target.destroy(); }
       return;
