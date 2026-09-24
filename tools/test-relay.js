@@ -419,6 +419,58 @@ async function run() {
       await new Promise((r) => setTimeout(r, 150));
     }
 
+    /*
+      EJECT. The relay cannot validate a resume token — only the host can, by
+      checking its own reservations — so the host needs a way to remove a seat
+      it does not recognise. Checked from both directions: the host's eject
+      must actually remove the guest, and a GUEST attempting the same message
+      must be ignored, or any player could kick any other out of the match.
+    */
+    {
+      let code7 = null;
+      const ehost = await client("ehost", (m) => {
+        const p = JSON.parse(t0(m));
+        if (p.t === "hosting") code7 = p.code;
+      });
+      ehost.send({ t: "host", mode: "tournament", name: "EJECTCUP" });
+      await new Promise((r) => setTimeout(r, 250));
+
+      let eg1Got = [];
+      const eg1 = await client("eg1", (m) => eg1Got.push(JSON.parse(t0(m))));
+      eg1.send({ t: "join", code: code7 });
+      await new Promise((r) => setTimeout(r, 200));
+      const eg1Seat = (eg1Got.find((m) => m.t === "joined") || {}).seat;
+
+      let eg2Got = [];
+      const eg2 = await client("eg2", (m) => eg2Got.push(JSON.parse(t0(m))));
+      eg2.send({ t: "join", code: code7 });
+      await new Promise((r) => setTimeout(r, 200));
+
+      // A GUEST sending "eject" must be ignored: eg1 targets eg2's seat, but
+      // only the host's own copy of this message may ever remove anyone.
+      const eg2Seat = (eg2Got.find((m) => m.t === "joined") || {}).seat;
+      eg1.send({ t: "eject", seat: eg2Seat });
+      await new Promise((r) => setTimeout(r, 200));
+      const stillThere = relay.rooms.get(code7).sockets.some((s) => s.hgSeat === eg2Seat);
+      results.push(["a guest's eject is ignored", stillThere,
+                    JSON.stringify(relay.rooms.get(code7).sockets.map((s) => s.hgSeat))]);
+
+      // The HOST ejecting the same seat actually removes it.
+      ehost.send({ t: "eject", seat: eg2Seat });
+      await new Promise((r) => setTimeout(r, 200));
+      const gone = !relay.rooms.get(code7).sockets.some((s) => s.hgSeat === eg2Seat);
+      results.push(["the host's eject removes that seat", gone,
+                    JSON.stringify(relay.rooms.get(code7).sockets.map((s) => s.hgSeat))]);
+      results.push(["and the room learns the seat left",
+                    eg1Got.some((m) => m.t === "peer-left" && m.seat === eg2Seat),
+                    JSON.stringify(eg1Got.slice(-2))]);
+      results.push(["eg1's own seat is untouched by its own failed eject",
+                    relay.rooms.get(code7).sockets.some((s) => s.hgSeat === eg1Seat)]);
+
+      ehost.sock.destroy(); eg1.sock.destroy();
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
     // A PRIVATE room is never advertised, but its code still works.
     let code3 = null;
     const host3 = await client("host3", (m) => {

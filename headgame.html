@@ -5428,7 +5428,20 @@ function relayPeer(seat, knownEntrant) {
   if (slot == null) {
     // Entrant 0 is always the host, so guests start at 1 and fill the lowest gap.
     slot = 1;
-    while (net.peers.some((p) => p.entrantId === slot)) slot++;
+    /*
+      An entrant under a LIVE reservation (net.reserved, set by netDropPeer)
+      is not free just because no peer currently holds it right now — that gap
+      is being held open for whoever dropped, and handing it to the next
+      arrival is exactly how a stranger could end up sharing a returning
+      player's seat. An EXPIRED reservation must not block forever, so its
+      deadline is checked against netClock() rather than treating any entry
+      in net.reserved as still live.
+    */
+    const reservedLive = (entrant) => Object.keys(net.reserved || {}).some((tok) => {
+      const held = net.reserved[tok];
+      return held.entrantId === entrant && netClock() <= held.deadline;
+    });
+    while (net.peers.some((p) => p.entrantId === slot) || reservedLive(slot)) slot++;
   }
   return {
     id: net.nextPeerId++,
@@ -5546,13 +5559,33 @@ function relayControl(msg) {
       */
       if (netIsHost() && game.mode === MODE.TOURNAMENT && msg.seat !== undefined) {
         if (!net.peers.some((p) => p.relaySeat === msg.seat)) {
-          const peer = relayPeer(msg.seat, reclaimed);
-          net.peers.push(peer);
-          // The token this machine will present if it has to come back.
-          if (typeof msg.resume === "string") peer.resume = msg.resume.slice(0, 64);
-          net.joinNote = `${peer.name || "a player"} joined`;
-          net.joinNoteT = 2.2;
-          netSendTo(peer, { t: "me", e: peer.entrantId });
+          /*
+            The match is already under way and this token was not recognised
+            (reclaimed === null): whoever this is, they are not the player who
+            held that seat, and the lowest-free-slot scan in relayPeer would
+            otherwise hand them a RESERVED entrant the moment they arrive. The
+            relay cannot tell a stranger from a returning player by itself —
+            only the host's own net.reserved table can — so the host is the one
+            that has to eject them; see relay.js's "eject" handler.
+
+            A join that arrives before net.matchStarted is set is a normal
+            lobby joiner and must still be seated below, or nobody could ever
+            join a tournament lobby.
+          */
+          if (net.matchStarted && reclaimed === null) {
+            if (typeof msg.seat === "number" && Number.isFinite(msg.seat) &&
+                net.ws && net.ws.readyState === 1) {
+              net.ws.send(JSON.stringify({ t: "eject", seat: msg.seat }));
+            }
+          } else {
+            const peer = relayPeer(msg.seat, reclaimed);
+            net.peers.push(peer);
+            // The token this machine will present if it has to come back.
+            if (typeof msg.resume === "string") peer.resume = msg.resume.slice(0, 64);
+            net.joinNote = `${peer.name || "a player"} joined`;
+            net.joinNoteT = 2.2;
+            netSendTo(peer, { t: "me", e: peer.entrantId });
+          }
         }
       }
       netSendHello();
@@ -5812,6 +5845,7 @@ function relayMarkStarted() {
   if (net.transport !== "relay") return;
   if (!net.ws || net.ws.readyState !== 1) return;
   if (!netIsHost()) return;
+  net.matchStarted = true;
   net.ws.send(JSON.stringify({ t: "room-state", started: true }));
 }
 
@@ -5892,6 +5926,14 @@ const net = {
   relayIntent: null,     // "host" | "join" — what the typed address is for
   portText: "",          // the port field while it is being edited
   relayLobby: false,     // hosting a tournament over the relay, not a 1v1
+  /*
+    Set once by relayMarkStarted and never before — net.relayLobby stays true
+    for the rest of a lobby-started tournament, so it cannot tell "still
+    accepting joiners" from "mid-bracket". This can't drift from what the
+    relay was told, because relayMarkStarted is the only place that sets it,
+    and the only place that tells the relay the room has started.
+  */
+  matchStarted: false,
   lobbies: [],           // the open games, as last pushed by the relay
   lobbyAt: 0,            // when that listing arrived
   lobbyRow: 0,           // cursor in the browser
@@ -5992,6 +6034,7 @@ function netReset() {
   net.relayUrl = "";
   net.relayWait = 0;
   net.relayLobby = false;
+  net.matchStarted = false;
   net.lobbies = [];
   net.lobbyAt = 0;
   net.lobbyRow = 0;
@@ -18712,6 +18755,105 @@ function runTests() {
          `entrantId=${rejoined && rejoined.entrantId}`);
       ok("Bob's reservation is consumed", !net.reserved["tok-bob"]);
       ok("Alice's reservation is untouched by Bob's return", !!net.reserved["tok-alice"]);
+      netReset();
+    }
+
+    /*
+      A RESERVED ENTRANT must not be handed to a stranger by relayPeer's own
+      lowest-free-slot scan. Before this, a probe with an unknown token landed
+      on netResume returning null, then fell into the "genuinely new joiner"
+      branch below and picked entrant 1 even though it was reserved for
+      whoever just dropped — so a second machine ended up driving that
+      player's entrant the moment the real owner reconnected.
+    */
+    {
+      netReset();
+      net.reserved = { "tok-away": { entrantId: 1, seat: 1, deadline: netClock() + 100 } };
+      const stranger = relayPeer(2, null);
+      ok("a live reservation is skipped by the new-joiner slot scan",
+         stranger.entrantId !== 1, `entrantId=${stranger.entrantId}`);
+      ok("the next open entrant is handed out instead",
+         stranger.entrantId === 2, `entrantId=${stranger.entrantId}`);
+
+      // An EXPIRED reservation must not block the slot forever.
+      net.reserved["tok-away"].deadline = netClock() - 1;
+      const late = relayPeer(3, null);
+      ok("an expired reservation frees its entrant back up",
+         late.entrantId === 1, `entrantId=${late.entrantId}`);
+      netReset();
+    }
+
+    /*
+      A STRANGER WITH AN UNKNOWN TOKEN must not be seated once the match is
+      under way, even though relayPeer's own scan (fixed above) would no
+      longer hand them Alice's reserved entrant — the "peer-joined" handler
+      used to seat ANY arrival on a tournament seat unconditionally, so a
+      probe with a fabricated or stale token would still get its own fresh
+      peer sharing the room, just bound to whichever slot was next free. Once
+      net.matchStarted is set, an unrecognised token (reclaimed === null) must
+      instead be told to leave via the relay's "eject" message.
+    */
+    {
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayHost("localhost:8787", true);
+      const ws = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws._open();
+      ws._recv({ t: "hosting", code: "STRA" });
+
+      // Alice joins, then drops — her entrant is reserved, exactly as a real
+      // disconnect would leave it.
+      ws._recv({ t: "peer-joined", seat: 1, resume: "tok-alice" });
+      const alice = net.peers.find((p) => p.relaySeat === 1);
+      ok("Alice is seated first", !!alice, JSON.stringify(net.peers.map((p) => p.relaySeat)));
+      netDropPeer(alice);
+      ok("Alice's entrant is reserved while she is away", !!net.reserved["tok-alice"]);
+
+      // The match begins — this is the same call a real host makes to leave
+      // the lobby and start play.
+      ws.sent.length = 0;
+      relayMarkStarted();
+      ok("starting the match sets the host's own started flag",
+         net.matchStarted === true);
+
+      // A STRANGER now arrives on Alice's old seat with a token the host has
+      // never seen. Before Step 3 this seated a fresh peer unconditionally.
+      ws.sent.length = 0;
+      ws._recv({ t: "peer-joined", seat: 1, resume: "tok-stranger" });
+      ok("no peer is created for the unrecognised token",
+         !net.peers.some((p) => p.relaySeat === 1),
+         JSON.stringify(net.peers.map((p) => p.relaySeat)));
+      ok("Alice's reservation survives the stranger's attempt",
+         !!net.reserved["tok-alice"]);
+      const ejectMsg = ws.sent.map((m) => JSON.parse(m)).find((m) => m.t === "eject");
+      ok("the relay is told to eject that seat instead",
+         !!ejectMsg && ejectMsg.seat === 1, JSON.stringify(ws.sent));
+
+      // Alice herself returns, with her real token — a genuine reclaim must
+      // still succeed even though the match has started.
+      ws.sent.length = 0;
+      ws._recv({ t: "peer-joined", seat: 1, resume: "tok-alice" });
+      const rejoined = net.peers.find((p) => p.relaySeat === 1);
+      ok("a genuine reclaim still seats the returning player",
+         !!rejoined && rejoined.entrantId === 1,
+         `entrantId=${rejoined && rejoined.entrantId}`);
+      ok("and no eject is sent for her own return",
+         !ws.sent.map((m) => JSON.parse(m)).some((m) => m.t === "eject"),
+         JSON.stringify(ws.sent));
+
+      // A brand-new joiner arriving BEFORE the match starts must still be
+      // seated as today — otherwise nobody could ever join a lobby.
+      netReset();
+      WebSocketSpy.made.length = 0;
+      relayHost("localhost:8787", true);
+      const ws2 = WebSocketSpy.made[WebSocketSpy.made.length - 1];
+      ws2._open();
+      ws2._recv({ t: "hosting", code: "LOBB" });
+      ws2._recv({ t: "peer-joined", seat: 1, resume: "tok-new" });
+      ok("a lobby joiner is seated normally before the match starts",
+         net.peers.some((p) => p.relaySeat === 1),
+         JSON.stringify(net.peers.map((p) => p.relaySeat)));
+
       netReset();
     }
 

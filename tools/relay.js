@@ -529,6 +529,26 @@ server.on("upgrade", (req, sock) => {
       }
       return;
     }
+    /*
+      EJECT. Only the HOST (room.sockets[0], set once at "host" time and never
+      displaced) may drop another seat, and only its own room's seats.
+
+      WHY THE RELAY STILL DOES NOT DECIDE ANYTHING: this exists because a
+      started room admits a resume join without being able to check the token
+      — it cannot know who left, so it cannot tell a returning player from a
+      stranger who just typed the room code. The HOST can (against its own
+      net.reserved table) and uses this message to remove whoever it does not
+      recognise. The relay's job here is exactly what dropSocket already does
+      for any other departure: forget the seat and tell the room. It does not
+      look at why, which is what keeps this file free of game logic.
+    */
+    if (msg.t === "eject") {
+      const room = rooms.get(sock.hgRoom);
+      if (!room || room.sockets[0] !== sock) return;   // guests may not eject
+      const target = room.sockets.find((s) => s.hgSeat === msg.seat);
+      if (target) { dropSocket(target); target.destroy(); }
+      return;
+    }
     if (msg.t === "join") {
       const code = String(msg.code || "").toUpperCase().trim();
       const room = rooms.get(code);
